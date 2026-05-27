@@ -2766,13 +2766,23 @@ class Scheduler:
         During external prefill we have direct access to per-layer cache
         objects (not BatchKVCache). Extract non-sliceable layers for
         boundary snapshot storage.
+
+        Pass ``request_id`` directly. The request is mid-prefill and has
+        not been inserted into ``BatchGenerator`` yet, so
+        ``request_id_to_uid`` has no entry for it. The earlier shape
+        routed through ``self.request_id_to_uid.get(request_id, -1)`` →
+        ``uid_to_request_id.get(-1)`` → ``None`` → silent return,
+        dropping every snapshot. For ArraysCache / GDN / hybrid models
+        that made every non-last block store a placeholder, and the
+        next identical-prompt request rejected the cache and re-
+        prefilled from scratch.
         """
         snapshot_cache = [
             c if type(c).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES else None
             for c in prompt_cache
         ]
         self._on_prefill_boundary_snapshot(
-            self.request_id_to_uid.get(request.request_id, -1),
+            request.request_id,
             snapshot_cache,
             total_tokens,
         )
@@ -3200,20 +3210,23 @@ class Scheduler:
 
     def _on_prefill_boundary_snapshot(
         self,
-        uid: int,
+        request_id: str,
         snapshot_cache: list[Any],
         token_count: int,
     ) -> None:
-        """Record boundary snapshots captured during prefill processing."""
+        """Record boundary snapshots captured during prefill processing.
+
+        Called from ``_emit_prefill_boundary_snapshot`` at each block
+        boundary crossed during prefill. Keyed by ``request_id`` rather
+        than ``uid`` because the request has not been inserted into
+        ``BatchGenerator`` yet and the uid mapping does not exist —
+        routing through it dropped every snapshot silently (#TBD).
+        """
         if self.block_aware_cache is None:
             return
 
         block_size = self.config.paged_cache_block_size
         if block_size <= 0 or token_count <= 0 or token_count % block_size != 0:
-            return
-
-        request_id = self.uid_to_request_id.get(uid)
-        if request_id is None:
             return
 
         if not self._cache_list_needs_boundary_snapshot(snapshot_cache):
