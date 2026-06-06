@@ -2,12 +2,14 @@
 """Tests for scheduler admission control (queue depth cap + admission_paused)."""
 
 from collections import deque
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from omlx.exceptions import SchedulerQueueFullError
 from omlx.scheduler import Scheduler
+
+GB = 1024**3
 
 
 @pytest.fixture
@@ -100,3 +102,125 @@ class TestAdmissionPausedField:
         s._prefill_memory_guard = False
         s._admission_paused = False
         assert s._admission_paused is False
+
+
+def _preflight_scheduler(
+    hard_limit: int, recent_peak: int, peak: int, *, running=None
+):
+    """Build a bare Scheduler wired for _preflight_memory_check.
+
+    `peak` is the value the (mocked) memory_monitor estimates for the
+    prefill chunk; `recent_peak` is the propagated high-water mark. `running`
+    seeds self.running -- _predicted_prefill_peak_bytes folds recent_peak into
+    `current` only while requests are in-flight, so an empty dict (idle, the
+    default) means a lone request is judged on the instant reading alone.
+    Transient margin is set to 0 here so these tests isolate the recent_peak
+    folding behaviour; margin handling is covered separately.
+    """
+    s = Scheduler.__new__(Scheduler)
+    s._prefill_memory_guard = True
+    s._memory_hard_limit_bytes = hard_limit
+    s._memory_recent_peak_bytes = recent_peak
+    s._prefill_transient_margin_bytes = 0
+    s.running = running if running is not None else {}
+    s.prefilling = deque()
+    s.config = MagicMock(prefill_step_size=2048)
+    s.memory_monitor = MagicMock()
+    s.memory_monitor.estimate_prefill_peak_bytes = MagicMock(return_value=peak)
+    return s
+
+
+def _preflight_request():
+    r = MagicMock()
+    r.num_prompt_tokens = 8192
+    r.cached_tokens = 0
+    return r
+
+
+class TestPreflightRecentPeak:
+    """_preflight_memory_check folds the recent high-water mark into `current`
+    while requests are in-flight, so it does not wave through a request during a
+    prefill trough that would wall the next chunk -- but it ignores recent_peak
+    when idle, so a stale prior-batch peak does not false-reject a lone request.
+    """
+
+    def test_rejects_on_recent_peak_when_inflight_and_instant_is_low(self):
+        """In-flight + instant active/phys low but recent_peak high -> reject.
+
+        Models the mid-prefill trough: another request is running, the instant
+        reading dipped after a _sync_and_clear_cache, but recent_peak still
+        reflects the real in-flight footprint. Numbers are picked so low + peak
+        fits (an instant-only read would admit) but recent_peak + peak exceeds
+        the hard limit. This pins the high-water fold.
+        """
+        hard_limit = 100 * GB
+        peak = 20 * GB
+        low = 10 * GB
+        high = 85 * GB
+        # Sanity: an instant-only read (low + peak) would have passed.
+        assert low + peak <= hard_limit
+        # Folding recent_peak (high + peak) must exceed the limit.
+        assert high + peak > hard_limit
+
+        s = _preflight_scheduler(
+            hard_limit=hard_limit,
+            recent_peak=high,
+            peak=peak,
+            running={"r-other": object()},
+        )
+        with patch("omlx.scheduler.mx") as mock_mx, patch(
+            "omlx.scheduler.get_phys_footprint", return_value=low
+        ):
+            mock_mx.get_active_memory.return_value = low
+            result = s._preflight_memory_check(_preflight_request())
+
+        assert result is not None
+        assert "Prefill would need" in result
+
+    def test_admits_when_recent_peak_also_low(self):
+        """Control: in-flight, recent_peak low too -> the request passes."""
+        hard_limit = 100 * GB
+        peak = 20 * GB
+        low = 10 * GB
+
+        s = _preflight_scheduler(
+            hard_limit=hard_limit,
+            recent_peak=low,
+            peak=peak,
+            running={"r-other": object()},
+        )
+        with patch("omlx.scheduler.mx") as mock_mx, patch(
+            "omlx.scheduler.get_phys_footprint", return_value=low
+        ):
+            mock_mx.get_active_memory.return_value = low
+            result = s._preflight_memory_check(_preflight_request())
+
+        assert result is None
+
+    def test_lone_request_ignores_stale_recent_peak(self):
+        """Idle (no in-flight requests): a high recent_peak is NOT folded in,
+        so a lone request that fits on the instant reading is admitted.
+
+        recent_peak when idle is a stale prior-batch high; folding it would
+        false-reject a request that physically fits. Same numbers as the
+        in-flight reject test, only running is empty -> opposite outcome.
+        """
+        hard_limit = 100 * GB
+        peak = 20 * GB
+        low = 10 * GB
+        high = 85 * GB
+        # Folding recent_peak would exceed the limit (the in-flight case)...
+        assert high + peak > hard_limit
+        # ...but idle, only the instant reading counts, which fits.
+        assert low + peak <= hard_limit
+
+        s = _preflight_scheduler(
+            hard_limit=hard_limit, recent_peak=high, peak=peak, running={}
+        )
+        with patch("omlx.scheduler.mx") as mock_mx, patch(
+            "omlx.scheduler.get_phys_footprint", return_value=low
+        ):
+            mock_mx.get_active_memory.return_value = low
+            result = s._preflight_memory_check(_preflight_request())
+
+        assert result is None

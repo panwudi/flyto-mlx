@@ -796,10 +796,26 @@ class Scheduler:
         # soft_threshold. Schedulers stop admitting new prefills while this is
         # set; in-flight requests proceed.
         self._admission_paused: bool = False
+        # Recent high-water memory usage, propagated from ProcessMemoryEnforcer.
+        # The entry-budget admission (_predicted_prefill_peak_bytes) and the
+        # forward gate max the instant reading against this so they do not wave
+        # through a request during a prefill trough that would wall the next
+        # chunk. Folded in only while requests are in-flight (see
+        # _predicted_prefill_peak_bytes). 0 until the enforcer sets it.
+        self._memory_recent_peak_bytes: int = 0
         # Adaptive prefill throttle params, propagated from enforcer.
         # Until set, _adaptive_chunk_size is a no-op (returns requested as-is).
         self._prefill_safe_zone_ratio: float = 0.80
         self._prefill_min_chunk_tokens: int = 32
+        # Conservative transient margin (bytes) added to the modelled prefill
+        # peak by both entry guards: _predicted_prefill_peak_bytes (admission)
+        # and _prefill_forward_gate (per-chunk backstop).
+        # estimate_prefill_peak_bytes only models KV + SDPA; it does NOT model
+        # the MoE expert-dequant activation spike, which on glm4.5-air-106b
+        # (MoE) is the dominant single-step transient. Sized from the observed
+        # worst-case single-step current jump on m5max (see MemorySettings
+        # .prefill_transient_margin_gb). 0 until the enforcer propagates it.
+        self._prefill_transient_margin_bytes: int = 0
         # EWMA estimator of per-token chunk transient bytes, used by
         # _adaptive_chunk_size in the caution zone. Owned per-scheduler.
         _tracker_model_id = ""
@@ -1729,6 +1745,107 @@ class Scheduler:
                 f"cache layers to {bits}-bit{skip_msg}"
             )
 
+    def _prefill_forward_gate(
+        self,
+        chunk_tokens: int,
+        *,
+        request_id: str,
+        loop_label: str,
+    ) -> None:
+        """Forward-FRONT memory gate: refuse a prefill chunk BEFORE it runs.
+
+        BACKSTOP to the primary entry-budget admission
+        (_predicted_prefill_peak_bytes + the _schedule_waiting defer). Admission
+        snapshots memory once, at admission time; this re-reads before every
+        chunk and so catches CONCURRENT DRIFT -- another in-flight request's KV
+        growing during this request's long prefill -- that the admission
+        snapshot cannot see. Because admission uses the full-prompt estimate
+        (>= this per-chunk estimate) and the same margin, a correctly-admitted
+        request cannot trip this gate under static memory: it only fires when
+        memory drifted up after admission.
+
+        The chunk-end check (after self.model(...) + mx.eval) only fires once
+        the transient has already been allocated -- on Apple Silicon a chunk
+        that overshoots the Metal cap kernel-panics the whole machine, so an
+        after-the-fact Python check never runs. This predicts the next chunk's
+        peak and raises BEFORE the forward when it would exceed the hard cap,
+        so the request is aborted cleanly (the #1405 cleanup paths convert this
+        RuntimeError into a finish_reason="error" output) instead of crashing.
+
+        predicted_peak = current(high-water) + estimate(KV+SDPA) + margin
+          - current: max(active, phys_footprint, recent_peak). recent_peak is
+            the enforcer's rolling high-water mark, so a mid-prefill trough in
+            the instant reading does not mask the real footprint.
+          - estimate: memory_monitor.estimate_prefill_peak_bytes models this
+            chunk's KV + SDPA activation only.
+          - margin: _prefill_transient_margin_bytes covers what the estimate
+            does NOT model -- chiefly the MoE expert-dequant activation spike,
+            the dominant single-step transient on MoE models like glm4.5-air.
+
+        No-op (returns) when the guard is off, the hard limit is unset, the
+        memory_monitor is missing, or the estimate is unavailable (0) -- in
+        every such case the legacy chunk-end check remains the only line of
+        defense, exactly as before this gate existed.
+
+        At chunk granularity the KV+SDPA estimate is small, so the margin is
+        the effective trip point (gate fires once current ~> cap - margin).
+        Correctness depends on `current` reflecting the true high-water mark:
+        this iteration runs right after the previous chunk's
+        _sync_and_clear_cache, when mx.get_active_memory() troughs, so the
+        gate leans on get_phys_footprint() + the propagated recent_peak to
+        avoid reading a trough. See MemorySettings.prefill_transient_margin_gb.
+
+        Raises:
+            RuntimeError: when the predicted peak exceeds the hard limit.
+        """
+        if not self._prefill_memory_guard:
+            return
+        if self._memory_hard_limit_bytes <= 0:
+            return
+        if self.memory_monitor is None:
+            return
+        if chunk_tokens <= 0:
+            return
+
+        estimate = self.memory_monitor.estimate_prefill_peak_bytes(
+            chunk_tokens, self.config.prefill_step_size
+        )
+        if estimate == 0:
+            return  # can't estimate this model -> leave it to the chunk-end check
+
+        predicted_transient = estimate + self._prefill_transient_margin_bytes
+        current = max(
+            mx.get_active_memory(),
+            get_phys_footprint(),
+            self._memory_recent_peak_bytes,
+        )
+        predicted_peak = current + predicted_transient
+
+        if predicted_peak > self._memory_hard_limit_bytes:
+            logger.warning(
+                "[memgate:%s] rid=%s refusing prefill chunk (n=%d) BEFORE "
+                "forward: predicted peak %.3fGB = current %.3fGB + transient "
+                "%.3fGB (estimate %.3fGB + margin %.3fGB) exceeds hard cap "
+                "%.3fGB. Aborting request to avoid a Metal-cap kernel panic.",
+                loop_label,
+                request_id,
+                chunk_tokens,
+                predicted_peak / 1024**3,
+                current / 1024**3,
+                predicted_transient / 1024**3,
+                estimate / 1024**3,
+                self._prefill_transient_margin_bytes / 1024**3,
+                self._memory_hard_limit_bytes / 1024**3,
+            )
+            raise RuntimeError(
+                "Prefill refused before forward: predicted peak "
+                f"{predicted_peak / 1024**3:.1f}GB (current "
+                f"{current / 1024**3:.1f}GB + transient "
+                f"{predicted_transient / 1024**3:.1f}GB) would exceed the "
+                f"memory ceiling {self._memory_hard_limit_bytes / 1024**3:.1f}GB. "
+                "Reduce context length or increase --max-process-memory."
+            )
+
     def _do_external_prefill(
         self,
         request: "Request",
@@ -1884,6 +2001,15 @@ class Scheduler:
                     model_kwargs["vlm_extra_kwargs"] = _slice_vlm_extra(
                         extra_kwargs, n_to_process
                     )
+
+            # Forward-FRONT gate: predict this chunk's peak and refuse BEFORE
+            # the forward if it would breach the Metal cap (post-forward checks
+            # cannot save us -- the overshoot kernel-panics the machine).
+            self._prefill_forward_gate(
+                n_to_process,
+                request_id=request.request_id,
+                loop_label="external",
+            )
 
             _throttle_pre = get_phys_footprint()
             self.model(input_arr[:, :n_to_process], cache=prompt_cache, **model_kwargs)
@@ -2223,6 +2349,17 @@ class Scheduler:
 
         chunk = state.tokens_remaining[:, :n]
         state.tokens_remaining = state.tokens_remaining[:, n:]
+
+        # Forward-FRONT gate: predict this chunk's peak and refuse BEFORE the
+        # forward if it would breach the Metal cap. Mirrors the external loop;
+        # raises RuntimeError that _advance_chunked_prefills converts into a
+        # finish_reason="error" output without crashing the machine.
+        self._prefill_forward_gate(
+            n,
+            request_id=state.request.request_id,
+            loop_label="chunked_step",
+        )
+
         _throttle_pre = get_phys_footprint()
         self.model(chunk, cache=state.cache)
         mx.eval([c.state for c in state.cache])
@@ -4506,20 +4643,52 @@ class Scheduler:
         """Get number of running requests."""
         return len(self.running)
 
-    def _preflight_memory_check(self, request: "Request") -> str | None:
+    def _has_inflight_kv(self) -> bool:
+        """True when any request holds (or is still accumulating) KV cache --
+        a running decode (self.running) OR an in-flight chunked prefill
+        (self.prefilling). A waiting request has not prefilled yet, so it holds
+        no KV. Admission folds the recent_peak high-water and may DEFER only
+        while this is True; with nothing in flight there is nothing to drain, so
+        a request is admitted instead of queued forever (and a lone request too
+        big to fit even alone is rejected by _preflight_memory_check).
+
+        Crucially this includes self.prefilling: the documented crash is
+        concurrent CHUNKED prefills stacking, and a request mid-chunked-prefill
+        lives in self.prefilling, not self.running. Gating on self.running alone
+        would wave the 2nd, 3rd, ... prefill straight past the budget into the
+        exact stack this guard exists to prevent.
         """
-        Estimate whether prefill would exceed memory limits.
+        return bool(self.running or self.prefilling)
 
-        Computes worst-case peak memory for the last prefill chunk
-        (model weights + KV cache + SDPA attention matrix) and rejects
-        if it would exceed the hard limit.
+    def _predicted_prefill_peak_bytes(self, request: "Request") -> int | None:
+        """Predicted memory peak if this request's prefill ran now, or None.
 
-        For head_dim > 128, MLX SDPA uses a fallback that materializes
-        the full attention matrix [B, n_q, chunk, kv_len] in float32.
-        For head_dim <= 128, MLX uses a fused kernel with O(n) memory.
+        Shared predicate for both entry-point memory guards: the budget
+        admission in _schedule_waiting (admit / queue) and the lone-request
+        rejection in _preflight_memory_check (reject).
 
-        Returns:
-            Error message string if request should be rejected, None if OK.
+        predicted = current(high-water) + estimate_prefill_peak(KV+SDPA) + margin
+
+          - current: max(active, phys_footprint). The enforcer recent_peak
+            high-water is folded in ONLY while work is in flight
+            (_has_inflight_kv): mid-generation/mid-prefill it masks the
+            active-memory trough left by the last _sync_and_clear_cache, but
+            when idle it can be a stale prior-batch peak that would false-reject
+            a lone request.
+          - estimate: memory_monitor.estimate_prefill_peak_bytes over the full
+            new (uncached) prompt -- KV for the whole prompt + last-chunk SDPA.
+            This is >= the per-chunk estimate the forward gate uses, so a
+            request admitted here cannot trip the gate under static memory (the
+            gate is a concurrent-drift backstop, not a second veto on the happy
+            path -- see _prefill_forward_gate).
+          - margin: _prefill_transient_margin_bytes carries the un-modelled MoE
+            expert-dequant transient, which is sub-poll and so invisible to
+            every memory read (see MemorySettings.prefill_transient_margin_gb).
+
+        Returns None (caller treats as "fits") when the guard is off, the hard
+        limit is unset, the monitor is missing, there are no new tokens, or the
+        model cannot be estimated (estimate == 0) -- in each case admission
+        falls back to the per-concurrency cap and the legacy in-prefill checks.
         """
         if not self._prefill_memory_guard:
             return None
@@ -4528,31 +4697,50 @@ class Scheduler:
         if self.memory_monitor is None:
             return None
 
-        prompt_tokens = request.num_prompt_tokens
-        cached_tokens = request.cached_tokens or 0
-        new_tokens = max(prompt_tokens - cached_tokens, 0)
-
+        new_tokens = max(request.num_prompt_tokens - (request.cached_tokens or 0), 0)
         if new_tokens == 0:
             return None
 
-        peak = self.memory_monitor.estimate_prefill_peak_bytes(
+        estimate = self.memory_monitor.estimate_prefill_peak_bytes(
             new_tokens, self.config.prefill_step_size
         )
-        if peak == 0:
-            return None  # can't estimate, skip
+        if estimate == 0:
+            return None  # can't estimate this model -> skip
 
         current = max(mx.get_active_memory(), get_phys_footprint())
+        if self._has_inflight_kv():
+            current = max(current, self._memory_recent_peak_bytes)
+        return current + estimate + self._prefill_transient_margin_bytes
 
-        if current + peak > self._memory_hard_limit_bytes:
-            from .utils.hardware import format_bytes
+    def _preflight_memory_check(self, request: "Request") -> str | None:
+        """Reject a request whose prefill cannot fit even on its own.
 
-            return (
-                f"Prefill would require ~{format_bytes(current + peak)} peak "
-                f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
-                f"but limit is {format_bytes(self._memory_hard_limit_bytes)}. "
-                f"Reduce context length or increase --max-process-memory."
-            )
-        return None
+        Entry-point sibling of the budget admission in _schedule_waiting. The
+        admission DEFERS (queues) a request that would breach the cap only
+        because other requests are in-flight; this REJECTS a request that would
+        breach even with nothing else running -- nothing will drain to make
+        room, so queuing it would deadlock. The #1405 cleanup converts the
+        returned error into a finish_reason="error" output -- the request is
+        refused cleanly instead of crashing the box.
+
+        Returns:
+            Error message string if request should be rejected, None if OK.
+        """
+        predicted = self._predicted_prefill_peak_bytes(request)
+        if predicted is None:
+            return None
+        if predicted <= self._memory_hard_limit_bytes:
+            return None
+
+        from .utils.hardware import format_bytes
+
+        return (
+            f"Prefill would need ~{format_bytes(predicted)} peak "
+            f"(KV+SDPA estimate + {format_bytes(self._prefill_transient_margin_bytes)} "
+            f"transient margin) but the memory ceiling is "
+            f"{format_bytes(self._memory_hard_limit_bytes)}. "
+            f"Reduce context length or increase --max-process-memory."
+        )
 
     def _schedule_waiting(
         self,
@@ -4649,6 +4837,41 @@ class Scheduler:
                 request.cached_tokens = 0
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
+
+            # Memory-budget admission. Predict this request's prefill peak; if
+            # admitting it alongside the in-flight work would breach the hard
+            # cap, leave it in the waiting queue (do NOT reject) and stop
+            # admitting for this step. step() re-invokes _schedule_waiting every
+            # step, so it is re-checked and admitted once in-flight work frees
+            # its KV. This is what makes concurrency adaptive without a fixed
+            # per-model cap: a memory-rich model packs many requests, an 85GB
+            # model collapses to 1 and queues the rest.
+            #
+            # Gate on _has_inflight_kv() (running OR prefilling), not self.running
+            # alone: a request mid-chunked-prefill is in self.prefilling and is
+            # the dominant KV holder during the very stack this guards against
+            # (concurrent prefills). The first request (nothing in flight) is
+            # never deferred -- nothing would drain to admit it -- so a lone
+            # request that cannot fit even alone falls through to
+            # _preflight_memory_check below and is rejected instead.
+            if self._has_inflight_kv():
+                predicted_peak = self._predicted_prefill_peak_bytes(request)
+                if (
+                    predicted_peak is not None
+                    and predicted_peak > self._memory_hard_limit_bytes
+                ):
+                    self.waiting.appendleft(request)
+                    logger.info(
+                        "[memadmit] deferring request %s: predicted prefill "
+                        "peak %d + in-flight (%d running, %d prefilling) would "
+                        "breach hard cap %d; left queued",
+                        request.request_id,
+                        predicted_peak,
+                        len(self.running),
+                        len(self.prefilling),
+                        self._memory_hard_limit_bytes,
+                    )
+                    break
 
             # SpecPrefill requests must be alone in the batch (RoPE patching
             # affects the entire model). Also block scheduling if another
