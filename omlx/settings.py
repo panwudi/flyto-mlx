@@ -391,33 +391,37 @@ class MemorySettings:
     # aborted via the same cleanup path the hard-limit RuntimeError uses.
     prefill_safe_zone_ratio: float = 0.80
     prefill_min_chunk_tokens: int = 32
-    # Conservative transient margin added to the modelled per-chunk prefill
-    # peak by the scheduler's forward-FRONT memory gate. The model in
+    # Conservative transient margin added to the modelled prefill peak by BOTH
+    # memory guards: the entry-point budget admission (primary -- scheduler.
+    # _predicted_prefill_peak_bytes, decides admit/queue/reject at admission
+    # time) and the forward-FRONT chunk gate (backstop -- scheduler.
+    # _prefill_forward_gate, refuses a chunk before its forward). The model in
     # memory_monitor.estimate_prefill_peak_bytes only accounts for KV + SDPA;
-    # it does NOT model the MoE expert-dequant activation spike, which on a
-    # MoE model (glm4.5-air-106b) is the dominant single-step transient. The
-    # gate refuses a chunk before its forward when current + estimate + this
-    # margin would breach the hard cap, so the transient never actually lands
-    # on the Metal ceiling (which would kernel-panic the whole machine, an
-    # after-the-fact Python check cannot catch it).
+    # it does NOT model the MoE expert-dequant activation spike, which on a MoE
+    # model (glm4.5-air-106b) is the dominant single-step transient. Either
+    # guard refuses when current + estimate + this margin would breach the hard
+    # cap, so the transient never actually lands on the Metal ceiling (which
+    # would kernel-panic the whole machine -- an after-the-fact Python check
+    # cannot catch it).
     #
-    # At chunk granularity the KV+SDPA estimate is tiny (~0.3GB for a
-    # 256-token GLM chunk), so this margin IS the safety mechanism. The
-    # load-bearing guarantee is: margin > the worst-case single-step memory
-    # jump. Across the 2026-06-06 m5max glm4.5-air-106b crash log the max
-    # trough->peak single-step delta was 7.44GB (peak overshoot reached
-    # 110.4GB vs a 107.5GB cap). With margin=10GB the gate effectively fires
-    # once current exceeds ~cap - margin (~97GB); since every observed forward
-    # jumps <=7.44GB < 10GB, any chunk that would land above the cap starts
-    # from a current already past that trip point, so the gate refuses it
-    # before the forward. 10 = ceil(7.44) padded for an unobserved larger
-    # spike. NOTE: this holds only while `current` is read at true high-water
-    # at gate time (it relies on phys_footprint stickiness + recent_peak to
-    # mask the post-_sync_and_clear_cache trough in mx.get_active_memory());
-    # watch the [memgate]/[memcheck] logs on hardware and raise the margin if
-    # a sub-trip-point trough precedes an over-cap chunk. Set to 0 to disable
-    # the extra margin (the gate then uses the bare KV+SDPA estimate).
-    prefill_transient_margin_gb: float = 10.0
+    # The load-bearing guarantee is: margin > the worst-case single-step memory
+    # jump. The jump is SUB-POLL -- it rises and falls faster than the
+    # enforcer's 1s sample, so it is invisible to every memory read (active,
+    # phys_footprint, recent_peak) by construction. It therefore MUST be carried
+    # by this margin, not by reading the footprint more cleverly. Across the
+    # 2026-06-06 m5max glm4.5-air-106b crash log the max trough->peak single-step
+    # delta was 7.44GB and the peak overshoot reached 110.4GB vs a 107.5GB cap,
+    # i.e. an effective transient up to ~10.6GB above the pre-step baseline.
+    # margin=10 was too small (10 < 10.6 -> admitted a step that then breached);
+    # 12 = ceil(10.6) padded, the value that would have refused that step from
+    # its true pre-step baseline. Both guards read `current` at high-water
+    # (max active / phys_footprint / -- when requests are in-flight -- the
+    # enforcer recent_peak); the baseline (KV+weights) is what they see and it
+    # is the determining factor, the sub-poll spike rides on the margin. Watch
+    # the [memgate]/[memcheck] logs on hardware and raise the margin if a step
+    # ever breaches from a baseline below cap - margin. Set to 0 to disable the
+    # extra margin (the guards then use the bare KV+SDPA estimate).
+    prefill_transient_margin_gb: float = 12.0
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -469,7 +473,7 @@ class MemorySettings:
                 data.get("prefill_min_chunk_tokens", 32)
             ),
             prefill_transient_margin_gb=float(
-                data.get("prefill_transient_margin_gb", 10.0)
+                data.get("prefill_transient_margin_gb", 12.0)
             ),
         )
 
