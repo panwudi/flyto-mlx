@@ -23,8 +23,12 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
-ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "video", "video_upscaler", "image"]
-EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "video", "video_upscaler", "image"]
+ModelType = Literal["llm", "vlm", "hrm_text", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "video", "video_upscaler", "image"]
+EngineType = Literal["batched", "vlm", "hrm_text", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "video", "video_upscaler", "image"]
+
+# HRM-Text (sapientinc/HRM-Text): hierarchical-recurrent LM served by its own
+# standalone engine (not mlx-lm's BatchGenerator). Matched on config model_type.
+HRM_TEXT_MODEL_TYPES = {"hrm_text"}
 
 # Diffusers pipeline classes (model_index.json "_class_name") that fmlx can
 # serve via the video engine (docs/video-generation-engine-spec.md). Unknown
@@ -580,6 +584,10 @@ def detect_model_type(model_path: Path) -> ModelType:
     if normalized_type.startswith("lfm") and normalized_type not in EMBEDDING_MODEL_TYPES:
         return "audio_sts"
 
+    # HRM-Text: hierarchical-recurrent LM with its own standalone engine.
+    if normalized_type in HRM_TEXT_MODEL_TYPES or model_type in HRM_TEXT_MODEL_TYPES:
+        return "hrm_text"
+
     return "llm"
 
 
@@ -943,6 +951,8 @@ def _register_model(
             engine_type = "reranker"
         elif model_type == "vlm":
             engine_type = "vlm"
+        elif model_type == "hrm_text":
+            engine_type = "hrm_text"
         elif model_type == "audio_stt":
             engine_type = "audio_stt"
         elif model_type == "audio_tts":

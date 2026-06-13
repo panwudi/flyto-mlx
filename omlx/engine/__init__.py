@@ -23,6 +23,7 @@ from .stt import STTEngine
 from .sts import STSEngine
 from .tts import TTSEngine
 from .vlm import VLMBatchedEngine
+from .hrm_text import HrmTextEngine
 
 __all__ = [
     "BaseEngine",
@@ -31,6 +32,7 @@ __all__ = [
     "BatchedEngine",
     "DFlashEngine",
     "VLMBatchedEngine",
+    "HrmTextEngine",
     "EmbeddingEngine",
     "RerankerEngine",
     "STTEngine",
