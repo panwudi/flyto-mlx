@@ -106,7 +106,7 @@ halved per-module count).
   a tiny held-in set. This validates the MLX training recipe is correct
   before spending on a cloud H100 run. Full-unroll backprop through the 8
   passes is fine at tiny scale; the bp-warmup truncated-BPTT trick can be
-  added later for fidelity at scale.
+  added later for fidelity at scale. **DONE** (see "P3 results" below).
 
 ## P1 results (generation, done on m2max)
 
@@ -201,6 +201,29 @@ Non-goals in P2 (documented, not bugs): no xgrammar structured output (the
 recurrence does not fit xgrammar), no tool calling, no continuous batching, and
 temp>0 sampling is not seed-reproducible (uses the global mx.random state, like
 a standard server). These can be added later if needed.
+
+## P3 results (training recipe smoke, done on m2max)
+
+Scratch `~/Code/hrm-mlx/train_smoke.py`. Random-inits a B-shrunk HRM-Text
+(hidden 128, 1 layer/module, 4 heads x head_dim 32, H2xL3 = 8 passes, vocab 64,
+seq 17) and trains it from scratch with `mx.value_and_grad` over the weight
+dict -- the SAME functional forward P0 logit-parity-verified, so the recipe is
+validated on the exact inference math. Loss = cross-entropy on response tokens
+only, under the PrefixLM mask (prompt bidirectional, response causal); AdamW.
+
+Task: reverse a short token sequence; overfit a fixed 64-example held-in set.
+Result: random-init loss 4.19 (~ln(62), a sane uniform-over-vocab start),
+collapses to 1e-4 by step 100, response-token accuracy 9% -> 100% and holds
+through step 1000. PASS. This proves full-unroll backprop flows correctly
+through the 8-pass H/L recurrence, the PrefixLM mask and response-only loss are
+wired right, and the optimizer drives a from-scratch HRM-Text to memorize the
+set -- the MLX training recipe is correct.
+
+Scope: recipe correctness (memorization), NOT generalization or scale. A real
+WMS-domain run still needs (a) a Chinese WMS reasoning-trace corpus, (b) the
+from-scratch vs domain-fine-tune decision, (c) the larger config + a cloud H100
+pretrain. The bp-warmup truncated-BPTT trick (L_bp_cycles) can be added for
+fidelity at scale; full-unroll is fine at this size.
 
 ## Honest costs / non-goals
 
@@ -306,6 +329,7 @@ sigmoid 门控注意力, NeoX RoPE, SwiGLU, H/L 双模块递归) -- MLX 全部�
   1 层, vocab 256, seq 128), 约 1000 个样本. 门槛: loss 下降且模型过拟合一个极小的
   held-in 集. 这能在花钱跑云端 H100 之前, 验证 MLX 训练配方是对的. 极小规模下对
   8 个 pass 做全展开反传没问题; bp-warmup 截断 BPTT 技巧可以以后再加以贴合规模.
+  **已完成** (见下文 "P3 结果").
 
 ## P1 结果 (生成, 在 m2max 上完成)
 
@@ -385,6 +409,24 @@ prompt 长度而言在两台机器上都不是 panic 风险.
 P2 的非目标 (已写明, 非 bug): 无 xgrammar 结构化输出 (递归不适配 xgrammar), 无
 工具调用, 无连续批处理, temp>0 采样不可按 seed 复现 (用全局 mx.random 状态, 与
 标准 server 一致). 需要时可以以后再加.
+
+## P3 结果 (训练配方冒烟, 在 m2max 上完成)
+
+scratch `~/Code/hrm-mlx/train_smoke.py`. 随机初始化一个 B 缩水的 HRM-Text
+(hidden 128, 每模块 1 层, 4 头 x head_dim 32, H2xL3 = 8 个 pass, vocab 64,
+seq 17), 用 `mx.value_and_grad` 对权重 dict 求导从头训 —— 用的是 P0 逐 logit
+parity 验过的同一个 functional forward, 所以配方是在真实推理数学上验证的. loss =
+只对 response token 的交叉熵, 配 PrefixLM mask (prompt 双向, response 因果); AdamW.
+
+任务: 反转一段短 token 序列; 过拟合一个固定的 64 例 held-in 集. 结果: 随机初始
+loss 4.19 (约 ln(62), 是合理的均匀分布起点), 到第 100 步收敛到 1e-4, response token
+准确率 9% -> 100% 并保持到第 1000 步. PASS. 这证明全展开反传能正确穿过 8 个 pass 的
+H/L 递归, PrefixLM mask 与 response-only loss 接线正确, 优化器能把一个从头初始化的
+HRM-Text 训到记住这组数据 —— MLX 训练配方是对的.
+
+范围: 只验配方正确性 (记忆), 不验泛化或规模. 真正的 WMS 域训练还需要 (a) 一份中文
+WMS 推理轨迹语料, (b) 从头训 vs 域微调的决策, (c) 更大配置 + 云端 H100 正式预训.
+bp-warmup 截断 BPTT (L_bp_cycles) 可在上规模时加以贴合; 这个尺寸全展开就够.
 
 ## 诚实的代价 / 非目标
 
