@@ -1,9 +1,10 @@
 # Image & Video Generation Client API
 
 Integration reference for callers driving flyto-mlx (fmlx) as a local image
-and video generation backend. Covers the three pipelines that matter for
-cross-shot / cross-frame consistency work: image edit (qwen-image-edit),
-image text-to-image (qwen-image / z-image), and image-to-video (wan2.2-i2v).
+and video generation backend. Covers the pipelines that matter for cross-shot
+/ cross-frame consistency work: image edit (qwen-image-edit), image inpaint /
+pixel lock (qwen-image-inpaint), image text-to-image (qwen-image / z-image),
+and image-to-video (wan2.2-i2v).
 
 Every field name, limit and behaviour below is taken from the server code
 (`omlx/api/image_routes.py`, `omlx/api/video_routes.py`,
@@ -31,6 +32,7 @@ The set registered on the reference server at the time of writing:
 | Pipeline | Registered id |
 |----------|---------------|
 | image edit | `qwen-image-edit-2511-4bit` |
+| image inpaint (pixel lock) | `qwen-image-inpaint-4bit` |
 | image t2i | `qwen-image-2512-4bit`, `z-image-turbo-4bit` |
 | video i2v | `wan2.2-i2v-a14b-diffusers-8bit` |
 | video t2v | `wan2.2-t2v-a14b-diffusers-8bit` |
@@ -147,6 +149,55 @@ curl -s http://localhost:8000/v1/images \
 #               -> GET /v1/images/{id}/content?index=0 for the PNG bytes
 ```
 
+### 2.5 Image inpaint -- pixel lock (qwen-image-inpaint)
+
+Use this when the kept region must stay **byte-exact** -- the advertising
+product-lock case (logo / text / shape must not be re-rendered at all). Unlike
+edit (semantic soft lock, no mask), inpaint takes a mask and only regenerates
+the masked region; the kept region is composited back from the source pixel for
+pixel, so it is identical down to the byte.
+
+Same endpoint (`POST /v1/images`); the inpaint path is selected by the model,
+not by mask presence.
+
+- `model`: an inpaint model id, e.g. `qwen-image-inpaint-4bit` (runs on the
+  qwen-image base weights). Confirm the exact id on your server with
+  `GET /v1/models`.
+- `image`: exactly one source image (multipart file, or JSON base64 / data URL).
+- `mask`: one mask image, same transport as `image`.
+- **Mask polarity (critical -- inverting it ruins every result): standard
+  inpaint convention, white (255) = REGENERATE, black (0) = KEEP.** A BiRefNet
+  foreground mask is the opposite (product = white), so invert it before
+  sending (product -> black = keep, background -> white = regenerate). fmlx does
+  NOT invert. An all-white or all-black mask is rejected with a clear error.
+- `prompt`: describe the **whole target image** (a descriptive caption), not an
+  instruction -- the inpaint model is sensitive to descriptive prompts.
+- `seed` / `steps` / `sync` behave as elsewhere. Output follows the source
+  aspect when width/height are omitted (the mask is resized to match).
+
+What you get: the kept region is pixel-identical to the source; the masked
+region is regenerated to match the prompt; a 1-2px feather hides the seam.
+
+```bash
+# product lock: keep the product (product=black in the mask), restyle only the
+# background (background=white). The mask is already inverted from BiRefNet.
+curl -s http://localhost:8000/v1/images \
+  -H "Authorization: Bearer $FMLX_KEY" \
+  -F model=qwen-image-inpaint-4bit \
+  -F image=@product.png \
+  -F mask=@mask_inverted.png \
+  -F 'prompt=the product on a bright marble kitchen counter, soft daylight, photorealistic' \
+  -F seed=42 \
+  -F sync=true
+# returns OpenAI shape data[].b64_json; product pixels unchanged, background regenerated
+```
+
+JSON form: `"image": ["data:image/png;base64,..."]` and `"mask":
+"data:image/png;base64,..."`. Inpaint coexists with edit -- route by intent:
+product pixel-lock -> inpaint (hard), character lock / re-scene -> edit (soft).
+A higher-quality ControlNet inpaint is planned and will use the same endpoint
+with a different model id (no client change).
+
 ### 3. Image text-to-image -- qwen-image / z-image
 
 This is the standard OpenAI `/v1/images/generations` surface plus fmlx
@@ -246,6 +297,7 @@ shots:
 | `model` | string | optional; auto-picked by pipeline if omitted |
 | `prompt` | string | required |
 | `image` | string / string[] / file(s) | input image(s); base64 or data URL in JSON, repeatable file field in multipart; max 4 |
+| `mask` | string / file | inpaint only; standard convention white=regenerate / black=keep (caller inverts a BiRefNet foreground mask); exactly one, paired with one `image` |
 | `n` | int | default 1; cap `settings.image.max_n` (default 4) |
 | `size` | string | `"WxH"` or `"auto"` |
 | `width`, `height` | int | override `size`; rounded up to 16; given together |
@@ -296,6 +348,7 @@ shots:
 | 管线 | 注册 id |
 |------|---------|
 | 图像 edit | `qwen-image-edit-2511-4bit` |
+| 图像 inpaint (像素锁) | `qwen-image-inpaint-4bit` |
 | 图像 t2i | `qwen-image-2512-4bit`, `z-image-turbo-4bit` |
 | 视频 i2v | `wan2.2-i2v-a14b-diffusers-8bit` |
 | 视频 t2v | `wan2.2-t2v-a14b-diffusers-8bit` |
@@ -396,6 +449,46 @@ curl -s http://localhost:8000/v1/images \
 #               -> GET /v1/images/{id}/content?index=0 for the PNG bytes
 ```
 
+### 2.5 图像 inpaint -- 像素锁 (qwen-image-inpaint)
+
+当保留区必须**字节级不变**时用这条 -- 广告产品锁场景 (logo / 文字 / 形状绝不能
+被重绘). 与 edit (语义软锁, 无 mask) 不同, inpaint 吃一张 mask, 只重画 mask 区,
+保留区在像素空间逐像素从原图合成回去, 所以字节级一致.
+
+同一端点 (`POST /v1/images`); inpaint 路径由模型选择, 不靠 mask 是否存在推断.
+
+- `model`: inpaint 模型 id, 如 `qwen-image-inpaint-4bit` (跑在 qwen-image 基座
+  权重上). 用 `GET /v1/models` 确认确切 id.
+- `image`: 恰好一张原图 (multipart 文件 或 JSON base64 / data URL).
+- `mask`: 一张 mask, 与 `image` 同传法.
+- **Mask 极性 (关键, 反了整张全废): 标准 inpaint 约定, 白 (255) = 重画, 黑 (0)
+  = 保留.** BiRefNet 前景 mask 正好相反 (产品=白), 所以发送前取反 (产品->黑保留,
+  背景->白重画). fmlx 不反转. 全白 / 全黑 mask 会被明确报错.
+- `prompt`: 描述**整张目标图** (描述式 caption), 不是指令 -- inpaint 模型对描述式
+  prompt 敏感.
+- `seed` / `steps` / `sync` 行为同其他. 不传 width/height 则跟随原图长宽比 (mask
+  会被缩放对齐).
+
+结果: 保留区与原图逐像素一致; mask 区按 prompt 重画; 1-2px 羽化消除接缝.
+
+```bash
+# 产品锁: 锁住产品 (mask 里产品=黑), 只改背景 (背景=白). mask 已从 BiRefNet 取反.
+curl -s http://localhost:8000/v1/images \
+  -H "Authorization: Bearer $FMLX_KEY" \
+  -F model=qwen-image-inpaint-4bit \
+  -F image=@product.png \
+  -F mask=@mask_inverted.png \
+  -F 'prompt=the product on a bright marble kitchen counter, soft daylight, photorealistic' \
+  -F seed=42 \
+  -F sync=true
+# 返回 OpenAI 形状 data[].b64_json; 产品像素不变, 背景重画
+```
+
+JSON 形式: `"image": ["data:image/png;base64,..."]` 与 `"mask":
+"data:image/png;base64,..."`. inpaint 与 edit 并存 -- 按意图路由: 产品像素锁 ->
+inpaint (硬), 角色锁 / 换景 -> edit (软). 后续会上质量更高的 ControlNet inpaint,
+同端点换 model id, 客户端不用改.
+
 ### 3. 图像 t2i -- qwen-image / z-image
 
 这是标准 OpenAI `/v1/images/generations` 接口外加 fmlx 扩展字段.
@@ -485,6 +578,7 @@ POST /v1/images (JSON 或 multipart):
 | `model` | string | 可选; 不传则按管线自动选 |
 | `prompt` | string | 必填 |
 | `image` | string / string[] / 文件 | 输入图; JSON 里 base64 或 data URL, multipart 里可重复文件字段; 最多 4 |
+| `mask` | string / 文件 | 仅 inpaint; 标准约定 白=重画 / 黑=保留 (调用方反转 BiRefNet 前景 mask); 恰好一张, 与一张 `image` 配对 |
 | `n` | int | 默认 1; 上限 `settings.image.max_n` (默认 4) |
 | `size` | string | `"WxH"` 或 `"auto"` |
 | `width`, `height` | int | 覆盖 `size`; 向上取整到 16; 必须成对给 |
