@@ -234,12 +234,20 @@ def run(spec: dict) -> int:
             base_kwargs["negative_prompt"] = spec["negative_prompt"]
         if spec.get("guidance") is not None:
             base_kwargs["guidance"] = float(spec["guidance"])
+    # Inpaint pipelines (inpaint / controlnet_inpaint) take exactly one source
+    # image + one mask and run a masked-denoise loop (omlx/image/qwen_inpaint),
+    # NOT model.generate_image. Resolved from the model's declared pipeline so a
+    # Phase-2 controlnet variant slots in here without touching dispatch.
+    is_inpaint = pipeline in ("inpaint", "controlnet_inpaint")
+    mask_path = spec.get("mask_path")
+    if is_inpaint and not (image_paths and mask_path):
+        raise RuntimeError("inpaint pipeline requires both an image and a mask")
     if pipeline == "edit":
         # Edit conditions on reference images; width/height default to the
         # first reference's aspect at ~1MP inside mflux (the recommended
         # default -- forced square output degrades qwen-edit quality).
         base_kwargs["image_paths"] = image_paths
-    elif image_paths:
+    elif image_paths and not is_inpaint:
         # img2img on a t2i model: single source image + strength.
         base_kwargs["image_path"] = image_paths[0]
         strength = spec.get("image_strength")
@@ -253,6 +261,36 @@ def run(spec: dict) -> int:
     out_width = out_height = None
     for i in range(n):
         current_index = i
+        if is_inpaint:
+            # mask is the standard inpaint convention (white=regenerate); the
+            # caller already inverted BiRefNet foreground (spec section 2).
+            from . import qwen_inpaint
+
+            pil = qwen_inpaint.generate_inpaint(
+                model,
+                prompt=spec["prompt"],
+                image_path=image_paths[0],
+                mask_path=str(mask_path),
+                width=int(spec["width"]),
+                height=int(spec["height"]),
+                steps=int(spec["steps"]),
+                seed=seed + i,
+                guidance=spec.get("guidance"),
+                negative_prompt=spec.get("negative_prompt"),
+                image_strength=float(spec.get("image_strength") or 1.0),
+            )
+            _emit(phase="saving", image_index=i)
+            name = f"output-{i}.png"
+            pil.save(os.path.join(output_dir, name))
+            outputs.append(name)
+            if out_width is None:
+                out_width, out_height = pil.size
+            if n > 1:
+                try:
+                    mx.clear_cache()
+                except Exception:
+                    pass
+            continue
         generated = model.generate_image(seed=seed + i, **base_kwargs)
         _emit(phase="saving", image_index=i)
         name = f"output-{i}.png"

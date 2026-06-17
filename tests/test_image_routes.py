@@ -118,6 +118,7 @@ def _make_manager(
             job: MediaJob,
             input_reference: tuple[bytes, str] | None = None,
             input_images: list[tuple[bytes, str]] | None = None,
+            input_mask: tuple[bytes, str] | None = None,
         ) -> MediaJob:
             # Record without waking the real dispatcher (no admission loop,
             # no subprocess); mirror the real submit's input-image handling
@@ -130,6 +131,13 @@ def _make_manager(
                     ref_path.write_bytes(data)
                     paths.append(str(ref_path))
                 job.params["image_paths"] = paths
+            if input_mask is not None:
+                data, suffix = input_mask
+                blob_dir = manager.artifacts_dir_for("image") / job.id
+                blob_dir.mkdir(parents=True, exist_ok=True)
+                mask_path = blob_dir / f"input_mask{suffix or '.png'}"
+                mask_path.write_bytes(data)
+                job.params["mask_path"] = str(mask_path)
             manager._jobs[job.id] = job
             submitted.append(job)
             return job
@@ -283,6 +291,79 @@ def _post(client: TestClient, **fields):
 def _post_async(client: TestClient, **fields):
     fields.setdefault("sync", False)
     return _post(client, **fields)
+
+
+INPAINT_MODEL = "qwen-image-inpaint-4bit"
+
+
+def _entries_with_inpaint(tmp_path: Path) -> dict:
+    """Default pool plus an inpaint-pipeline model on the qwen-image base."""
+    entries = _default_entries(tmp_path)
+    entries[INPAINT_MODEL] = SimpleNamespace(
+        model_id=INPAINT_MODEL,
+        model_path=tmp_path / "models" / INPAINT_MODEL,
+        model_type="image",
+        image_pipeline="inpaint",
+        image_alias="qwen-image",
+    )
+    return entries
+
+
+class TestInpaintRouting:
+    """Mask <-> inpaint-pipeline routing (docs/qwen-inpaint-engine-spec.md s4).
+    Mask is the standard convention (white=regenerate); the route never infers
+    inpaint from mask presence -- it gates on the model's declared pipeline."""
+
+    def test_mask_without_model_400(self, image_env, tmp_path):
+        client, _ = image_env(entries=_entries_with_inpaint(tmp_path))
+        r = client.post(
+            "/v1/images",
+            json={"prompt": "a desk", "image": PNG_DATA_URL, "mask": PNG_DATA_URL},
+        )
+        assert r.status_code == 400
+        assert "inpaint" in r.json()["detail"].lower()
+
+    def test_mask_on_non_inpaint_model_400(self, image_env, tmp_path):
+        client, _ = image_env(entries=_entries_with_inpaint(tmp_path))
+        r = client.post(
+            "/v1/images",
+            json={
+                "model": EDIT_MODEL,
+                "prompt": "a desk",
+                "image": PNG_DATA_URL,
+                "mask": PNG_DATA_URL,
+            },
+        )
+        assert r.status_code == 400
+        assert "mask" in r.json()["detail"].lower()
+
+    def test_inpaint_model_without_mask_400(self, image_env, tmp_path):
+        client, _ = image_env(entries=_entries_with_inpaint(tmp_path))
+        r = client.post(
+            "/v1/images",
+            json={"model": INPAINT_MODEL, "prompt": "a desk", "image": PNG_DATA_URL},
+        )
+        assert r.status_code == 400
+        assert "mask" in r.json()["detail"].lower()
+
+    def test_inpaint_image_and_mask_submits(self, image_env, tmp_path):
+        client, manager = image_env(entries=_entries_with_inpaint(tmp_path))
+        r = client.post(
+            "/v1/images",
+            json={
+                "model": INPAINT_MODEL,
+                "prompt": "a desk",
+                "image": PNG_DATA_URL,
+                "mask": PNG_DATA_URL,
+                "sync": False,
+            },
+        )
+        assert r.status_code == 200, r.text
+        assert len(manager.test_submitted) == 1
+        job = manager.test_submitted[0]
+        assert job.params["pipeline"] == "inpaint"
+        assert job.params.get("mask_path")
+        assert len(job.params.get("image_paths") or []) == 1
 
 
 # ---------------------------------------------------------------------------
