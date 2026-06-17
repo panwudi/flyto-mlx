@@ -134,6 +134,27 @@ inpaint 任务的 normalized dict 在现有 image 字段基础上新增:
 mask 与 image 一样走模型外提取 (multipart 文件字段 / JSON base64), 不进
 pydantic 模型. route 提取后落临时文件, 路径进 normalized.
 
+## 5.1 客户端用法 (curl)
+
+复用 `POST /v1/images` (不开新端点), model 指向注册的 inpaint 模型, 带 image +
+mask. mask 是标准约定 (白=重画/黑=保留), 调用方已反转 BiRefNet 前景.
+
+```bash
+# 产品锁: 锁住产品 (mask 里产品=黑), 只重画背景 (背景=白)
+curl -s http://HOST:8000/v1/images \
+  -H "Authorization: Bearer $FMLX_KEY" \
+  -F model=qwen-image-inpaint-4bit \
+  -F image=@product.png \
+  -F mask=@mask_inverted.png \
+  -F 'prompt=the product on a bright marble kitchen counter, soft daylight' \
+  -F sync=true
+# 返回 OpenAI 形状 data[].b64_json; 产品区与原图逐像素一致, 背景按 prompt 重画
+```
+
+JSON body 同 image: `"image"` / `"mask"` 为 data URL 或 base64 字符串.
+prompt 用整图描述式 (ControlNet 阶段尤其), 不是指令式. 完整 client-API 文档的
+inpaint 段在 PR #84 (image-video-generation-client-api.md) 合并后补.
+
 ## 6. 文件改动清单 (Phase 1)
 
 - `omlx/api/image_models.py`: 无需加字段 (mask 走模型外提取); 可加注释说明.

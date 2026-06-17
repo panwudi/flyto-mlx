@@ -266,7 +266,14 @@ def run(spec: dict) -> int:
             # caller already inverted BiRefNet foreground (spec section 2).
             # width/height omitted -> follow the source aspect at ~1MP (mflux
             # canvas policy); the mask is resized to match, so they stay aligned.
-            from . import qwen_inpaint
+            # Sibling import without the omlx package: this script runs as
+            # `python -I worker.py` (no parent package, and -I implies -P so the
+            # script dir is NOT on sys.path), so add the dir explicitly. A
+            # relative/omlx import would crash every inpaint job.
+            _here = os.path.dirname(os.path.abspath(__file__))
+            if _here not in sys.path:
+                sys.path.insert(0, _here)
+            import qwen_inpaint
 
             def _inpaint_cb(step: int, total: int, _i: int = i) -> None:
                 _emit(
