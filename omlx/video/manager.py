@@ -512,12 +512,15 @@ class MediaJobManager:
         job: MediaJob,
         input_reference: tuple[bytes, str] | None = None,
         input_images: list[tuple[bytes, str]] | None = None,
+        input_mask: tuple[bytes, str] | None = None,
     ) -> MediaJob:
         """Accept a job into the queue (caller validates params + caps).
 
         input_reference is (bytes, suffix) of the I2V conditioning image.
         input_images is a list of (bytes, suffix) for image jobs (img2img
-        source or edit references). Both land in the job's blob dir so the
+        source or edit references). input_mask is (bytes, suffix) of the
+        inpaint mask (standard convention white=regenerate; the caller already
+        inverted any foreground mask). All land in the job's blob dir so the
         worker reads them from disk.
         """
         kind_settings = self._kind_settings(job.kind)
@@ -541,6 +544,12 @@ class MediaJobManager:
                 ref_path.write_bytes(data)
                 paths.append(str(ref_path))
             job.params["image_paths"] = paths
+        if input_mask is not None:
+            data, suffix = input_mask
+            blob_dir.mkdir(parents=True, exist_ok=True)
+            mask_path = blob_dir / f"input_mask{suffix or '.png'}"
+            mask_path.write_bytes(data)
+            job.params["mask_path"] = str(mask_path)
         self._jobs[job.id] = job
         self._terminal_events[job.id] = asyncio.Event()
         self._queue.append(job.id)

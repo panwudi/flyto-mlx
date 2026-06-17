@@ -134,10 +134,26 @@ class TestReadImageModelKind:
             ("Z-Image-Turbo-4bit", ("t2i", "z-image-turbo")),
             ("z-image-base-4bit", ("t2i", "z-image")),
             ("Qwen-Image-4bit", ("t2i", "qwen-image")),
+            # Inpaint runs on the qwen-image base alias; the dir name only
+            # selects the inpaint pipeline (docs/qwen-inpaint-engine-spec.md).
+            ("Qwen-Image-Inpaint-4bit", ("inpaint", "qwen-image")),
+            ("qwen-image-2512-inpaint", ("inpaint", "qwen-image")),
         ],
     )
     def test_known_aliases(self, name, expected):
         assert read_image_model_kind(Path("/models") / name) == expected
+
+    def test_inpaint_checked_before_plain_t2i(self):
+        # "inpaint" must win over the bare "qwen-image" t2i fallback
+        assert read_image_model_kind(Path("Qwen-Image-Inpaint")) == (
+            "inpaint", "qwen-image",
+        )
+
+    def test_edit_wins_over_inpaint_in_name(self):
+        # An edit dir that also says inpaint stays edit (edit checked first);
+        # inpaint of an edit model is a separate future concern.
+        kind, _ = read_image_model_kind(Path("qwen-image-edit-2511-inpaint"))
+        assert kind == "edit"
 
     def test_2511_marker_wins_over_plain_edit(self):
         # The dated markers must be checked before the bare edit alias
