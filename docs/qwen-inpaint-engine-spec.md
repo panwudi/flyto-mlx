@@ -153,16 +153,43 @@ inpaint 多一次 VAE 编码原图 + mask, 峰值与 edit 同量级, Phase 1 复
 
 ## 8. 验证出口判据 (Phase 1 完成定义)
 
-单测过 != 真机过. Phase 1 的完成判据是 m5max 真机对拍:
+单测过 != 真机过. 核心 loop 的完成判据是 m5max 真机验证.
 
-1. 独立脚本 (非生产路径) 在 m5max 跑移植的 mflux inpaint loop, 与真
-   diffusers `QwenImageInpaintPipeline` 用同一 image + mask + seed + prompt 出图,
-   对比保留区是否一致 / 重画区是否合理. "跑出一张图" 不等于对 -- 保留区漂移 /
-   sigma 索引错位 / mask 打包错都会照样出一张图.
-2. 像素合成后产品区与原图逐像素一致 (字节级锁验证).
-3. 走 MediaJobManager 单租约的端到端任务跑通 (queued -> in_progress -> completed
-   -> content).
+### 8.1 验证方法 (为何不是 diffusers 对拍)
 
-panic 纪律: 独立脚本绕过 MediaJobManager 单租约, 会重演单请求 prefill 撞顶
-拖死整机的风险 (m5max-ops-panic-reality). 必须在 server idle (active==0) 或租约内
-跑, 不要作为自由进程贴着生产跑.
+原计划对拍真 diffusers `QwenImageInpaintPipeline`, 但 m5max 全机无 diffusers,
+且现存权重是 mflux 4bit 量化版 (非 HF torch 原版); 真对拍要装 diffusers + 下
+~40GB torch 权重, 不划算且属大动作. 改用 mflux 自带 txt2img 作 ground truth 的
+自洽验证, 覆盖同样的失败模式 (保留区漂移 / sigma 索引 / mask 打包):
+
+- 全白 mask (整图重画) 应 == mflux QwenImage txt2img (同 seed/prompt).
+- 全黑 mask (整图保留) 应 == 原图 (仅 VAE 往返).
+- 小块 mask 保留区应贴近原图, 重画区随 prompt 变.
+
+### 8.2 验证结果 (2026-06-17, m5max, qwen-image-2512-4bit, 512px/8步)
+
+PASS. 实测 (MSE, 0-255):
+
+- allblack vs original = 1.4 (保留全部 ~= identity; 证 blend/mask 打包/sigma 索引对)
+- allwhite vs txt2img  = 0.0 (重画全部与 mflux txt2img 逐字节相同; 证去噪路径对)
+- small vs original    = 9072.9, baseline txt2img vs original = 15198.2 (保留区拉近原图)
+- 视觉: 红方块产品位置/边缘/颜色完整保留, 背景重画成热带海滩.
+
+生产模块 (含像素合成 + progress 回调 + 可选尺寸) 复跑 PASS:
+
+- 产品内部 max|diff| = 0 (字节级锁定, 合成后产品像素与原图逐像素一致).
+- 背景 mean|diff| = 108 (完全重画).
+- progress 回调 [1..8] 正常 (worker stall 超时安全).
+- 模块按文件路径加载, 仅依赖 mflux/mlx/numpy/PIL, 不引 omlx (worker venv HARD RULE).
+
+panic 纪律: 验证脚本绕过 MediaJobManager 单租约, 会重演单请求撞顶拖死整机的风险
+(m5max-ops-panic-reality). 实测时机 = server idle (95% free, 无大模型驻留), 脚本
+自身 set_wired_limit(30GB) + cache 1GB; 单次 512px/8步约 10s.
+
+### 8.3 剩余 (端到端可用前)
+
+1. 注册一个 image_pipeline=inpaint 的逻辑模型指向 qwen-image 基座权重 (discovery
+   或 registry), 路由才能 dispatch.
+2. 走 MediaJobManager 单租约的端到端任务跑通 (queued -> in_progress -> completed
+   -> content), 在 m5max 真机 (部署分支 + 重启 server) A/B.
+3. 客户端 API 文档补 inpaint 段 (mask 极性契约).

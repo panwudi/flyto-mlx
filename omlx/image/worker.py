@@ -264,20 +264,28 @@ def run(spec: dict) -> int:
         if is_inpaint:
             # mask is the standard inpaint convention (white=regenerate); the
             # caller already inverted BiRefNet foreground (spec section 2).
+            # width/height omitted -> follow the source aspect at ~1MP (mflux
+            # canvas policy); the mask is resized to match, so they stay aligned.
             from . import qwen_inpaint
+
+            def _inpaint_cb(step: int, total: int, _i: int = i) -> None:
+                _emit(
+                    phase="denoise", step=step, total_steps=total, image_index=_i
+                )
 
             pil = qwen_inpaint.generate_inpaint(
                 model,
                 prompt=spec["prompt"],
                 image_path=image_paths[0],
                 mask_path=str(mask_path),
-                width=int(spec["width"]),
-                height=int(spec["height"]),
+                width=int(spec["width"]) if spec.get("width") else None,
+                height=int(spec["height"]) if spec.get("height") else None,
                 steps=int(spec["steps"]),
                 seed=seed + i,
                 guidance=spec.get("guidance"),
                 negative_prompt=spec.get("negative_prompt"),
                 image_strength=float(spec.get("image_strength") or 1.0),
+                progress_cb=_inpaint_cb,
             )
             _emit(phase="saving", image_index=i)
             name = f"output-{i}.png"

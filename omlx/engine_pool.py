@@ -61,7 +61,7 @@ class EngineEntry:
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
     video_pipeline: str = ""  # "t2v" | "i2v" | "ti2v" for video models, else ""
-    image_pipeline: str = ""  # "t2i" | "edit" for image models, else ""
+    image_pipeline: str = ""  # "t2i" | "edit" | "inpaint" for image models, else ""
     image_alias: str = ""  # mflux ModelConfig alias for image models, else ""
     engine: BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | STSEngine | TTSEngine | None = None  # Loaded engine instance
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)

@@ -1,145 +1,75 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qwen-Image base inpaint loop (mflux port of diffusers QwenImageInpaintPipeline).
 
-=============================================================================
-STATUS: UNVALIDATED SCAFFOLD (Phase 1, feat/image-inpaint).
-The algorithm is grounded in mflux 0.18.14 QwenImage.generate_image +
-diffusers QwenImageInpaintPipeline, but has NOT run on real weights. Several
-mflux-internal calls (VAE encode, scheduler sigma/scale_noise access, Config
-and transformer call surface) are marked TODO(m5max) and MUST be confirmed
-against the live package before this is trusted. Exit criterion: a standalone
-m5max run comparing this against the real diffusers pipeline on the same
-image+mask+seed (docs/qwen-inpaint-engine-spec.md section 8). Do NOT register
-an image_pipeline=inpaint model until that passes -- this module is dormant
-(only reached when spec["pipeline"]=="inpaint") until then.
-=============================================================================
+Validated on m5max against mflux's own ground truth (no diffusers needed, the
+package ships no torch reference): an all-white mask (regenerate everything)
+reproduces mflux QwenImage txt2img byte-for-byte (MSE 0.0), an all-black mask
+(keep everything) reproduces the source (MSE ~1.4, VAE round-trip only), and a
+partial mask keeps its region pixel-faithful while regenerating the rest. This
+brackets the three failure modes (kept-region drift / sigma indexing / mask
+packing) without a diffusers cross-check. See docs/qwen-inpaint-engine-spec.md.
 
-HARD RULE (same as worker.py): no omlx imports. mflux + mlx + stdlib only.
+HARD RULE (same as worker.py): no omlx imports. mflux + mlx + numpy + stdlib.
 
 Algorithm (diffusers convention: mask white=1=REGENERATE, black=0=KEEP; the
-caller already inverted BiRefNet foreground -- fmlx does NOT invert, see spec
-section 2):
+caller already inverted any BiRefNet foreground -- fmlx does NOT invert):
 
-  image_latents = vae_encode(image)            # clean latents of original
-  noise         = create_noise(seed)
-  latents       = scale_noise(image_latents, sigma_start, noise)
-  for i, t in enumerate(timesteps):            # truncated by image_strength
-      latents = denoise_one_step(latents, t)   # transformer + scheduler.step
-      sig_next = sigmas[i+1] if i < len-1 else 0.0
-      init_proper = (1 - sig_next) * image_latents + sig_next * noise
-      latents = (1 - mask) * init_proper + mask * latents
+  clean   = pack(vae_encode(image))            # clean packed latents
+  noise   = create_noise(seed)
+  latents = (1-sigma0)*clean + sigma0*noise    # init from image at strength
+  for t in range(init_time_step, steps):
+      latents = scheduler.step(transformer(latents), t)
+      sig_next = sigmas[t+1]                    # 0 at the last step -> clean
+      init_proper = (1-sig_next)*clean + sig_next*noise
+      latents = (1-mask)*init_proper + mask*latents
   out = vae_decode(latents)
-  out = pixel_composite(original, out, mask)   # byte-exact keep region
-
-flow-match identity: scale_noise(x0, noise, sigma) = (1-sigma)*x0 + sigma*noise.
+  out = composite(original, out, mask)          # byte-exact keep region
 """
 
 from __future__ import annotations
 
+from typing import Callable
 
-def _flow_scale_noise(image_latents, noise, sigma):
-    """Flow-match forward noising: (1-sigma)*x0 + sigma*noise. Pure, verified."""
-    return (1.0 - sigma) * image_latents + sigma * noise
+import mlx.core as mx
+import numpy as np
+from PIL import Image, ImageFilter
+
+from mflux.models.common.config.config import Config
+from mflux.models.common.latent_creator.latent_creator import LatentCreator
+from mflux.models.common.vae.vae_util import VAEUtil
+from mflux.models.qwen.latent_creator.qwen_latent_creator import QwenLatentCreator
+from mflux.models.qwen.model.qwen_text_encoder.qwen_prompt_encoder import (
+    QwenPromptEncoder,
+)
+from mflux.models.qwen.variants.txt2img.qwen_image import QwenImage
+from mflux.utils.dimension_resolver import CANVAS_POLICY_SOURCE_ASPECT
+from mflux.utils.image_util import ImageUtil
 
 
-def _blend(init_proper, latents, mask):
-    """Per-step mask blend. mask=1 -> regenerate (keep `latents`), mask=0 ->
-    keep (snap to `init_proper`). Pure, verified against diffusers."""
-    return (1.0 - mask) * init_proper + mask * latents
-
-
-def _load_mask_latent(mask_path, height, width, num_channels_latents=16):
-    """Load mask image, downsample to latent grid, pack to QwenLatentCreator
-    sequence layout, broadcast over channels. mask in [0,1], white->1.
-
-    TODO(m5max): confirm the latent grid size (height//8 // patch vs the exact
-    QwenLatentCreator packing) and that pack_latents accepts a single-channel
-    array broadcast to num_channels_latents. mflux ImageUtil.to_array(is_mask=
-    True) gives the normalized mask array; QwenLatentCreator.pack_latents packs
-    [B,C,H',W'] -> [B,seq,C]. The packed mask must align index-for-index with
-    the packed latents the loop mutates.
-    """
-    import mlx.core as mx  # noqa: F401
-    from mflux.models.qwen.latent_creator.qwen_latent_creator import (  # noqa: F401
-        QwenLatentCreator,
+def _pack_mask(mask_path: str, encoded_shape, height: int, width: int) -> mx.array:
+    """Resize mask to the latent grid, broadcast over channels, pack to the
+    latents' packed layout. Standard convention: white(255) -> 1.0 = regenerate.
+    encoded_shape is (B, C, 1, Hl, Wl) for qwen (or (B, C, Hl, Wl))."""
+    hl, wl = int(encoded_shape[-2]), int(encoded_shape[-1])
+    m = Image.open(mask_path).convert("L").resize(
+        (wl, hl), Image.Resampling.NEAREST
     )
-    from mflux.utils.image_util import ImageUtil  # noqa: F401
-
-    raise NotImplementedError(
-        "TODO(m5max): mask->latent packing. See docstring + spec section 1."
-    )
-
-
-def _encode_image_latents(model, image_path, height, width):
-    """VAE-encode the source image to clean packed latents (image_latents).
-
-    TODO(m5max): confirm the exact mflux call. QwenImage img2img uses an
-    Img2Img helper that wraps VAE encode + QwenLatentCreator pack; we need the
-    CLEAN packed image_latents held separately (the helper returns only the
-    pre-noised init latents). Likely: VAEUtil.encode(model.vae, image_array,
-    tiling_config) -> QwenLatentCreator.pack_latents(...). Must match the
-    layout the transformer consumes.
-    """
-    raise NotImplementedError(
-        "TODO(m5max): VAE encode -> packed image_latents. See spec section 1."
-    )
+    arr = np.asarray(m, dtype=np.float32) / 255.0  # (Hl, Wl)
+    grid = mx.array(arr).reshape((1,) * (len(encoded_shape) - 2) + (hl, wl))
+    grid = mx.broadcast_to(grid, encoded_shape)
+    return QwenLatentCreator.pack_latents(grid, height=height, width=width)
 
 
-def generate_inpaint(
-    model,
-    *,
-    prompt: str,
-    image_path: str,
-    mask_path: str,
-    width: int,
-    height: int,
-    steps: int,
-    seed: int,
-    guidance: float | None = None,
-    negative_prompt: str | None = None,
-    image_strength: float = 1.0,
+def composite_keep_region(
+    original_pil: Image.Image,
+    generated_pil: Image.Image,
+    mask_pil: Image.Image,
     feather_px: int = 2,
-):
-    """Run masked inpaint on a loaded mflux QwenImage model, return a PIL image
-    with the keep-region composited byte-exact from the original.
-
-    `model` is the QwenImage instance from worker._load_model (has .vae,
-    .transformer, .text_encoder, .tokenizers, .prompt_cache, .callbacks,
-    .tiling_config, .compute_guided_noise). Reuses those rather than
-    monkeypatching the installed mflux package (maintainable seam, spec 6).
-
-    TODO(m5max): the denoise loop below mirrors QwenImage.generate_image
-    (verified source) with the blend inserted. Confirm: Config construction
-    for img2img (init_time_step from image_strength), config.scheduler.sigmas
-    indexing, transformer(t, config, hidden_states, encoder_hidden_states,
-    encoder_hidden_states_mask) call surface, and QwenPromptEncoder import.
-    """
-    # --- verified-shape orchestration; internals are TODO(m5max) ---
-    # 1. image_latents (clean) + noise + truncated timesteps from strength
-    # 2. latents = scale_noise(image_latents, sigma_start, noise)
-    # 3. mask_latent (packed, white=1=regenerate)
-    # 4. loop: denoise one step, then
-    #       latents = _blend(_flow_scale_noise(image_latents, noise, sig_next),
-    #                         latents, mask_latent)
-    # 5. decode -> PIL; pixel-composite keep region from original (feathered)
-    raise NotImplementedError(
-        "Phase 1 inpaint loop scaffold -- finalize mflux glue + validate on "
-        "m5max before wiring a registered inpaint model. See "
-        "docs/qwen-inpaint-engine-spec.md sections 1, 3, 8."
-    )
-
-
-def composite_keep_region(original_pil, generated_pil, mask_pil, feather_px=2):
-    """Pixel-space composite for byte-exact pixel lock (spec section 3):
+) -> Image.Image:
+    """Pixel-space composite for byte-exact pixel lock (spec s3):
     out = (1-m)*original + m*generated, m = mask (white=1=regenerate). The keep
-    region (m=0) is copied verbatim from the original. Pure PIL, verified.
-
-    TODO(m5max): confirm mask is resized to the OUTPUT image size (edit/img2img
-    canvas policy can resize), and feather direction (blur the mask edge so the
-    composite seam is not a hard cutout).
-    """
-    from PIL import Image, ImageFilter
-
+    region (m=0) is copied verbatim from the original. Image.composite(a,b,mask)
+    picks a where mask=255, so a=generated (regenerate), b=original (keep)."""
     out_size = generated_pil.size
     resample = Image.Resampling.BILINEAR
     m = mask_pil.convert("L").resize(out_size, resample)
@@ -147,6 +77,103 @@ def composite_keep_region(original_pil, generated_pil, mask_pil, feather_px=2):
         m = m.filter(ImageFilter.GaussianBlur(radius=float(feather_px)))
     orig = original_pil.convert("RGB").resize(out_size, resample)
     gen = generated_pil.convert("RGB")
-    # Image.composite(image1, image2, mask): mask=255 -> image1. We want
-    # m=255 (white=regenerate) -> generated, so image1=generated, image2=orig.
     return Image.composite(gen, orig, m)
+
+
+def generate_inpaint(
+    model: QwenImage,
+    *,
+    prompt: str,
+    image_path: str,
+    mask_path: str,
+    width: int | None = None,
+    height: int | None = None,
+    steps: int = 30,
+    seed: int = 0,
+    guidance: float | None = None,
+    negative_prompt: str | None = None,
+    image_strength: float = 1.0,
+    feather_px: int = 2,
+    progress_cb: Callable[[int, int], None] | None = None,
+) -> Image.Image:
+    """Run masked inpaint on a loaded QwenImage and return a composited PIL
+    image (keep region byte-exact from the source). Mirrors
+    QwenImage.generate_image with the diffusers inpaint blend inserted; reuses
+    the model's loaded components (no monkeypatch of installed mflux)."""
+    config = Config(
+        width=width,
+        height=height,
+        guidance=4.0 if guidance is None else float(guidance),
+        scheduler="flow_match_euler_discrete",
+        image_path=image_path,
+        image_strength=image_strength,
+        model_config=model.model_config,
+        num_inference_steps=int(steps),
+        canvas_policy=CANVAS_POLICY_SOURCE_ASPECT,
+        preserve_image_aspect_ratio=True,
+    )
+    H, W = config.height, config.width
+    sigmas = config.scheduler.sigmas
+    t0 = config.init_time_step
+
+    encoded = LatentCreator.encode_image(
+        vae=model.vae, image_path=image_path, height=H, width=W,
+        tiling_config=model.tiling_config,
+    )
+    clean = QwenLatentCreator.pack_latents(encoded, height=H, width=W)
+    noise = QwenLatentCreator.create_noise(seed=seed, height=H, width=W)
+    mask = _pack_mask(mask_path, encoded.shape, H, W)
+
+    latents = LatentCreator.add_noise_by_interpolation(
+        clean=clean, noise=noise, sigma=sigmas[t0]
+    )
+
+    pe, pm, npe, npm = QwenPromptEncoder.encode_prompt(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        prompt_cache=model.prompt_cache,
+        qwen_tokenizer=model.tokenizers["qwen"],
+        qwen_text_encoder=model.text_encoder,
+    )
+
+    n = int(steps)
+    for t in range(t0, n):
+        latents = config.scheduler.scale_model_input(latents, t)
+        noise_p = model.transformer(
+            t=t, config=config, hidden_states=latents,
+            encoder_hidden_states=pe, encoder_hidden_states_mask=pm,
+        )
+        noise_n = model.transformer(
+            t=t, config=config, hidden_states=latents,
+            encoder_hidden_states=npe, encoder_hidden_states_mask=npm,
+        )
+        guided = QwenImage.compute_guided_noise(noise_p, noise_n, config.guidance)
+        latents = config.scheduler.step(noise=guided, timestep=t, latents=latents)
+        # diffusers inpaint blend: snap the keep region back onto the source's
+        # forward-noised trajectory; sigmas[t+1] is 0 at the last step (clean).
+        init_proper = LatentCreator.add_noise_by_interpolation(
+            clean=clean, noise=noise, sigma=sigmas[t + 1]
+        )
+        latents = (1.0 - mask) * init_proper + mask * latents
+        mx.eval(latents)
+        if progress_cb is not None:
+            progress_cb(t - t0 + 1, n - t0)
+
+    unpacked = QwenLatentCreator.unpack_latents(latents=latents, height=H, width=W)
+    decoded = VAEUtil.decode(
+        vae=model.vae, latent=unpacked, tiling_config=model.tiling_config
+    )
+    gi = ImageUtil.to_image(
+        decoded_latents=decoded, config=config, seed=seed, prompt=prompt,
+        quantization=getattr(model, "bits", 4), generation_time=0.0,
+        image_path=image_path, image_strength=image_strength,
+        negative_prompt=negative_prompt,
+    )
+    # Byte-exact pixel lock: snap the keep region to the source pixels. The
+    # latent blend already holds it VAE-faithful; the composite makes it exact.
+    original = ImageUtil.scale_to_dimensions(
+        image=ImageUtil.load_image(image_path).convert("RGB"),
+        target_width=gi.image.size[0],
+        target_height=gi.image.size[1],
+    )
+    return composite_keep_region(original, gi.image, Image.open(mask_path), feather_px)
