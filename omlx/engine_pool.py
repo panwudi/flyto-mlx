@@ -32,6 +32,7 @@ from .engine.stt import STTEngine
 from .engine.sts import STSEngine
 from .engine.tts import TTSEngine
 from .engine.vlm import VLMBatchedEngine
+from .engine.hrm_text import HrmTextEngine
 from .exceptions import (
     EnginePoolError,
     InsufficientMemoryError,
@@ -54,8 +55,8 @@ class EngineEntry:
 
     model_id: str  # Directory name (e.g., "llama-3b")
     model_path: str  # Full path to model directory
-    model_type: Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "video", "video_upscaler", "image"]  # Model type
-    engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "audio_stt", "audio_tts", "audio_sts", "video", "video_upscaler", "image"]  # Engine type to use
+    model_type: Literal["llm", "vlm", "hrm_text", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "video", "video_upscaler", "image"]  # Model type
+    engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "hrm_text", "audio_stt", "audio_tts", "audio_sts", "video", "video_upscaler", "image"]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
@@ -210,6 +211,7 @@ class EnginePool:
     _MODEL_TYPE_TO_ENGINE: dict[str, str] = {
         "llm": "batched",
         "vlm": "vlm",
+        "hrm_text": "hrm_text",
         "embedding": "embedding",
         "reranker": "reranker",
         "audio_stt": "audio_stt",
@@ -680,6 +682,13 @@ class EnginePool:
                     )
                 elif effective_type == "vlm":
                     engine = VLMBatchedEngine(
+                        model_name=entry.model_path,
+                        trust_remote_code=trc,
+                        scheduler_config=self._scheduler_config,
+                        model_settings=model_settings,
+                    )
+                elif effective_type == "hrm_text":
+                    engine = HrmTextEngine(
                         model_name=entry.model_path,
                         trust_remote_code=trc,
                         scheduler_config=self._scheduler_config,
