@@ -2516,10 +2516,19 @@
             // artifact lives on the server: completed jobs re-fetch the
             // mp4, still-running jobs resume polling, purged artifacts
             // surface the retention note.
-            async rehydrateVideo(msg) {
+            async rehydrateVideo(msg, attempt = 0) {
         const v = msg._video;
         if (!v || !v.job_id || v.url) return;
         const auth = { 'Authorization': `Bearer ${this.getApiKey()}` };
+        // Same transient-abandonment guard as rehydrateImage: a single failed
+        // status poll during loadChat must not strand the bubble at its
+        // persisted progress with no video until the next load. Retry first.
+        const retryTransient = () => {
+            if (attempt < 4) {
+                setTimeout(() => this.rehydrateVideo(msg, attempt + 1),
+                           1500 * (attempt + 1));
+            }
+        };
         try {
             const s = await fetch(`/v1/videos/${v.job_id}`, { headers: auth });
             if (s.status === 404) {
@@ -2528,7 +2537,7 @@
                 this.saveCurrentChat();
                 return;
             }
-            if (!s.ok) return; // transient: keep persisted state
+            if (!s.ok) { retryTransient(); return; } // transient: retry before abandoning
             const j = await s.json();
             v.status = j.status;
             v.progress = j.progress || 0;
@@ -2555,7 +2564,7 @@
                 }).finally(() => this.saveCurrentChat());
             }
             this.saveCurrentChat();
-        } catch (e) { /* network hiccup: keep persisted state */ }
+        } catch (e) { retryTransient(); /* network hiccup: retry before abandoning */ }
     },
 
             // Cancel any in-flight video/image jobs among messages about
@@ -2765,10 +2774,22 @@
     // live on the server: completed jobs re-fetch the PNGs, still-running
     // jobs resume polling, purged artifacts surface the expired
     // placeholder with the regenerate hint.
-    async rehydrateImage(msg) {
+    async rehydrateImage(msg, attempt = 0) {
         const im = msg._image;
         if (!im || !im.job_id || (im.urls && im.urls.length > 0)) return;
         const auth = { 'Authorization': `Bearer ${this.getApiKey()}` };
+        // A transient status-poll failure here must not permanently abandon
+        // the bubble. loadChat strips the session blob urls before calling
+        // this un-awaited, so a single !ok (or network hiccup) used to leave
+        // the persisted "100% done" caption with no image until the NEXT
+        // load happened to succeed -- the intermittent "image never showed,
+        // refresh fixed it" report. Retry with backoff before giving up.
+        const retryTransient = () => {
+            if (attempt < 4) {
+                setTimeout(() => this.rehydrateImage(msg, attempt + 1),
+                           1500 * (attempt + 1));
+            }
+        };
         try {
             const s = await fetch(`/v1/images/${im.job_id}`, { headers: auth });
             if (s.status === 404) {
@@ -2777,7 +2798,7 @@
                 this.saveCurrentChat();
                 return;
             }
-            if (!s.ok) return; // transient: keep persisted state
+            if (!s.ok) { retryTransient(); return; } // transient: retry before abandoning
             const j = await s.json();
             im.status = j.status;
             im.progress = j.progress || 0;
@@ -2806,7 +2827,7 @@
                 }).finally(() => this.saveCurrentChat());
             }
             this.saveCurrentChat();
-        } catch (e) { /* network hiccup: keep persisted state */ }
+        } catch (e) { retryTransient(); /* network hiccup: retry before abandoning */ }
     },
 
     async cancelImage(msg) {
