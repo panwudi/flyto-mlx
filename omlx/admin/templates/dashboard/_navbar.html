@@ -2,6 +2,15 @@
          xl so the extra items never overflow the centered nav pill. Custom CSS
          because the prebuilt tailwind.css has no xl: variants. -->
     <style>
+        /* The center nav is absolute at left:50%, so its shrink-to-fit width is
+           capped at ~half the container -- once the items exceed that the flex
+           children compress and the Chinese labels wrap character-by-character
+           (looks vertical). Size the pill to its content and never wrap items. */
+        .nav-center { width: max-content; }
+        .nav-center > * { flex-shrink: 0; }
+        .nav-center a, .nav-center button, .nav-center span { white-space: nowrap; }
+        /* Collapse the two tool links to icon-only below xl so the pill stays
+           narrow enough not to overlap the logo / right controls. */
         @media (max-width: 1279px) { .nav-tool-label { display: none; } }
     </style>
     <nav class="w-full py-5 px-6 md:px-12 border-b border-neutral-100 bg-white sticky top-0 z-50">
@@ -37,7 +46,7 @@
             </button>
 
             <!-- Center Navigation -->
-            <div class="hidden lg:flex items-center gap-1 bg-neutral-100 rounded-full p-1 absolute left-1/2 -translate-x-1/2">
+            <div class="nav-center hidden lg:flex items-center gap-1 bg-neutral-100 rounded-full p-1 absolute left-1/2 -translate-x-1/2">
                 <button
                     @click="setMainTab('status')"
                     :class="mainTab === 'status'
