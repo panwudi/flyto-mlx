@@ -81,50 +81,52 @@ passes on dense calls (measured clean at <=7-min windows), at the cost of more
 windows on every call. It makes no difference to slow calls, whose windows
 pass on the first try.
 
-### 3. API
+### 3. It just works -- the server decides
 
-Opt in per request:
-
-```
-POST <base_url>/v1/audio/transcriptions
-Content-Type: multipart/form-data
-
-file           = @call.wav
-model          = qwen3-asr-1.7b-audio8-text4
-long_audio     = chunk        # "off" (default) | "chunk"
-chunk_minutes  = 15           # optional, target window length; default 15
-```
-
-| Field | Type | Default | Meaning |
-|---|---|---|---|
-| `long_audio` | string | `off` | `off` keeps the single whole-file pass; `chunk` enables silence-aware chunking. |
-| `chunk_minutes` | float | `15` | Target window length in minutes. The window count is `ceil(total / chunk_minutes)`. Windows snap to the nearest silence near each boundary; a hard cap of 1.25x (18.75 min at the default) bounds any single window. |
-
-One curl transcribes a call of any length:
+The default is `long_audio=auto`: the server transcribes once, checks the
+output for the repeat-loop signature (the same 12-gram uniqueness check the
+guard uses), and **only if it degenerated** re-transcribes chunked. A bare
+curl transcribes a call of any length with nothing extra:
 
 ```bash
 curl -H "Authorization: Bearer $KEY" \
   -F file=@call-89min.wav \
   -F model=qwen3-asr-1.7b-audio8-text4 \
-  -F long_audio=chunk \
   http://m5max:8000/v1/audio/transcriptions
 ```
 
-### 4. Per-model default
+`auto` is zero-config and model-agnostic: clean, short, or non-degenerating
+audio (e.g. Whisper) never triggers a re-chunk, so it costs one extra pass
+only when a call actually broke. The consumer never has to know the feature
+exists.
 
-To make bare curls (no `long_audio` field) chunk automatically, set the
-default on the ASR model via the admin settings API:
+### 4. Overriding per request
+
+The `long_audio` and `chunk_minutes` form fields let a consumer override the
+default. They are published in the server's OpenAPI schema (`/openapi.json`,
+Swagger `/docs`).
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `long_audio` | string | `auto` | `auto` = transcribe once, re-chunk only if degenerate; `chunk` = always chunk proactively (skips the probe -- best on a model known to degenerate); `off` = single pass, never chunk. |
+| `chunk_minutes` | float | `15` | Target window length in minutes for chunking. The window count is `ceil(total / chunk_minutes)`. Windows snap to the nearest silence near each boundary; a hard cap of 1.25x (18.75 min at the default) bounds any single window. |
+
+### 5. Per-model default
+
+`auto` is the server default for every model. To pin a specific mode on a
+model -- e.g. set a known-degenerating model to `chunk` so it skips the
+single-pass probe entirely (no wasted pass) -- use the admin settings API:
 
 ```
 PUT <base_url>/api/models/{model_id}/settings
 { "default_long_audio": "chunk", "long_audio_chunk_minutes": 15 }
 ```
 
-`default_long_audio` is `off` or `chunk`; a per-request `long_audio` field
-always wins over it. `long_audio_chunk_minutes` sets the target window length
-when omitted per request.
+`default_long_audio` is `auto`, `chunk`, or `off`; a per-request `long_audio`
+field always wins over it. `long_audio_chunk_minutes` sets the target window
+length when omitted per request.
 
-### 5. Composition with diarization and word timestamps
+### 6. Composition with diarization and word timestamps
 
 - **`energy_tripass` is not chunked.** The 3-pass stereo path already re-ASRs
   in short forced-aligner windows and rebuilds its text from those windows, so
@@ -141,7 +143,7 @@ when omitted per request.
   transcript is assembled and operate on global-timeline words, so they see
   the clean concatenated result exactly as they would a single pass.
 
-### 6. Where it lives
+### 7. Where it lives
 
 - `omlx/engine/audio_chunk.py` -- pure, engine-free: `plan_chunks` (silence
   split planning), `ngram_uniqueness` (the guard), `bisect_at_silence`
@@ -207,49 +209,46 @@ token 循环 -- 中文通话退化成 `啊。啊。啊。...` -- 后面内容全
 上这些白跑 (实测 <=7 分钟窗口干净), 代价是每通话都切更多块. 对慢速通话无差别
 (它们的窗口首趟就过).
 
-### 3. API
+### 3. 开箱即用 -- 服务器自己判断
 
-按请求 opt-in:
-
-```
-POST <base_url>/v1/audio/transcriptions
-Content-Type: multipart/form-data
-
-file           = @call.wav
-model          = qwen3-asr-1.7b-audio8-text4
-long_audio     = chunk        # "off" (默认) | "chunk"
-chunk_minutes  = 15           # 可选, 目标窗口时长; 默认 15
-```
-
-| 字段 | 类型 | 默认 | 含义 |
-|---|---|---|---|
-| `long_audio` | string | `off` | `off` 保持单趟整文件; `chunk` 启用静音感知分块. |
-| `chunk_minutes` | float | `15` | 目标窗口时长 (分钟). 窗口数 = `ceil(总时长 / chunk_minutes)`. 窗口边界吸附到附近静音; 硬上限为 1.25 倍 (默认下 18.75 分钟) 约束单窗口. |
-
-一条 curl 转任意长度通话:
+默认是 `long_audio=auto`: 服务器先正常转一趟, 用重复率检查 (守卫用的同一个
+12-gram 唯一率) 看输出像不像崩溃循环, **只有崩了才**切块重转. 裸 curl 什么都
+不用加就能转任意长度:
 
 ```bash
 curl -H "Authorization: Bearer $KEY" \
   -F file=@call-89min.wav \
   -F model=qwen3-asr-1.7b-audio8-text4 \
-  -F long_audio=chunk \
   http://m5max:8000/v1/audio/transcriptions
 ```
 
-### 4. 按模型设默认
+`auto` 零配置、模型无关: 干净/短/不退化的音频 (比如 Whisper) 永远不会触发重转,
+所以只有真崩的通话才多花一趟. 消费者根本不需要知道这个特性存在.
 
-要让裸 curl (不带 `long_audio` 字段) 自动分块, 通过 admin 设置 API 给 ASR
-模型设默认:
+### 4. 按请求覆盖
+
+`long_audio` 和 `chunk_minutes` 两个表单字段让消费者覆盖默认. 它们发布在服务器
+的 OpenAPI 规范里 (`/openapi.json`, Swagger `/docs`).
+
+| 字段 | 类型 | 默认 | 含义 |
+|---|---|---|---|
+| `long_audio` | string | `auto` | `auto` = 转一趟, 崩了才重转切块; `chunk` = 总是主动切块 (跳过试探趟, 适合已知会崩的模型); `off` = 单趟, 从不切块. |
+| `chunk_minutes` | float | `15` | 切块的目标窗口时长 (分钟). 窗口数 = `ceil(总时长 / chunk_minutes)`. 窗口边界吸附到附近静音; 硬上限为 1.25 倍 (默认下 18.75 分钟) 约束单窗口. |
+
+### 5. 按模型设默认
+
+`auto` 是所有模型的服务器默认. 想给某个模型钉死某个模式 -- 比如把已知会崩的
+模型设成 `chunk` 让它跳过单趟试探 (不白跑) -- 通过 admin 设置 API:
 
 ```
 PUT <base_url>/api/models/{model_id}/settings
 { "default_long_audio": "chunk", "long_audio_chunk_minutes": 15 }
 ```
 
-`default_long_audio` 取 `off` 或 `chunk`; 按请求的 `long_audio` 字段永远优先.
-`long_audio_chunk_minutes` 在请求未指定时作为目标窗口时长.
+`default_long_audio` 取 `auto`, `chunk`, 或 `off`; 按请求的 `long_audio` 字段
+永远优先. `long_audio_chunk_minutes` 在请求未指定时作为目标窗口时长.
 
-### 5. 与 diarization / 词级时间戳的组合
+### 6. 与 diarization / 词级时间戳的组合
 
 - **`energy_tripass` 不分块.** 3-pass 立体声路径本就在短的 forced-aligner
   窗口里重跑 ASR 并用这些窗口重建文本, 故其合并转写在长音频上不退化. 在
@@ -262,7 +261,7 @@ PUT <base_url>/api/models/{model_id}/settings
 - **`energy` (单 pass) 和 `pyannote` 可组合.** 两者都在主转写组装完之后运行,
   作用于全局时间轴的词, 故看到的是干净的拼接结果, 与单趟无异.
 
-### 6. 代码位置
+### 7. 代码位置
 
 - `omlx/engine/audio_chunk.py` -- 纯逻辑, 不依赖引擎: `plan_chunks` (静音切点
   规划), `ngram_uniqueness` (守卫), `bisect_at_silence` (再切点),

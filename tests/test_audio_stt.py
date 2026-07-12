@@ -1115,7 +1115,8 @@ class TestLongAudioChunking:
         assert "啊。啊。啊。" not in body["text"]
         assert ngram_uniqueness(body["text"]) > 0.5
 
-    def test_off_default_does_not_chunk(self, audio_client, tmp_path):
+    def test_auto_default_clean_audio_single_pass(self, audio_client, tmp_path):
+        # Default is "auto": a clean single pass is not re-chunked.
         client, pool = audio_client
         wav = tmp_path / "plain.wav"
         self._write_wav(wav, [("speech", 20.0)])
@@ -1124,10 +1125,60 @@ class TestLongAudioChunking:
         resp = client.post(
             "/v1/audio/transcriptions",
             files={"file": ("plain.wav", wav.read_bytes(), "audio/wav")},
-            data={"model": "qwen3-asr"},  # no long_audio -> default off
+            data={"model": "qwen3-asr"},  # no long_audio -> default "auto"
         )
         assert resp.status_code == 200, resp.text
-        assert len(calls) == 1                       # single whole-file pass
+        assert len(calls) == 1                       # clean -> no re-chunk
+
+    def test_auto_rechunks_on_degeneration(self, audio_client, tmp_path):
+        # Default "auto": a degenerate single pass on splittable audio is
+        # automatically re-transcribed chunked, and the guard rescues it.
+        from omlx.engine.audio_chunk import ngram_uniqueness
+
+        client, pool = audio_client
+        wav = tmp_path / "dense.wav"
+        self._write_wav(wav, [
+            ("speech", 2.75), ("silence", 0.5),
+            ("speech", 2.5), ("silence", 0.5),
+            ("speech", 2.5), ("silence", 0.5),
+            ("speech", 2.75),
+        ])
+        calls: list = []
+        pool.get_engine.return_value.transcribe = self._degenerate_by_duration(
+            calls, thresh_s=4.0,
+        )
+        # Drop the 5-min floor so the ~12s test audio clears the auto
+        # duration gate AND the guard can re-split it.
+        with patch("omlx.api.audio_routes._LONG_AUDIO_MIN_RESPLIT_S", 2.0):
+            resp = client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("dense.wav", wav.read_bytes(), "audio/wav")},
+                data={"model": "qwen3-asr"},  # no long_audio -> "auto"
+            )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert len(calls) > 1                        # probe + re-chunk passes
+        assert "啊。啊。啊。" not in body["text"]      # rescued, not the loop
+        assert ngram_uniqueness(body["text"]) > 0.5
+
+    def test_off_forces_single_pass_even_if_degenerate(self, audio_client, tmp_path):
+        # "off" opts out entirely: one pass, no auto-detect, no chunking --
+        # the caller gets whatever the single pass produced.
+        client, pool = audio_client
+        wav = tmp_path / "dense.wav"
+        self._write_wav(wav, [("speech", 20.0)])
+        calls: list = []
+        pool.get_engine.return_value.transcribe = self._degenerate_by_duration(
+            calls, thresh_s=4.0,
+        )
+        resp = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("dense.wav", wav.read_bytes(), "audio/wav")},
+            data={"model": "qwen3-asr", "long_audio": "off"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert len(calls) == 1                        # single pass, no re-chunk
+        assert "啊。" in resp.json()["text"]           # degenerate output honored
 
     def test_invalid_long_audio_rejected(self, audio_client, tmp_path):
         client, _ = audio_client

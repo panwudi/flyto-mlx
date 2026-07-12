@@ -222,20 +222,25 @@ class ModelSettings:
     # Per-request ``diarize_backend`` always wins over this setting.
     default_diarize_quality: Optional[str] = None
 
-    # Long-audio auto-chunking for decoder-only ASR. Qwen3-ASR transcribes a
-    # single real call cleanly up to ~30 min, then degenerates past ~40 min
-    # into a repeated-token loop (e.g. "啊。啊。啊。") that drops the back half
-    # of the content; raising max_tokens / repetition_penalty only reshapes
-    # the garbage. Set this on the *ASR* model.
-    #   None / "off" — transcribe the whole file in one pass (current default)
-    #   "chunk"      — split at silence into ~long_audio_chunk_minutes windows,
-    #                  transcribe each independently (no previous-text context,
-    #                  which is what seeds the loop), concatenate with per-window
-    #                  time offsets. A repeat-loop guard re-splits any window
-    #                  that still degenerates. Only the single-pass transcribe
-    #                  path is chunked; energy_tripass already re-ASRs in short
-    #                  aligner windows and does not degenerate.
-    # A per-request ``long_audio`` form field overrides this setting.
+    # Long-audio handling for decoder-only ASR. Qwen3-ASR degenerates into a
+    # repeated-token loop (e.g. "啊。啊。啊。") once a single pass generates too
+    # much text -- driven by output length (content density), not audio
+    # minutes; raising max_tokens / repetition_penalty only reshapes the
+    # garbage. Set this on the *ASR* model to override the server "auto"
+    # default.
+    #   None — use the server default ("auto").
+    #   "auto"  — transcribe once; if the output looks like the loop, re-
+    #             transcribe chunked. Only pays extra on an actual break.
+    #   "chunk" — always chunk proactively (skip the single-pass probe; best
+    #             on a model known to degenerate). Splits at silence into
+    #             ~long_audio_chunk_minutes windows, transcribes each with no
+    #             previous-text context (what seeds the loop), concatenates
+    #             with per-window offsets. A repeat-loop guard re-splits any
+    #             window that still degenerates.
+    #   "off"   — single whole-file pass, never chunk.
+    # Only the single-pass transcribe path is managed; energy_tripass already
+    # re-ASRs in short aligner windows and does not degenerate. A per-request
+    # ``long_audio`` form field overrides this setting.
     default_long_audio: Optional[str] = None
 
     # Target chunk length in minutes for long_audio="chunk". None = server

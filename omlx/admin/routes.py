@@ -171,9 +171,10 @@ class ModelSettingsRequest(BaseModel):
     # L/R speakers; "high" auto-upgrades to 3-pass energy_tripass (3x ASR).
     # Per-request diarize_backend always wins over this preference.
     default_diarize_quality: str | None = None
-    # Long-audio auto-chunking for decoder-only ASR: "off" (or None) transcribes
-    # the whole file in one pass; "chunk" splits at silence into windows. Set on
-    # the ASR model. Per-request long_audio always wins.
+    # Long-audio handling for decoder-only ASR. None = server default ("auto":
+    # transcribe once, re-transcribe chunked only if the output degenerates).
+    # "chunk" = always chunk proactively; "off" = single pass. Set on the ASR
+    # model. Per-request long_audio always wins.
     default_long_audio: str | None = None
     # Target chunk length (minutes) for default_long_audio="chunk". None = 15.
     long_audio_chunk_minutes: float | None = None
@@ -2245,7 +2246,7 @@ async def update_model_settings(
     if "default_long_audio" in sent:
         current_settings.default_long_audio = (
             request.default_long_audio
-            if request.default_long_audio in ("off", "chunk")
+            if request.default_long_audio in ("off", "chunk", "auto")
             else None
         )
     if "long_audio_chunk_minutes" in sent:
