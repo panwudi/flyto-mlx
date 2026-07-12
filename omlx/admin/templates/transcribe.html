@@ -124,9 +124,17 @@
                 try {
                     const r = await fetch('/v1/models', { headers: { 'X-API-Key': this.apiKey } });
                     const d = await r.json();
-                    const stt = (d.data || []).find(m =>
-                        String(m.model_type || '').includes('stt') && !String(m.id).toLowerCase().includes('aligner')
-                        || String(m.id).toLowerCase().includes('asr'));
+                    // Candidate STT models, excluding the forced aligner itself
+                    // (it is also an audio_stt engine). Prefer an ASR model --
+                    // only ASR models carry a forced-aligner companion, which is
+                    // what produces the word-level timestamps this page needs.
+                    // A plain audio_stt (e.g. qwen2-audio) has no aligner and
+                    // would come back with no word timestamps.
+                    const stts = (d.data || []).filter(m => {
+                        const id = String(m.id).toLowerCase();
+                        return String(m.model_type || '').includes('stt') && !id.includes('aligner');
+                    });
+                    const stt = stts.find(m => String(m.id).toLowerCase().includes('asr')) || stts[0];
                     if (stt) { this.model = stt.id; } else { this.noStt = true; }
                 } catch (e) { this.noStt = true; }
             },
