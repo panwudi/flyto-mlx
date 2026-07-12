@@ -175,7 +175,7 @@ class ModelSettingsRequest(BaseModel):
     # the whole file in one pass; "chunk" splits at silence into windows. Set on
     # the ASR model. Per-request long_audio always wins.
     default_long_audio: str | None = None
-    # Target chunk length (minutes) for default_long_audio="chunk". None = 20.
+    # Target chunk length (minutes) for default_long_audio="chunk". None = 15.
     long_audio_chunk_minutes: float | None = None
     is_pinned: bool | None = None
     is_default: bool | None = None

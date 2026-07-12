@@ -62,16 +62,24 @@ Windows are cut at silence, so there is no need for inter-window overlap
 (overlap raises word error rate); the concatenation is a straight ordered
 join.
 
-**Verified end-to-end** on the dense 42-min call at the 20-min default. The
-planner produced three 14-min windows; each one degenerated on its first pass
-(uniqueness 0.09 / 0.12 / 0.31), the guard re-split each at its mid-silence,
-and all six 7-min leaves came back clean (uniqueness 1.00). Merged result:
-12604 chars, uniqueness 1.00, a proper call opening and closing -- versus the
-8446-char, uniqueness-0.09 degenerate whole-file pass. Because this call is
-dense, every window tripped the guard: the 20-min default costs one wasted
-degenerate pass per window before the re-split. A lower `chunk_minutes`
-default trades transcription latency for fewer wasted passes on dense calls;
-it makes no difference to slow calls, whose windows pass on the first try.
+**Verified end-to-end** on the dense 42-min call. The planner produced three
+14-min windows; each one degenerated on its first pass (uniqueness
+0.09 / 0.12 / 0.31), the guard re-split each at its mid-silence, and all six
+7-min leaves came back clean (uniqueness 1.00). Merged result: 12604 chars,
+uniqueness 1.00, a proper call opening and closing -- versus the 8446-char,
+uniqueness-0.09 degenerate whole-file pass.
+
+Note that the chunk count is `ceil(total / chunk_minutes)`, so 42 min splits
+into 3 windows at both the 15-min and 20-min defaults (42/15 and 42/20 both
+round up to 3) -- the same ~14-min windows, and the same guard re-splits on a
+dense call. The default only changes the window count where the rounding
+differs (e.g. a 50-min call is 3 windows at 20 but 4 at 15). Because this call
+is dense, every window tripped the guard: one wasted degenerate pass per
+window before the re-split. Correctness does not depend on the default -- the
+guard converges regardless -- but a smaller default reduces those wasted
+passes on dense calls (measured clean at <=7-min windows), at the cost of more
+windows on every call. It makes no difference to slow calls, whose windows
+pass on the first try.
 
 ### 3. API
 
@@ -84,13 +92,13 @@ Content-Type: multipart/form-data
 file           = @call.wav
 model          = qwen3-asr-1.7b-audio8-text4
 long_audio     = chunk        # "off" (default) | "chunk"
-chunk_minutes  = 20           # optional, target window length; default 20
+chunk_minutes  = 15           # optional, target window length; default 15
 ```
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `long_audio` | string | `off` | `off` keeps the single whole-file pass; `chunk` enables silence-aware chunking. |
-| `chunk_minutes` | float | `20` | Target window length in minutes. Windows snap to the nearest silence near each boundary; a hard cap of 1.25x (25 min at the default) bounds any single window. |
+| `chunk_minutes` | float | `15` | Target window length in minutes. The window count is `ceil(total / chunk_minutes)`. Windows snap to the nearest silence near each boundary; a hard cap of 1.25x (18.75 min at the default) bounds any single window. |
 
 One curl transcribes a call of any length:
 
@@ -109,7 +117,7 @@ default on the ASR model via the admin settings API:
 
 ```
 PUT <base_url>/api/models/{model_id}/settings
-{ "default_long_audio": "chunk", "long_audio_chunk_minutes": 20 }
+{ "default_long_audio": "chunk", "long_audio_chunk_minutes": 15 }
 ```
 
 `default_long_audio` is `off` or `chunk`; a per-request `long_audio` field
@@ -125,7 +133,7 @@ when omitted per request.
   split (tripass keeps its own path).
 - **`word_timestamps` composes.** When word timestamps are requested with
   chunking, each transcript window runs the configured forced aligner on its
-  own audio. A ~20 minute window still exceeds the aligner's ~270 s
+  own audio. A ~15 minute window still exceeds the aligner's ~270 s
   single-segment limit, so within a window the aligner sub-windows itself
   (the existing `on_aligner_overflow=chunk` machinery) -- no separate
   `on_aligner_overflow` field is needed, chunking implies it.
@@ -186,13 +194,18 @@ token 循环 -- 中文通话退化成 `啊。啊。啊。...` -- 后面内容全
 
 窗口在静音处切, 故无需窗间重叠 (重叠会拉高词错率); 拼接就是顺序直连.
 
-**已端到端验证**: 用那通密集 42 分钟通话在 20 分钟默认下实测. 规划器切出三个
-14 分钟窗口, 每个首趟都退化 (唯一率 0.09 / 0.12 / 0.31), 守卫在各自中点静音处
-再切, 六个 7 分钟叶子全部干净 (唯一率 1.00). 合并结果: 12604 字, 唯一率 1.00,
-开头结尾都正常 -- 对比退化整文件的 8446 字 / 唯一率 0.09. 因为这通密集, 每个
-窗口都触发了守卫: 20 分钟默认的代价是每窗多一趟退化的白跑再切. 调低
-`chunk_minutes` 默认可用转写延迟换密集通话上更少的白跑; 对慢速通话无差别 (它们
-的窗口首趟就过).
+**已端到端验证**: 用那通密集 42 分钟通话实测. 规划器切出三个 14 分钟窗口, 每个
+首趟都退化 (唯一率 0.09 / 0.12 / 0.31), 守卫在各自中点静音处再切, 六个 7 分钟
+叶子全部干净 (唯一率 1.00). 合并结果: 12604 字, 唯一率 1.00, 开头结尾都正常 --
+对比退化整文件的 8446 字 / 唯一率 0.09.
+
+注意窗口数 = `ceil(总时长 / chunk_minutes)`, 所以 42 分钟在 15 分钟和 20 分钟
+默认下都切成 3 块 (42/15 和 42/20 都向上进位到 3) -- 同样的 ~14 分钟窗口, 密集
+通话上同样触发守卫再切. 默认只在进位不同的时长上改变块数 (比如 50 分钟通话在
+20 分钟下 3 块, 15 分钟下 4 块). 因为这通密集, 每个窗口都触发了守卫: 每窗多一趟
+退化的白跑再切. 正确性不依赖默认 -- 守卫都会收敛 -- 但更小的默认能减少密集通话
+上这些白跑 (实测 <=7 分钟窗口干净), 代价是每通话都切更多块. 对慢速通话无差别
+(它们的窗口首趟就过).
 
 ### 3. API
 
@@ -205,13 +218,13 @@ Content-Type: multipart/form-data
 file           = @call.wav
 model          = qwen3-asr-1.7b-audio8-text4
 long_audio     = chunk        # "off" (默认) | "chunk"
-chunk_minutes  = 20           # 可选, 目标窗口时长; 默认 20
+chunk_minutes  = 15           # 可选, 目标窗口时长; 默认 15
 ```
 
 | 字段 | 类型 | 默认 | 含义 |
 |---|---|---|---|
 | `long_audio` | string | `off` | `off` 保持单趟整文件; `chunk` 启用静音感知分块. |
-| `chunk_minutes` | float | `20` | 目标窗口时长 (分钟). 窗口边界吸附到附近静音; 硬上限为 1.25 倍 (默认下 25 分钟) 约束单窗口. |
+| `chunk_minutes` | float | `15` | 目标窗口时长 (分钟). 窗口数 = `ceil(总时长 / chunk_minutes)`. 窗口边界吸附到附近静音; 硬上限为 1.25 倍 (默认下 18.75 分钟) 约束单窗口. |
 
 一条 curl 转任意长度通话:
 
@@ -230,7 +243,7 @@ curl -H "Authorization: Bearer $KEY" \
 
 ```
 PUT <base_url>/api/models/{model_id}/settings
-{ "default_long_audio": "chunk", "long_audio_chunk_minutes": 20 }
+{ "default_long_audio": "chunk", "long_audio_chunk_minutes": 15 }
 ```
 
 `default_long_audio` 取 `off` 或 `chunk`; 按请求的 `long_audio` 字段永远优先.
@@ -243,7 +256,7 @@ PUT <base_url>/api/models/{model_id}/settings
   tripass 请求上开 `long_audio=chunk` 对转写分块是 no-op (tripass 走自己的
   路径).
 - **`word_timestamps` 可组合.** 分块时请求词级时间戳, 每个转写窗口在自己的
-  音频上跑配置的 forced aligner. 一个约 20 分钟窗口仍超过 aligner 约 270s 的
+  音频上跑配置的 forced aligner. 一个约 15 分钟窗口仍超过 aligner 约 270s 的
   单段上限, 故窗口内 aligner 自行再分窗 (复用已有 `on_aligner_overflow=chunk`
   机制) -- 无需单独传 `on_aligner_overflow`, 分块隐含它.
 - **`energy` (单 pass) 和 `pyannote` 可组合.** 两者都在主转写组装完之后运行,

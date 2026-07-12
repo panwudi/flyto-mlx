@@ -59,15 +59,18 @@ _DEFAULT_ALIGNER_MAX_AUDIO_S = _ALIGNER_CARD_LIMIT_S * 0.9  # 270 s
 _ALIGNER_OVERFLOW_VALUES = {"error", "chunk"}
 _ALIGNER_CHUNK_OVERLAP_S = 5.0
 
-# Long-audio auto-chunking. Decoder-only ASR (Qwen3-ASR) transcribes a real
-# call cleanly up to ~30 min, then degenerates past ~40 min into a
-# repeated-token loop ("啊。啊。啊。") that drops the back half of the audio.
-# long_audio="chunk" splits at silence into windows the model handles cleanly,
-# transcribes each independently (no cross-window context -- that seeds the
-# loop), and concatenates with per-window time offsets.
+# Long-audio auto-chunking. Decoder-only ASR (Qwen3-ASR) degenerates into a
+# repeated-token loop ("啊。啊。啊。") once a single pass generates too much text
+# -- driven by output length (content density), not audio minutes, so a dense
+# call trips it sooner. long_audio="chunk" splits at silence into windows the
+# model handles cleanly, transcribes each independently (no cross-window
+# context -- that seeds the loop), and concatenates with per-window offsets.
+# The default is a heuristic starting size; the repeat-loop guard below adapts
+# by re-splitting any window that still degenerates, so correctness does not
+# depend on picking the "right" size -- only latency does.
 _LONG_AUDIO_VALUES = {"off", "chunk"}
-_DEFAULT_LONG_AUDIO_CHUNK_MINUTES = 20.0
-# Hard cap on any single window = this * target (25 min at the 20 min default).
+_DEFAULT_LONG_AUDIO_CHUNK_MINUTES = 15.0
+# Hard cap on any single window = this * target (18.75 min at the 15 min default).
 _LONG_AUDIO_MAX_RATIO = 1.25
 # Repeat-loop guard: a window whose 12-gram uniqueness drops below this has
 # degenerated (healthy ~1.0, loop ~0.04-0.09) -- re-split and re-transcribe it.
@@ -814,11 +817,12 @@ async def create_transcription(
     model's own default applies.
 
     ``long_audio`` controls long-audio auto-chunking. Decoder-only ASR
-    (Qwen3-ASR) transcribes a real call cleanly up to ~30 min, then
-    degenerates past ~40 min into a repeated-token loop that drops the back
-    half of the audio; raising ``max_tokens`` / ``repetition_penalty`` only
-    reshapes the garbage. ``"chunk"`` splits the audio at silence pauses into
-    ``chunk_minutes``-long windows (default 20), transcribes each
+    (Qwen3-ASR) degenerates into a repeated-token loop that drops the rest of
+    the audio once a single pass generates too much text -- driven by output
+    length (content density), not audio minutes, so a dense call trips it
+    sooner; raising ``max_tokens`` / ``repetition_penalty`` only reshapes the
+    garbage. ``"chunk"`` splits the audio at silence pauses into
+    ``chunk_minutes``-long windows (default 15), transcribes each
     independently (no cross-window context -- that is exactly what seeds the
     loop), and concatenates with per-window time offsets; a repeat-loop guard
     re-splits any window that still degenerates. ``"off"`` (default) keeps the

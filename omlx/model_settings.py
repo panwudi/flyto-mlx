@@ -239,7 +239,7 @@ class ModelSettings:
     default_long_audio: Optional[str] = None
 
     # Target chunk length in minutes for long_audio="chunk". None = server
-    # default (20 min). Cut points snap to the nearest silence pause near each
+    # default (15 min). Cut points snap to the nearest silence pause near each
     # window boundary; a hard cap of 1.25x this keeps any window bounded.
     long_audio_chunk_minutes: Optional[float] = None
 
