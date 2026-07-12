@@ -59,6 +59,24 @@ _DEFAULT_ALIGNER_MAX_AUDIO_S = _ALIGNER_CARD_LIMIT_S * 0.9  # 270 s
 _ALIGNER_OVERFLOW_VALUES = {"error", "chunk"}
 _ALIGNER_CHUNK_OVERLAP_S = 5.0
 
+# Long-audio auto-chunking. Decoder-only ASR (Qwen3-ASR) transcribes a real
+# call cleanly up to ~30 min, then degenerates past ~40 min into a
+# repeated-token loop ("啊。啊。啊。") that drops the back half of the audio.
+# long_audio="chunk" splits at silence into windows the model handles cleanly,
+# transcribes each independently (no cross-window context -- that seeds the
+# loop), and concatenates with per-window time offsets.
+_LONG_AUDIO_VALUES = {"off", "chunk"}
+_DEFAULT_LONG_AUDIO_CHUNK_MINUTES = 20.0
+# Hard cap on any single window = this * target (25 min at the 20 min default).
+_LONG_AUDIO_MAX_RATIO = 1.25
+# Repeat-loop guard: a window whose 12-gram uniqueness drops below this has
+# degenerated (healthy ~1.0, loop ~0.04-0.09) -- re-split and re-transcribe it.
+_LONG_AUDIO_GUARD_UNIQUENESS = 0.5
+# Never re-split a window shorter than this (a genuinely repetitive but valid
+# stretch must not trigger endless splitting); also cap recursion depth.
+_LONG_AUDIO_MIN_RESPLIT_S = 300.0
+_LONG_AUDIO_MAX_RESPLIT_DEPTH = 3
+
 
 # ---------------------------------------------------------------------------
 # Engine pool accessor — patched in tests via omlx.api.audio_routes._get_engine_pool
@@ -724,6 +742,8 @@ async def create_transcription(
     max_tokens: Optional[int] = Form(None),
     word_timestamps: bool = Form(False),
     on_aligner_overflow: Optional[str] = Form(None),
+    long_audio: Optional[str] = Form(None),
+    chunk_minutes: Optional[float] = Form(None),
     n: int = Form(1),
     # ---- Diarization: Phase 1 energy backend for stereo+L/R, Phase 2 pyannote
     # for mono / multi-speaker / conference audio.
@@ -792,6 +812,20 @@ async def create_transcription(
     output cap. Useful for long audio with models like VibeVoice-ASR whose
     mlx-audio default (8192) truncates ~24 min files. When omitted, the
     model's own default applies.
+
+    ``long_audio`` controls long-audio auto-chunking. Decoder-only ASR
+    (Qwen3-ASR) transcribes a real call cleanly up to ~30 min, then
+    degenerates past ~40 min into a repeated-token loop that drops the back
+    half of the audio; raising ``max_tokens`` / ``repetition_penalty`` only
+    reshapes the garbage. ``"chunk"`` splits the audio at silence pauses into
+    ``chunk_minutes``-long windows (default 20), transcribes each
+    independently (no cross-window context -- that is exactly what seeds the
+    loop), and concatenates with per-window time offsets; a repeat-loop guard
+    re-splits any window that still degenerates. ``"off"`` (default) keeps the
+    single whole-file pass. Only the single-pass path is chunked --
+    ``energy_tripass`` already re-ASRs in short aligner windows and does not
+    degenerate. A per-model ``default_long_audio`` setting supplies the
+    default when this field is omitted.
 
     ``diarize_backend`` selects the speaker-attribution backend:
       * ``energy`` — stereo only; single mix-pass ASR + per-word RMS
@@ -1154,12 +1188,54 @@ async def create_transcription(
                 )
             effective_overflow = on_aligner_overflow
 
+        # Resolve long-audio auto-chunking: request > per-model default > off.
+        # Only the single-pass transcribe path is chunked -- a forced aligner
+        # gets caller text it cannot re-segment, and energy_tripass already
+        # re-ASRs in short aligner windows so its merged text does not
+        # degenerate on long audio.
+        effective_long_audio = "off"
+        long_chunk_minutes = _DEFAULT_LONG_AUDIO_CHUNK_MINUTES
+        try:
+            _sm = _get_settings_manager()
+            _ms = _sm.get_settings(resolved_model) if _sm else None
+            if _ms is not None:
+                _dla = getattr(_ms, "default_long_audio", None)
+                if _dla in _LONG_AUDIO_VALUES:
+                    effective_long_audio = _dla
+                _cm = getattr(_ms, "long_audio_chunk_minutes", None)
+                if _cm and _cm > 0:
+                    long_chunk_minutes = float(_cm)
+        except Exception:
+            pass
+        if long_audio is not None:
+            _la = (long_audio or "").lower().strip()
+            if _la not in _LONG_AUDIO_VALUES:
+                raise HTTPException(
+                    status_code=400,
+                    detail="long_audio must be 'off' or 'chunk'.",
+                )
+            effective_long_audio = _la
+        if chunk_minutes is not None:
+            if chunk_minutes <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="chunk_minutes must be a positive number of minutes.",
+                )
+            long_chunk_minutes = float(chunk_minutes)
+        long_audio_chunk_active = (
+            effective_long_audio == "chunk"
+            and not is_aligner
+            and not energy_tripass_requested
+        )
+
         # Fail fast on audio too long for forced alignment — before burning
         # ASR compute. The direct aligner call always errors (caller-supplied
         # text cannot be split); the word_timestamps auto-chain errors, or
         # chunks when on_aligner_overflow=chunk. Per-channel tripass files
         # share the uploaded audio's duration, so checking tmp_path once
-        # covers all passes.
+        # covers all passes. When long_audio chunking is active this whole-file
+        # pre-check is skipped: each transcript window aligns independently
+        # (and is short enough that _maybe_align_inplace decides per window).
         _align_should_chunk = False
         _align_window_s = _DEFAULT_ALIGNER_MAX_AUDIO_S
         if is_aligner:
@@ -1167,7 +1243,7 @@ async def create_transcription(
                 resolved_model, tmp_path,
                 overflow=effective_overflow, allow_chunk=False,
             )
-        elif word_timestamps:
+        elif word_timestamps and not long_audio_chunk_active:
             _auto_aligner = None
             try:
                 _sm = _get_settings_manager()
@@ -1211,12 +1287,24 @@ async def create_transcription(
                 aligner_engine = await pool.get_engine(aligner_resolved)
                 if not isinstance(aligner_engine, STTEngine):
                     return
-                if _align_should_chunk:
-                    # Opted into server-side chunking via on_aligner_overflow.
+                _should_chunk = _align_should_chunk
+                _window_s = _align_window_s
+                if long_audio_chunk_active:
+                    # Long-audio chunking is on: each transcript window aligns
+                    # independently, so decide chunk-vs-direct from THIS
+                    # window's own length (a ~20 min window still exceeds the
+                    # aligner's ~270 s limit and needs its own sub-windowing;
+                    # a re-split window may fall under it and align directly).
+                    _should_chunk, _window_s = _check_aligner_audio_length(
+                        aligner_resolved, audio_path,
+                        overflow="chunk", allow_chunk=True,
+                    )
+                if _should_chunk:
+                    # Server-side windowed alignment (aligner over-limit).
                     words = await _chunk_align(
                         engine, aligner_engine, audio_path,
                         language=language, max_tokens=effective_max_tokens,
-                        window_s=_align_window_s,
+                        window_s=_window_s,
                     )
                 else:
                     align_kwargs: dict = {"language": language}
@@ -1253,6 +1341,91 @@ async def create_transcription(
                     aligner_name, resolved_model, exc,
                 )
 
+        async def _transcribe_long_audio(audio_path: str) -> dict:
+            """Split long audio at silence, transcribe each window on its own,
+            guard against decoder degeneration, concatenate with global time
+            offsets. Windows are transcribed with NO cross-window context --
+            condition-on-previous-text is exactly what seeds the repeat loop.
+            Falls back to a single whole-file pass when the audio cannot be
+            decoded for slicing (e.g. a non-wav upload)."""
+            import soundfile as _sf
+            from omlx.engine.audio_chunk import (
+                bisect_at_silence,
+                concat_chunk_results,
+                ngram_uniqueness,
+                offset_result_times,
+                plan_chunks,
+            )
+            try:
+                audio, sr = _sf.read(audio_path, dtype="float32")
+            except Exception as exc:
+                logger.warning(
+                    "long_audio: cannot decode %s for chunking (%s); "
+                    "falling back to single-pass transcribe",
+                    audio_path, exc,
+                )
+                res = await engine.transcribe(audio_path, **transcribe_kwargs)
+                await _maybe_align_inplace(res, audio_path)
+                return res
+            mono_buf = audio.mean(axis=1) if getattr(audio, "ndim", 1) == 2 else audio
+            total_s = len(mono_buf) / sr if sr else 0.0
+            target_s = long_chunk_minutes * 60.0
+            max_s = target_s * _LONG_AUDIO_MAX_RATIO
+            chunks = plan_chunks(mono_buf, sr, target_s=target_s, max_s=max_s)
+            if len(chunks) <= 1:
+                # Within one window; nothing to chunk. Single pass on the
+                # original path (keeps native decode quality).
+                res = await engine.transcribe(audio_path, **transcribe_kwargs)
+                await _maybe_align_inplace(res, audio_path)
+                return res
+
+            async def _do_window(seg_audio, seg_start_s: float, depth: int) -> list:
+                """Transcribe one slice; re-split on a degenerate transcript.
+                Returns leaf results already offset to the global timeline."""
+                tf = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+                tf.close()
+                try:
+                    _sf.write(tf.name, seg_audio, sr, subtype="FLOAT")
+                    res = await engine.transcribe(tf.name, **transcribe_kwargs)
+                    uniq = ngram_uniqueness(res.get("text") or "")
+                    seg_dur = len(seg_audio) / sr if sr else 0.0
+                    if (
+                        uniq < _LONG_AUDIO_GUARD_UNIQUENESS
+                        and seg_dur > _LONG_AUDIO_MIN_RESPLIT_S
+                        and depth < _LONG_AUDIO_MAX_RESPLIT_DEPTH
+                    ):
+                        cut = bisect_at_silence(seg_audio, sr)
+                        if cut and 0.0 < cut < seg_dur:
+                            logger.info(
+                                "long_audio: window @%.0fs degenerated "
+                                "(uniq=%.3f); re-splitting at +%.0fs",
+                                seg_start_s, uniq, cut,
+                            )
+                            ci = int(cut * sr)
+                            left = await _do_window(seg_audio[:ci], seg_start_s, depth + 1)
+                            right = await _do_window(
+                                seg_audio[ci:], seg_start_s + cut, depth + 1
+                            )
+                            return left + right
+                    await _maybe_align_inplace(res, tf.name)
+                    offset_result_times(res, seg_start_s)
+                    return [res]
+                finally:
+                    try:
+                        os.unlink(tf.name)
+                    except OSError:
+                        pass
+
+            leaves: list = []
+            for (s, e) in chunks:
+                si, ei = int(s * sr), int(e * sr)
+                leaves.extend(await _do_window(mono_buf[si:ei], s, 0))
+            logger.info(
+                "long_audio: %s (%.0fs) -> %d window(s)",
+                os.path.basename(audio_path), total_s, len(leaves),
+            )
+            return concat_chunk_results(leaves, total_s, language)
+
         if energy_tripass_requested:
             # 3-pass: L only, R only, mix (mix = tmp_path). Serial — the
             # underlying MLX engine is single-threaded so asyncio.gather
@@ -1272,6 +1445,8 @@ async def create_transcription(
                 result_L, result_R, result_mix,
                 left_speaker=left_speaker, right_speaker=right_speaker,
             )
+        elif long_audio_chunk_active:
+            result = await _transcribe_long_audio(tmp_path)
         else:
             result = await engine.transcribe(tmp_path, **transcribe_kwargs)
             await _maybe_align_inplace(result, tmp_path)

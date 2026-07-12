@@ -222,6 +222,27 @@ class ModelSettings:
     # Per-request ``diarize_backend`` always wins over this setting.
     default_diarize_quality: Optional[str] = None
 
+    # Long-audio auto-chunking for decoder-only ASR. Qwen3-ASR transcribes a
+    # single real call cleanly up to ~30 min, then degenerates past ~40 min
+    # into a repeated-token loop (e.g. "啊。啊。啊。") that drops the back half
+    # of the content; raising max_tokens / repetition_penalty only reshapes
+    # the garbage. Set this on the *ASR* model.
+    #   None / "off" — transcribe the whole file in one pass (current default)
+    #   "chunk"      — split at silence into ~long_audio_chunk_minutes windows,
+    #                  transcribe each independently (no previous-text context,
+    #                  which is what seeds the loop), concatenate with per-window
+    #                  time offsets. A repeat-loop guard re-splits any window
+    #                  that still degenerates. Only the single-pass transcribe
+    #                  path is chunked; energy_tripass already re-ASRs in short
+    #                  aligner windows and does not degenerate.
+    # A per-request ``long_audio`` form field overrides this setting.
+    default_long_audio: Optional[str] = None
+
+    # Target chunk length in minutes for long_audio="chunk". None = server
+    # default (20 min). Cut points snap to the nearest silence pause near each
+    # window boundary; a hard cap of 1.25x this keeps any window bounded.
+    long_audio_chunk_minutes: Optional[float] = None
+
     # Model management flags
     is_pinned: bool = False
     is_default: bool = False  # Only one model can be default

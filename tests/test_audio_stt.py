@@ -990,3 +990,163 @@ class TestChunkAlign:
 
         assert aligner.transcribe.await_count == 2
         assert [w["start"] for w in words] == [0.5, 470.5]
+
+
+class TestLongAudioChunking:
+    """Integration: long_audio=chunk splits at silence, transcribes each
+    window independently, offsets timestamps, and concatenates. Uses a short
+    synthetic wav + tiny chunk_minutes to exercise the real endpoint path with
+    a mocked engine (no model, no mlx-audio)."""
+
+    def _write_wav(self, path, segments, sr=8000):
+        import numpy as np
+        import soundfile as sf
+        rng = np.random.default_rng(0)
+        parts = []
+        for kind, dur in segments:
+            n = int(dur * sr)
+            if kind == "speech":
+                parts.append(rng.uniform(-0.3, 0.3, n).astype("float32"))
+            else:
+                parts.append(np.zeros(n, dtype="float32"))
+        sf.write(str(path), np.concatenate(parts), sr, subtype="FLOAT")
+
+    def _fresh_transcribe(self, calls):
+        # Per-call FRESH dict: offset_result_times mutates in place, so a
+        # shared return_value would compound offsets across windows. A word at
+        # local 0.2s lets the caller verify the global offset was applied.
+        async def fake_transcribe(path, **kwargs):
+            import soundfile as sf
+            dur = float(sf.info(path).duration)
+            calls.append(dur)
+            return {
+                "text": "片", "language": "zh", "duration": dur,
+                "segments": [{
+                    "start": 0.0, "end": dur, "text": "片",
+                    "words": [{"word": "w", "start": 0.2, "end": 0.4}],
+                }],
+            }
+        return AsyncMock(side_effect=fake_transcribe)
+
+    def test_chunks_offsets_and_concatenates(self, audio_client, tmp_path):
+        client, pool = audio_client
+        wav = tmp_path / "long.wav"
+        # ~23.7s with silence gaps near 8s and 16s -> ~3 windows at target 8s.
+        self._write_wav(wav, [
+            ("speech", 7.7), ("silence", 0.6),
+            ("speech", 7.1), ("silence", 0.6),
+            ("speech", 7.7),
+        ])
+        calls: list = []
+        pool.get_engine.return_value.transcribe = self._fresh_transcribe(calls)
+
+        resp = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("long.wav", wav.read_bytes(), "audio/wav")},
+            data={
+                "model": "qwen3-asr", "long_audio": "chunk",
+                "chunk_minutes": str(8.0 / 60.0),
+                "response_format": "verbose_json",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert len(calls) >= 3                      # split into >= 3 windows
+        assert body["text"] == "片" * len(calls)    # ordered concatenation
+        # Word timestamps offset onto the global timeline, strictly ascending.
+        starts = [
+            w["start"] for seg in body["segments"]
+            for w in (seg.get("words") or [])
+        ]
+        assert starts == sorted(starts)
+        assert starts[-1] > 5.0                     # last window well past t=0
+        assert body["duration"] == pytest.approx(23.7, abs=0.6)
+
+    def _degenerate_by_duration(self, calls, thresh_s=4.0):
+        """Mock transcribe that simulates the real degeneration: a slice longer
+        than thresh_s comes back as a repeat loop; shorter slices are clean.
+        Lets the guard recursion fire on short synthetic audio."""
+        async def fake(path, **kwargs):
+            import soundfile as sf
+            dur = float(sf.info(path).duration)
+            calls.append(dur)
+            if dur > thresh_s:
+                txt = "啊。" * 60            # decoder repeat loop
+            else:
+                txt = "clean-content-%d" % len(calls)  # unique, non-looping
+            return {
+                "text": txt, "language": "zh", "duration": dur,
+                "segments": [{"start": 0.0, "end": dur, "text": txt, "words": []}],
+            }
+        return AsyncMock(side_effect=fake)
+
+    def test_guard_resplits_degenerate_window(self, audio_client, tmp_path):
+        from omlx.engine.audio_chunk import ngram_uniqueness
+
+        client, pool = audio_client
+        wav = tmp_path / "dense.wav"
+        # ~12s with silence gaps near 3s, 6s, 9s so a 6s window bisects cleanly
+        # at its mid-silence into two 3s halves.
+        self._write_wav(wav, [
+            ("speech", 2.75), ("silence", 0.5),   # gap centre ~3s
+            ("speech", 2.5), ("silence", 0.5),    # gap centre ~6s
+            ("speech", 2.5), ("silence", 0.5),    # gap centre ~9s
+            ("speech", 2.75),
+        ])
+        calls: list = []
+        pool.get_engine.return_value.transcribe = self._degenerate_by_duration(
+            calls, thresh_s=4.0,
+        )
+        # Drop the 5-min re-split floor so the guard can split short test audio.
+        with patch("omlx.api.audio_routes._LONG_AUDIO_MIN_RESPLIT_S", 2.0):
+            resp = client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("dense.wav", wav.read_bytes(), "audio/wav")},
+                data={
+                    "model": "qwen3-asr", "long_audio": "chunk",
+                    "chunk_minutes": str(6.0 / 60.0),
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        # Two ~6s windows each degenerated then re-split -> more than 2 calls.
+        assert len(calls) > 2
+        # The degenerate parents were discarded; the merged text is clean.
+        assert "啊。啊。啊。" not in body["text"]
+        assert ngram_uniqueness(body["text"]) > 0.5
+
+    def test_off_default_does_not_chunk(self, audio_client, tmp_path):
+        client, pool = audio_client
+        wav = tmp_path / "plain.wav"
+        self._write_wav(wav, [("speech", 20.0)])
+        calls: list = []
+        pool.get_engine.return_value.transcribe = self._fresh_transcribe(calls)
+        resp = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("plain.wav", wav.read_bytes(), "audio/wav")},
+            data={"model": "qwen3-asr"},  # no long_audio -> default off
+        )
+        assert resp.status_code == 200, resp.text
+        assert len(calls) == 1                       # single whole-file pass
+
+    def test_invalid_long_audio_rejected(self, audio_client, tmp_path):
+        client, _ = audio_client
+        wav = tmp_path / "x.wav"
+        self._write_wav(wav, [("speech", 2.0)])
+        resp = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("x.wav", wav.read_bytes(), "audio/wav")},
+            data={"model": "qwen3-asr", "long_audio": "bogus"},
+        )
+        assert resp.status_code == 400
+
+    def test_negative_chunk_minutes_rejected(self, audio_client, tmp_path):
+        client, _ = audio_client
+        wav = tmp_path / "x.wav"
+        self._write_wav(wav, [("speech", 2.0)])
+        resp = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("x.wav", wav.read_bytes(), "audio/wav")},
+            data={"model": "qwen3-asr", "long_audio": "chunk", "chunk_minutes": "-1"},
+        )
+        assert resp.status_code == 400
