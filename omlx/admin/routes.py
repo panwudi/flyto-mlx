@@ -171,6 +171,13 @@ class ModelSettingsRequest(BaseModel):
     # L/R speakers; "high" auto-upgrades to 3-pass energy_tripass (3x ASR).
     # Per-request diarize_backend always wins over this preference.
     default_diarize_quality: str | None = None
+    # Long-audio handling for decoder-only ASR. None = server default ("auto":
+    # transcribe once, re-transcribe chunked only if the output degenerates).
+    # "chunk" = always chunk proactively; "off" = single pass. Set on the ASR
+    # model. Per-request long_audio always wins.
+    default_long_audio: str | None = None
+    # Target chunk length (minutes) for default_long_audio="chunk". None = 15.
+    long_audio_chunk_minutes: float | None = None
     is_pinned: bool | None = None
     is_default: bool | None = None
     # Security: per-model opt-in for trust_remote_code (issue #926)
@@ -1892,6 +1899,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "aligner_max_audio_seconds": settings.aligner_max_audio_seconds,
                 "default_aligner_overflow": settings.default_aligner_overflow,
                 "default_diarize_quality": settings.default_diarize_quality,
+                "default_long_audio": settings.default_long_audio,
+                "long_audio_chunk_minutes": settings.long_audio_chunk_minutes,
                 "is_pinned": settings.is_pinned,
                 "is_default": settings.is_default,
                 "trust_remote_code": settings.trust_remote_code,
@@ -2234,6 +2243,19 @@ async def update_model_settings(
                 ),
             )
         current_settings.default_diarize_quality = _q
+    if "default_long_audio" in sent:
+        current_settings.default_long_audio = (
+            request.default_long_audio
+            if request.default_long_audio in ("off", "chunk", "auto")
+            else None
+        )
+    if "long_audio_chunk_minutes" in sent:
+        current_settings.long_audio_chunk_minutes = (
+            request.long_audio_chunk_minutes
+            if request.long_audio_chunk_minutes
+            and request.long_audio_chunk_minutes > 0
+            else None
+        )
     if "dflash_draft_quant_enabled" in sent:
         current_settings.dflash_draft_quant_enabled = bool(request.dflash_draft_quant_enabled) if request.dflash_draft_quant_enabled is not None else None
     if "dflash_draft_quant_weight_bits" in sent:

@@ -70,6 +70,8 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "aligner_max_audio_seconds",
     "default_aligner_overflow",
     "default_diarize_quality",
+    "default_long_audio",
+    "long_audio_chunk_minutes",
     # Video generation defaults (video models only)
     "video_default_steps",
     "video_default_fps",
