@@ -27,8 +27,11 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Maximum upload size for audio files (100 MB).
-MAX_AUDIO_UPLOAD_BYTES = 100 * 1024 * 1024
+# Maximum upload size for audio files (300 MB). Sized for long call recordings:
+# stereo 8 kHz 16-bit PCM is ~1.9 MB/min, so an 89-min stereo call is ~163 MB;
+# 300 MB covers up to ~160 min stereo (or ~320 min mono) with margin. Long-audio
+# auto-chunking transcribes any length below this cap in one request.
+MAX_AUDIO_UPLOAD_BYTES = 300 * 1024 * 1024
 
 # Maximum base64-encoded ref_audio size (~15 MB raw audio, enough for ~60s).
 MAX_REF_AUDIO_BASE64_BYTES = 20 * 1024 * 1024
