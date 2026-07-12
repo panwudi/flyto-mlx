@@ -1079,5 +1079,21 @@
   "settings.video.first_frame_desc": "Genera el primer fotograma I2V desde el prompt con un modelo de imagen y luego lo anima: los modelos de imagen siguen mucho mejor los prompts, asi la accion sale bien. Por solicitud: first_frame_from_text. Desactivado si esta vacio.",
   "settings.video.first_frame_off": "Desactivado (sin primer fotograma)",
   "chat.video.first_frame": "Primer fotograma",
-  "chat.video.first_frame_tooltip": "Genera el primer fotograma desde tu prompt con un modelo de imagen y luego lo anima (mejor fidelidad de la accion). Enruta a un modelo i2v."
+  "chat.video.first_frame_tooltip": "Genera el primer fotograma desde tu prompt con un modelo de imagen y luego lo anima (mejor fidelidad de la accion). Enruta a un modelo i2v.",
+  "navbar.tab.transcribe": "Transcribe",
+  "transcribe.title": "Call transcription",
+  "transcribe.subtitle": "Upload a stereo call recording to get a speaker-attributed, word-timestamped dialogue",
+  "transcribe.back": "Dashboard",
+  "transcribe.left_speaker": "Left channel speaker",
+  "transcribe.right_speaker": "Right channel speaker",
+  "transcribe.choose_file": "Choose audio file",
+  "transcribe.no_file": "No file selected",
+  "transcribe.run": "Transcribe",
+  "transcribe.running": "Transcribing...",
+  "transcribe.model_label": "Model",
+  "transcribe.no_stt": "No speech-to-text model is available on this server.",
+  "transcribe.stereo_hint": "Stereo recording required, one speaker per channel. Long calls are chunked automatically.",
+  "transcribe.turns": "turns",
+  "transcribe.download_srt": "Download SRT",
+  "transcribe.empty": "No dialogue was produced. Check that the recording is stereo with one speaker per channel."
 }

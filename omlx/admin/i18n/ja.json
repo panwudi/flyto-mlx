@@ -1079,5 +1079,21 @@
   "settings.video.first_frame_desc": "画像モデルでプロンプトから最初のフレームを生成し, それを動かします -- 画像モデルは動画モデルよりプロンプト追従が高く, 動作が正確になります. リクエスト単位は first_frame_from_text. 未設定で無効.",
   "settings.video.first_frame_off": "無効 (最初のフレームなし)",
   "chat.video.first_frame": "最初のフレーム",
-  "chat.video.first_frame_tooltip": "画像モデルでプロンプトから最初のフレームを生成し, それを動かします (動作がより正確). i2v モデルに自動でルーティングします."
+  "chat.video.first_frame_tooltip": "画像モデルでプロンプトから最初のフレームを生成し, それを動かします (動作がより正確). i2v モデルに自動でルーティングします.",
+  "navbar.tab.transcribe": "Transcribe",
+  "transcribe.title": "Call transcription",
+  "transcribe.subtitle": "Upload a stereo call recording to get a speaker-attributed, word-timestamped dialogue",
+  "transcribe.back": "Dashboard",
+  "transcribe.left_speaker": "Left channel speaker",
+  "transcribe.right_speaker": "Right channel speaker",
+  "transcribe.choose_file": "Choose audio file",
+  "transcribe.no_file": "No file selected",
+  "transcribe.run": "Transcribe",
+  "transcribe.running": "Transcribing...",
+  "transcribe.model_label": "Model",
+  "transcribe.no_stt": "No speech-to-text model is available on this server.",
+  "transcribe.stereo_hint": "Stereo recording required, one speaker per channel. Long calls are chunked automatically.",
+  "transcribe.turns": "turns",
+  "transcribe.download_srt": "Download SRT",
+  "transcribe.empty": "No dialogue was produced. Check that the recording is stereo with one speaker per channel."
 }

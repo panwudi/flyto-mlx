@@ -1079,5 +1079,21 @@
   "settings.video.first_frame_desc": "用圖像模型按提示詞先出一張首幀再讓視訊模型動起來 -- 圖像模型對提示詞的遵循遠強於視訊模型, 動作更準. 按請求用 first_frame_from_text 開啟. 留空為關閉.",
   "settings.video.first_frame_off": "關閉 (不生成首幀)",
   "chat.video.first_frame": "首幀",
-  "chat.video.first_frame_tooltip": "先用圖像模型按提示詞生成首幀再讓它動起來 (動作更準). 會自動路由到圖生視訊模型."
+  "chat.video.first_frame_tooltip": "先用圖像模型按提示詞生成首幀再讓它動起來 (動作更準). 會自動路由到圖生視訊模型.",
+  "navbar.tab.transcribe": "對話轉寫",
+  "transcribe.title": "通話轉寫",
+  "transcribe.subtitle": "上傳立體聲通話錄音，生成帶說話人歸屬和詞級時間戳的對話流",
+  "transcribe.back": "管理後台",
+  "transcribe.left_speaker": "左聲道說話人",
+  "transcribe.right_speaker": "右聲道說話人",
+  "transcribe.choose_file": "選擇音訊檔案",
+  "transcribe.no_file": "未選擇檔案",
+  "transcribe.run": "開始轉寫",
+  "transcribe.running": "轉寫中……",
+  "transcribe.model_label": "模型",
+  "transcribe.no_stt": "本伺服器沒有可用的語音轉寫模型。",
+  "transcribe.stereo_hint": "需要立體聲錄音，每個聲道一位說話人。長通話會自動分塊處理。",
+  "transcribe.turns": "輪",
+  "transcribe.download_srt": "下載 SRT",
+  "transcribe.empty": "沒有生成對話。請確認錄音為立體聲且每個聲道只有一位說話人。"
 }

@@ -1079,5 +1079,21 @@
   "settings.video.first_frame_desc": "Сгенерировать первый кадр I2V из промпта моделью изображений, затем оживить его -- модели изображений следуют промптам намного лучше, поэтому действие выходит правильным. Для запроса: first_frame_from_text. Выключено, если не задано.",
   "settings.video.first_frame_off": "Выключено (без первого кадра)",
   "chat.video.first_frame": "Первый кадр",
-  "chat.video.first_frame_tooltip": "Сгенерировать первый кадр из промпта моделью изображений, затем оживить его (точнее действие). Направляется на модель i2v."
+  "chat.video.first_frame_tooltip": "Сгенерировать первый кадр из промпта моделью изображений, затем оживить его (точнее действие). Направляется на модель i2v.",
+  "navbar.tab.transcribe": "Transcribe",
+  "transcribe.title": "Call transcription",
+  "transcribe.subtitle": "Upload a stereo call recording to get a speaker-attributed, word-timestamped dialogue",
+  "transcribe.back": "Dashboard",
+  "transcribe.left_speaker": "Left channel speaker",
+  "transcribe.right_speaker": "Right channel speaker",
+  "transcribe.choose_file": "Choose audio file",
+  "transcribe.no_file": "No file selected",
+  "transcribe.run": "Transcribe",
+  "transcribe.running": "Transcribing...",
+  "transcribe.model_label": "Model",
+  "transcribe.no_stt": "No speech-to-text model is available on this server.",
+  "transcribe.stereo_hint": "Stereo recording required, one speaker per channel. Long calls are chunked automatically.",
+  "transcribe.turns": "turns",
+  "transcribe.download_srt": "Download SRT",
+  "transcribe.empty": "No dialogue was produced. Check that the recording is stereo with one speaker per channel."
 }

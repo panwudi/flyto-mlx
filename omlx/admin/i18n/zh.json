@@ -1079,5 +1079,21 @@
   "settings.video.first_frame_desc": "用图像模型按提示词先出一张首帧再让视频模型动起来 -- 图像模型对提示词的遵循远强于视频模型, 动作更准. 按请求用 first_frame_from_text 开. 留空为关闭.",
   "settings.video.first_frame_off": "关闭 (不生成首帧)",
   "chat.video.first_frame": "首帧",
-  "chat.video.first_frame_tooltip": "先用图像模型按提示词生成首帧再让它动起来 (动作更准). 会自动路由到图生视频模型."
+  "chat.video.first_frame_tooltip": "先用图像模型按提示词生成首帧再让它动起来 (动作更准). 会自动路由到图生视频模型.",
+  "navbar.tab.transcribe": "对话转写",
+  "transcribe.title": "通话转写",
+  "transcribe.subtitle": "上传立体声通话录音，生成带说话人归属和词级时间戳的对话流",
+  "transcribe.back": "管理后台",
+  "transcribe.left_speaker": "左声道说话人",
+  "transcribe.right_speaker": "右声道说话人",
+  "transcribe.choose_file": "选择音频文件",
+  "transcribe.no_file": "未选择文件",
+  "transcribe.run": "开始转写",
+  "transcribe.running": "转写中……",
+  "transcribe.model_label": "模型",
+  "transcribe.no_stt": "本服务器没有可用的语音转写模型。",
+  "transcribe.stereo_hint": "需要立体声录音，每个声道一位说话人。长通话会自动分块处理。",
+  "transcribe.turns": "轮",
+  "transcribe.download_srt": "下载 SRT",
+  "transcribe.empty": "没有生成对话。请确认录音为立体声且每个声道只有一位说话人。"
 }

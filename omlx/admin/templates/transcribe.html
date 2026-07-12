@@ -1,0 +1,204 @@
+{% extends "base.html" %}
+
+{% block title %}{{ t('transcribe.title') }}{% endblock %}
+
+{% block head %}
+<style>
+    :root {
+        --bg: #ffffff; --bg-soft: #f8fafc; --bg-card: #ffffff;
+        --text: #0f172a; --text-soft: #475569; --text-muted: #94a3b8;
+        --border: #e2e8f0; --accent: #171717; --accent-text: #ffffff;
+        --left: #2563eb; --left-bg: #eff6ff; --right: #059669; --right-bg: #ecfdf5;
+        --danger: #dc2626;
+    }
+    [data-theme="dark"] {
+        --bg: #1d1d20; --bg-soft: #252529; --bg-card: #252529;
+        --text: #efefef; --text-soft: #a1a1aa; --text-muted: #71717a;
+        --border: #3f3f46; --accent: #e5e5e5; --accent-text: #18181b;
+        --left: #60a5fa; --left-bg: #1e293b; --right: #34d399; --right-bg: #14342a;
+        --danger: #f87171;
+    }
+    body { background: var(--bg); color: var(--text); }
+    .tp-wrap { max-width: 900px; margin: 0 auto; padding: 1.5rem 1rem 4rem; }
+    .tp-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 1rem; padding: 1.25rem; }
+    .tp-input { background: var(--bg-soft); border: 1px solid var(--border); color: var(--text);
+        border-radius: 0.5rem; padding: 0.4rem 0.7rem; font-size: 0.9rem; width: 100%; }
+    .tp-btn { background: var(--accent); color: var(--accent-text); border: none; border-radius: 0.6rem;
+        padding: 0.5rem 1rem; font-size: 0.9rem; font-weight: 600; cursor: pointer; }
+    .tp-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .tp-ghost { background: transparent; border: 1px solid var(--border); color: var(--text-soft);
+        border-radius: 0.6rem; padding: 0.45rem 0.9rem; font-size: 0.85rem; cursor: pointer; }
+    .tp-bubble { max-width: 78%; border-radius: 0.9rem; padding: 0.55rem 0.8rem; font-size: 0.92rem; line-height: 1.5; }
+    .tp-meta { font-size: 0.72rem; opacity: 0.75; margin-bottom: 0.2rem; font-variant-numeric: tabular-nums; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="tp-wrap" x-data="transcribeApp()" x-init="init()">
+    <!-- header -->
+    <div class="flex items-center justify-between mb-5">
+        <div>
+            <a href="/admin/dashboard" style="color: var(--text-muted); font-size: 0.8rem;">&larr; {{ t('transcribe.back') }}</a>
+            <h1 class="text-2xl font-bold mt-1">{{ t('transcribe.title') }}</h1>
+            <p style="color: var(--text-soft); font-size: 0.88rem;">{{ t('transcribe.subtitle') }}</p>
+        </div>
+    </div>
+
+    <!-- controls -->
+    <div class="tp-card space-y-4">
+        <div class="grid grid-cols-2 gap-3">
+            <label class="block">
+                <span style="color: var(--text-soft); font-size: 0.8rem;">{{ t('transcribe.left_speaker') }}</span>
+                <input class="tp-input mt-1" x-model="leftSpeaker" />
+            </label>
+            <label class="block">
+                <span style="color: var(--text-soft); font-size: 0.8rem;">{{ t('transcribe.right_speaker') }}</span>
+                <input class="tp-input mt-1" x-model="rightSpeaker" />
+            </label>
+        </div>
+
+        <div class="flex items-center gap-3 flex-wrap">
+            <input type="file" accept="audio/*,.wav" class="hidden" x-ref="fileInput" @change="pickFile($event)" />
+            <button class="tp-ghost" @click="$refs.fileInput.click()">{{ t('transcribe.choose_file') }}</button>
+            <span style="color: var(--text-soft); font-size: 0.85rem;" x-text="fileName || '{{ t('transcribe.no_file') }}'"></span>
+        </div>
+
+        <div class="flex items-center gap-3 flex-wrap">
+            <button class="tp-btn" @click="transcribe()" :disabled="!file || loading || !model">
+                <span x-show="!loading">{{ t('transcribe.run') }}</span>
+                <span x-show="loading" x-cloak>{{ t('transcribe.running') }}</span>
+            </button>
+            <span x-show="model" x-cloak style="color: var(--text-muted); font-size: 0.78rem;">
+                {{ t('transcribe.model_label') }}: <span x-text="model"></span>
+            </span>
+        </div>
+
+        <p x-show="noStt" x-cloak style="color: var(--danger); font-size: 0.85rem;">{{ t('transcribe.no_stt') }}</p>
+        <p x-show="error" x-cloak style="color: var(--danger); font-size: 0.85rem; white-space: pre-wrap;" x-text="error"></p>
+        <p style="color: var(--text-muted); font-size: 0.78rem;">{{ t('transcribe.stereo_hint') }}</p>
+    </div>
+
+    <!-- dialogue -->
+    <div x-show="segments.length" x-cloak class="mt-6">
+        <div class="flex items-center justify-between mb-3">
+            <span style="color: var(--text-soft); font-size: 0.85rem;"
+                  x-text="segments.length + ' {{ t('transcribe.turns') }}'"></span>
+            <button class="tp-ghost" @click="downloadSrt()">{{ t('transcribe.download_srt') }}</button>
+        </div>
+        <div class="flex flex-col gap-2">
+            <template x-for="(s, i) in segments" :key="i">
+                <div class="flex" :class="s.speaker === rightSpeaker ? 'justify-end' : 'justify-start'">
+                    <div class="tp-bubble"
+                         :style="s.speaker === rightSpeaker
+                            ? 'background: var(--right-bg); border: 1px solid var(--right);'
+                            : 'background: var(--left-bg); border: 1px solid var(--left);'">
+                        <div class="tp-meta">
+                            <span x-text="s.speaker"
+                                  :style="s.speaker === rightSpeaker ? 'color: var(--right);' : 'color: var(--left);'"></span>
+                            &middot; <span x-text="fmtTime(s.start) + ' - ' + fmtTime(s.end)"></span>
+                        </div>
+                        <div x-text="s.text"></div>
+                    </div>
+                </div>
+            </template>
+        </div>
+    </div>
+</div>
+
+<script>
+    function transcribeApp() {
+        const API_KEY = {{ api_key | tojson }};
+        return {
+            apiKey: API_KEY || '',
+            leftSpeaker: '销售',
+            rightSpeaker: '客户',
+            file: null,
+            fileName: '',
+            model: '',
+            loading: false,
+            error: '',
+            noStt: false,
+            segments: [],
+
+            async init() {
+                try {
+                    const r = await fetch('/v1/models', { headers: { 'X-API-Key': this.apiKey } });
+                    const d = await r.json();
+                    const stt = (d.data || []).find(m =>
+                        String(m.model_type || '').includes('stt') && !String(m.id).toLowerCase().includes('aligner')
+                        || String(m.id).toLowerCase().includes('asr'));
+                    if (stt) { this.model = stt.id; } else { this.noStt = true; }
+                } catch (e) { this.noStt = true; }
+            },
+
+            pickFile(e) {
+                const f = e.target.files[0];
+                if (f) { this.file = f; this.fileName = f.name; this.segments = []; this.error = ''; }
+            },
+
+            fmtTime(sec) {
+                sec = Math.max(0, sec || 0);
+                const m = Math.floor(sec / 60), s = Math.floor(sec % 60);
+                return m + ':' + String(s).padStart(2, '0');
+            },
+
+            async transcribe() {
+                if (!this.file || !this.model) return;
+                this.loading = true; this.error = ''; this.segments = [];
+                try {
+                    const fd = new FormData();
+                    fd.append('file', this.file);
+                    fd.append('model', this.model);
+                    fd.append('response_format', 'verbose_json');
+                    fd.append('word_timestamps', 'true');
+                    fd.append('diarize_backend', 'energy_tripass');
+                    fd.append('left_speaker', this.leftSpeaker);
+                    fd.append('right_speaker', this.rightSpeaker);
+                    fd.append('on_aligner_overflow', 'chunk');
+                    const r = await fetch('/v1/audio/transcriptions', {
+                        method: 'POST',
+                        headers: { 'X-API-Key': this.apiKey },
+                        body: fd,
+                    });
+                    if (!r.ok) {
+                        const body = await r.text();
+                        this.error = 'HTTP ' + r.status + '\n' + body.slice(0, 300);
+                        return;
+                    }
+                    const d = await r.json();
+                    this.segments = (d.segments || []).map(s => ({
+                        speaker: s.speaker || '',
+                        start: s.start || 0,
+                        end: s.end || 0,
+                        text: s.text || '',
+                    }));
+                    if (!this.segments.length) this.error = '{{ t('transcribe.empty') }}';
+                } catch (e) {
+                    this.error = String(e);
+                } finally {
+                    this.loading = false;
+                }
+            },
+
+            downloadSrt() {
+                const pad = (n, l = 2) => String(n).padStart(l, '0');
+                const ts = (sec) => {
+                    const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60),
+                          s = Math.floor(sec % 60), ms = Math.floor((sec % 1) * 1000);
+                    return pad(h) + ':' + pad(m) + ':' + pad(s) + ',' + pad(ms, 3);
+                };
+                let out = '';
+                this.segments.forEach((s, i) => {
+                    out += (i + 1) + '\n' + ts(s.start) + ' --> ' + ts(s.end) + '\n'
+                        + s.speaker + ': ' + s.text + '\n\n';
+                });
+                const blob = new Blob([out], { type: 'text/plain;charset=utf-8' });
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
+                a.download = 'dialogue.srt';
+                a.click();
+            },
+        };
+    }
+</script>
+{% endblock %}
