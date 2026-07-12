@@ -745,8 +745,25 @@ async def create_transcription(
     max_tokens: Optional[int] = Form(None),
     word_timestamps: bool = Form(False),
     on_aligner_overflow: Optional[str] = Form(None),
-    long_audio: Optional[str] = Form(None),
-    chunk_minutes: Optional[float] = Form(None),
+    long_audio: Optional[str] = Form(
+        None,
+        description=(
+            "Long-audio auto-chunking. 'chunk' splits the audio at silence "
+            "into chunk_minutes-long windows and transcribes each "
+            "independently, fixing the Qwen3-ASR long-call degeneration into a "
+            "repeated-token loop; 'off' (default) transcribes in a single "
+            "pass. A per-model default_long_audio setting may enable this "
+            "without sending the field."
+        ),
+    ),
+    chunk_minutes: Optional[float] = Form(
+        None,
+        description=(
+            "Target window length in minutes for long_audio='chunk' "
+            "(default 15). The window count is ceil(total_minutes / "
+            "chunk_minutes); windows snap to the nearest silence pause."
+        ),
+    ),
     n: int = Form(1),
     # ---- Diarization: Phase 1 energy backend for stereo+L/R, Phase 2 pyannote
     # for mono / multi-speaker / conference audio.
