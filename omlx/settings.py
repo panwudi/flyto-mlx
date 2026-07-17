@@ -418,6 +418,17 @@ class MemorySettings:
     # hardware. Set to 0 only to disable the margin (gate degrades to the bare cap
     # check; logged as a WARNING at startup).
     prefill_transient_margin_gb: float = 12.0
+    # Working-set headroom reserved ABOVE model weights at pool LOAD admission
+    # (engine_pool.get_engine) so two large generation models cannot co-reside
+    # with no room left for prefill/KV -- the "mid-stream rejection after HTTP
+    # 200" failure. Distinct from prefill_transient_margin_gb: headroom prevents
+    # CO-RESIDENCY at load; the margin bounds a single request's prefill spike.
+    # 0.0 = auto-derive as max(prefill_transient_margin_gb, 0.20 * live_ceiling)
+    # so it tracks the dynamic ceiling; a positive value overrides. Applied only
+    # to generation engines (llm / vlm / hrm_text); embedding / reranker / stt
+    # get 0. A model that is the ONLY resident is never blocked by headroom --
+    # it loads whenever its weights alone fit under the ceiling.
+    memory_admission_headroom_gb: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -430,6 +441,7 @@ class MemorySettings:
             "prefill_safe_zone_ratio": self.prefill_safe_zone_ratio,
             "prefill_min_chunk_tokens": self.prefill_min_chunk_tokens,
             "prefill_transient_margin_gb": self.prefill_transient_margin_gb,
+            "memory_admission_headroom_gb": self.memory_admission_headroom_gb,
         }
 
     @classmethod
@@ -470,6 +482,9 @@ class MemorySettings:
             ),
             prefill_transient_margin_gb=float(
                 data.get("prefill_transient_margin_gb", 12.0)
+            ),
+            memory_admission_headroom_gb=float(
+                data.get("memory_admission_headroom_gb", 0.0)
             ),
         )
 

@@ -104,6 +104,7 @@ class EnginePool:
         self._scheduler_config = scheduler_config or SchedulerConfig()
         self._process_memory_enforcer: object | None = None  # Set by server
         self._get_final_ceiling: object | None = None  # Set by server
+        self._get_working_headroom: object | None = None  # Set by server
         self._settings_manager: object | None = None  # Set by server
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
         self._load_seconds_per_gb_ema: float | None = None
@@ -319,6 +320,31 @@ class EnginePool:
 
         return model_id_or_alias
 
+    # Engine types that run prefill and grow a KV cache -- only these reserve
+    # working-set headroom at load admission. embedding / reranker / audio have
+    # small bounded working sets and get 0 so they are never mis-evicted or
+    # mis-rejected. "hrm_text" is listed defensively for the HRM-Text engine
+    # branch; harmless when that engine type is not present.
+    _HEADROOM_ENGINE_TYPES: frozenset = frozenset({"batched", "vlm", "hrm_text"})
+
+    def _working_headroom_for(self, entry: EngineEntry) -> int:
+        """Working-set headroom (bytes) to reserve above this model's weights
+        at load admission.
+
+        Only generation engines get headroom (see _HEADROOM_ENGINE_TYPES);
+        everything else gets 0. Returns 0 when the enforcer callback is not
+        wired up, so admission degrades to the old weight-only behavior.
+        """
+        if entry.engine_type not in self._HEADROOM_ENGINE_TYPES:
+            return 0
+        cb = self._get_working_headroom
+        if cb is None:
+            return 0
+        try:
+            return max(0, int(cb()))
+        except Exception:  # noqa: BLE001
+            return 0
+
     async def get_engine(
         self, model_id: str, force_lm: bool = False,
     ) -> BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | STSEngine | TTSEngine:
@@ -381,40 +407,83 @@ class EnginePool:
             # not yet wired up), so we admit unconditionally.
             ceiling = self._current_ceiling()
             if ceiling > 0:
+                # Reserve working-set headroom ABOVE weights for generation
+                # models so two large models cannot co-reside with no prefill
+                # room (the load-time root cause of "mid-stream rejection after
+                # HTTP 200"). headroom is 0 for non-generation engines and when
+                # the enforcer callback is not wired.
+                headroom = self._working_headroom_for(entry)
                 while True:
                     current = max(mx.get_active_memory(), get_phys_footprint())
-                    projected = current + entry.estimated_size
+                    projected = current + entry.estimated_size + headroom
                     if projected <= ceiling:
                         break
                     victim = self._find_lru_victim()
                     if victim is not None:
                         logger.info(
                             f"Evicting '{victim}' to fit '{model_id}' "
+                            f"(+{format_size(headroom)} working headroom) "
                             f"under memory ceiling "
                             f"({format_size(projected)} > "
                             f"{format_size(ceiling)})"
                         )
                         await self._unload_engine(victim)
                         continue
-                    # Nothing else to evict — model cannot fit. Use
-                    # ModelTooLargeError when the model alone exceeds the
-                    # ceiling (no chance of fitting), InsufficientMemoryError
-                    # when the model would fit on a clean process but the
-                    # current usage leaves no room.
+
+                    # Nothing left to evict. A model whose WEIGHTS alone exceed
+                    # the ceiling can never fit -> permanent ModelTooLargeError
+                    # (HTTP 507).
                     if entry.estimated_size > ceiling:
                         raise ModelTooLargeError(
                             model_id, entry.estimated_size, ceiling
                         )
+
+                    # Decide by scanning entries whether this model would be the
+                    # ONLY resident model -- NOT by guessing from phys (which
+                    # lags after an unload settle). A model that would be alone
+                    # must still load whenever its WEIGHTS fit against current
+                    # usage (single-model serving is never blocked by the extra
+                    # headroom reserve; the per-request gate + forward gate bound
+                    # its prefill). We waive ONLY the headroom here, not the base
+                    # weight fit.
+                    others_loaded = any(
+                        e.engine is not None and mid != model_id
+                        for mid, e in self._entries.items()
+                    )
+                    if (
+                        not others_loaded
+                        and current + entry.estimated_size <= ceiling
+                    ):
+                        if headroom > 0:
+                            logger.warning(
+                                f"Loading '{model_id}' with thin working "
+                                f"headroom: weights "
+                                f"{format_size(entry.estimated_size)} leave "
+                                f"{format_size(max(0, ceiling - current - entry.estimated_size))} "
+                                f"free under ceiling {format_size(ceiling)} "
+                                f"(headroom target {format_size(headroom)}); "
+                                "large prompts may be refused per-request."
+                            )
+                        break
+
+                    # Reject transiently (server.py maps to HTTP 503 +
+                    # Retry-After): either other model(s) are resident so
+                    # co-residency would over-commit, or this model is alone but
+                    # current usage already leaves no room even for its weights.
+                    # In both cases retrying after memory frees can succeed.
                     raise InsufficientMemoryError(
-                        required=entry.estimated_size,
+                        required=entry.estimated_size + headroom,
                         current=current,
                         message=(
-                            f"Cannot load {model_id}: projected memory "
-                            f"{format_size(projected)} would exceed the memory "
-                            f"ceiling {format_size(ceiling)} "
-                            f"(current: {format_size(current)}, "
-                            f"model: {format_size(entry.estimated_size)}). "
-                            "Free system memory or lower memory_guard_tier."
+                            f"Cannot load {model_id} right now: projected "
+                            f"memory {format_size(projected)} (weights "
+                            f"{format_size(entry.estimated_size)} + working "
+                            f"headroom {format_size(headroom)}) would exceed "
+                            f"the memory ceiling {format_size(ceiling)} "
+                            f"(current: {format_size(current)}"
+                            f"{', other model(s) resident' if others_loaded else ''}). "
+                            "Retry shortly -- memory frees as resident models "
+                            "and in-flight requests finish."
                         ),
                     )
 

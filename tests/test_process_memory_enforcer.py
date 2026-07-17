@@ -1269,3 +1269,93 @@ class TestTwoWatermarkPressureLevels:
         assert status["current_bytes"] == 88 * 1024**3
         # Utilization computed against the max value
         assert abs(status["utilization"] - 0.88) < 0.01
+
+
+class TestWorkingHeadroom:
+    """get_working_headroom(): load-admission co-residency reserve."""
+
+    def test_auto_derive_uses_fraction_of_ceiling(self, mock_engine_pool):
+        # auto: max(margin 12GB, 0.20*100GB=20GB) = 20GB
+        enforcer = _make_enforcer(
+            mock_engine_pool, ceiling=100 * 1024**3,
+            prefill_transient_margin_gb=12.0,
+        )
+        assert enforcer.get_working_headroom() == 20 * 1024**3
+
+    def test_auto_derive_floored_by_transient_margin(self, mock_engine_pool):
+        # small ceiling: 0.20*40GB=8GB < margin 12GB -> floor to margin
+        enforcer = _make_enforcer(
+            mock_engine_pool, ceiling=40 * 1024**3,
+            prefill_transient_margin_gb=12.0,
+        )
+        assert enforcer.get_working_headroom() == 12 * 1024**3
+
+    def test_explicit_override_returned_verbatim(self, mock_engine_pool):
+        enforcer = _make_enforcer(
+            mock_engine_pool, ceiling=100 * 1024**3,
+            prefill_transient_margin_gb=12.0,
+            memory_admission_headroom_gb=30.0,
+        )
+        assert enforcer.get_working_headroom() == 30 * 1024**3
+
+    def test_zero_when_guard_disabled(self, mock_engine_pool):
+        enforcer = _make_enforcer(
+            mock_engine_pool, ceiling=100 * 1024**3,
+            prefill_memory_guard=False,
+            prefill_transient_margin_gb=12.0,
+        )
+        assert enforcer.get_working_headroom() == 0
+
+
+class TestPrefillAdmissionOk:
+    """prefill_admission_ok(): pre-stream request gate, mirrors forward gate."""
+
+    def test_ok_when_current_plus_margin_under_ceiling(
+        self, mock_engine_pool, monkeypatch
+    ):
+        enforcer = _make_enforcer(
+            mock_engine_pool, ceiling=100 * 1024**3,
+            prefill_transient_margin_gb=12.0,
+        )
+        monkeypatch.setattr(
+            "omlx.process_memory_enforcer.mx.get_active_memory",
+            lambda: 50 * 1024**3,
+        )
+        monkeypatch.setattr(
+            "omlx.process_memory_enforcer.get_phys_footprint",
+            lambda *a: 50 * 1024**3,
+        )
+        enforcer._recent_peak_bytes = 60 * 1024**3
+        ok, current, ceiling = enforcer.prefill_admission_ok()
+        # current = max(50,50,60)=60GB; 60+12=72 <= 100 -> ok
+        assert ok is True
+        assert current == 60 * 1024**3
+        assert ceiling == 100 * 1024**3
+
+    def test_reject_when_margin_would_breach(
+        self, mock_engine_pool, monkeypatch
+    ):
+        enforcer = _make_enforcer(
+            mock_engine_pool, ceiling=100 * 1024**3,
+            prefill_transient_margin_gb=12.0,
+        )
+        monkeypatch.setattr(
+            "omlx.process_memory_enforcer.mx.get_active_memory",
+            lambda: 90 * 1024**3,
+        )
+        monkeypatch.setattr(
+            "omlx.process_memory_enforcer.get_phys_footprint",
+            lambda *a: 90 * 1024**3,
+        )
+        enforcer._recent_peak_bytes = 92 * 1024**3
+        ok, current, _ = enforcer.prefill_admission_ok()
+        # current = 92GB (recent_peak dominates); 92+12=104 > 100 -> reject
+        assert ok is False
+        assert current == 92 * 1024**3
+
+    def test_ok_when_guard_disabled(self, mock_engine_pool):
+        enforcer = _make_enforcer(
+            mock_engine_pool, ceiling=100 * 1024**3,
+            prefill_memory_guard=False,
+        )
+        assert enforcer.prefill_admission_ok() == (True, 0, 0)
