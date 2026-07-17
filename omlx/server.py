@@ -363,10 +363,12 @@ async def lifespan(app: FastAPI):
             prefill_safe_zone_ratio=mem_cfg.prefill_safe_zone_ratio,
             prefill_min_chunk_tokens=mem_cfg.prefill_min_chunk_tokens,
             prefill_transient_margin_gb=mem_cfg.prefill_transient_margin_gb,
+            memory_admission_headroom_gb=mem_cfg.memory_admission_headroom_gb,
         )
         _server_state.process_memory_enforcer = enforcer
         _server_state.engine_pool._process_memory_enforcer = enforcer
         _server_state.engine_pool._get_final_ceiling = enforcer.get_final_ceiling
+        _server_state.engine_pool._get_working_headroom = enforcer.get_working_headroom
         enforcer.start()
 
     # Media job manager (video + image) -- constructed AFTER the enforcer
@@ -566,7 +568,13 @@ async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
         content = _openai_error_body(exc.detail, exc.status_code)
     else:
         content = {"detail": exc.detail}
-    return JSONResponse(status_code=exc.status_code, content=content)
+    # Propagate any headers set on the exception (e.g. Retry-After on the 503
+    # admission gate / InsufficientMemoryError). Without this the generic
+    # handler silently dropped them -- the SchedulerQueueFullError handler only
+    # kept its Retry-After by building its own JSONResponse.
+    return JSONResponse(
+        status_code=exc.status_code, content=content, headers=exc.headers
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -830,9 +838,16 @@ async def get_engine(
         )
         raise HTTPException(status_code=404, detail=detail)
     except ModelTooLargeError as e:
+        # Model weights alone exceed the ceiling -- never fits, not retryable.
         raise HTTPException(status_code=507, detail=str(e))
     except InsufficientMemoryError as e:
-        raise HTTPException(status_code=507, detail=str(e))
+        # Transient co-residency over-commit: the resident model frees memory
+        # when idle, so the client should retry. 503 + Retry-After (not 507,
+        # which signals a permanent "won't fit"). Rejected here BEFORE any
+        # StreamingResponse, so the client never sees a mid-stream error event.
+        raise HTTPException(
+            status_code=503, detail=str(e), headers={"Retry-After": "1"}
+        )
     except ModelLoadingError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except ModelTypeNotLoadableError as e:
@@ -904,6 +919,45 @@ def _suggest_endpoint_for_engine(engine: object) -> str:
     return "Use the model's dedicated endpoint (see /v1/models)."
 
 
+def _memory_admission_gate() -> None:
+    """Pre-stream memory admission gate for generation requests.
+
+    Runs AFTER the engine is resolved (even on a pool cache hit) and BEFORE the
+    SSE stream opens, so a request that would breach the memory ceiling during
+    prefill is rejected with HTTP 503 + Retry-After up front, instead of a
+    mid-stream error event after HTTP 200 -- the hardest failure form for
+    clients (see docs/memory-admission-gate-design.md).
+
+    This is the axis the load-time headroom check cannot cover: many concurrent
+    requests against the SAME already-loaded big model accumulate KV and push
+    the baseline up. It mirrors the scheduler's phys-based forward gate
+    threshold, so it rejects exactly the requests the forward gate would -- only
+    earlier and cleanly. No-op when the enforcer is absent or the guard is
+    disabled.
+    """
+    pool = get_engine_pool()
+    enforcer = getattr(pool, "_process_memory_enforcer", None)
+    if enforcer is None:
+        return
+    ok, current, ceiling = enforcer.prefill_admission_ok()
+    if ok:
+        return
+    logger.warning(
+        "[memadmit] pre-stream 503: current %s + margin would breach "
+        "ceiling %s",
+        format_size(current), format_size(ceiling),
+    )
+    raise HTTPException(
+        status_code=503,
+        detail=(
+            "Server memory is at capacity "
+            f"({format_size(current)} of {format_size(ceiling)} ceiling). "
+            "Retry shortly."
+        ),
+        headers={"Retry-After": "1"},
+    )
+
+
 async def get_engine_for_model(model: str | None = None) -> BaseEngine:
     """
     Get LLM engine for the specified model (or default).
@@ -919,7 +973,12 @@ async def get_engine_for_model(model: str | None = None) -> BaseEngine:
     Raises:
         HTTPException: If model not found or memory error
     """
-    return await get_engine(model, EngineType.LLM)
+    engine = await get_engine(model, EngineType.LLM)
+    # Pre-stream memory admission: reject over-budget requests with 503 BEFORE
+    # any StreamingResponse opens (all LLM chat/completions/responses endpoints
+    # funnel through here). Runs even on a pool cache hit.
+    _memory_admission_gate()
+    return engine
 
 
 async def get_embedding_engine(model: str) -> EmbeddingEngine:
