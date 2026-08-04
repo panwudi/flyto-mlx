@@ -1393,6 +1393,26 @@ async def chat_page(request: Request, is_admin: bool = Depends(require_admin)):
     )
 
 
+@router.get("/transcribe", response_class=HTMLResponse)
+async def transcribe_page(request: Request, is_admin: bool = Depends(require_admin)):
+    """
+    Render the call-transcription viewer: upload a stereo call recording and
+    see a speaker-attributed (sales / customer) word-timestamped dialogue.
+
+    Requires admin authentication via session cookie. The API key is injected
+    into the template so the page can call the /v1/audio/transcriptions
+    endpoint (which uses X-API-Key auth) directly.
+
+    Returns:
+        HTML transcription viewer page.
+    """
+    global_settings = _get_global_settings()
+    api_key = global_settings.auth.api_key if global_settings else ""
+    return templates.TemplateResponse(
+        request, "transcribe.html", {"api_key": api_key or ""}
+    )
+
+
 @router.get("/static/{path:path}")
 async def admin_static(path: str):
     """Serve static files for admin panel (CSS, JS, fonts, logos, etc.)."""

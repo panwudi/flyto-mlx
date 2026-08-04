@@ -1,3 +1,18 @@
+    <!-- Collapse the tool-link labels (transcribe / chat) to icon-only below
+         xl so the extra items never overflow the centered nav pill. Custom CSS
+         because the prebuilt tailwind.css has no xl: variants. -->
+    <style>
+        /* The center nav is absolute at left:50%, so its shrink-to-fit width is
+           capped at ~half the container -- once the items exceed that the flex
+           children compress and the Chinese labels wrap character-by-character
+           (looks vertical). Size the pill to its content and never wrap items. */
+        .nav-center { width: max-content; }
+        .nav-center > * { flex-shrink: 0; }
+        .nav-center a, .nav-center button, .nav-center span { white-space: nowrap; }
+        /* Collapse the two tool links to icon-only below xl so the pill stays
+           narrow enough not to overlap the logo / right controls. */
+        @media (max-width: 1279px) { .nav-tool-label { display: none; } }
+    </style>
     <nav class="w-full py-5 px-6 md:px-12 border-b border-neutral-100 bg-white sticky top-0 z-50">
         <div class="max-w-7xl mx-auto flex items-center relative">
             <!-- Logo -->
@@ -31,7 +46,7 @@
             </button>
 
             <!-- Center Navigation -->
-            <div class="hidden lg:flex items-center gap-1 bg-neutral-100 rounded-full p-1 absolute left-1/2 -translate-x-1/2">
+            <div class="nav-center hidden lg:flex items-center gap-1 bg-neutral-100 rounded-full p-1 absolute left-1/2 -translate-x-1/2">
                 <button
                     @click="setMainTab('status')"
                     :class="mainTab === 'status'
@@ -222,11 +237,20 @@
                     </div>
                 </div>
                 <a
+                    href="/admin/transcribe"
+                    title="{{ t('navbar.tab.transcribe') }}"
+                    class="px-3 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5 text-neutral-600 hover:text-neutral-900"
+                >
+                    <i data-lucide="captions" class="w-4 h-4"></i>
+                    <span class="nav-tool-label">{{ t('navbar.tab.transcribe') }}</span>
+                </a>
+                <a
                     href="/admin/chat"
-                    class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5 text-neutral-600 hover:text-neutral-900"
+                    title="{{ t('navbar.tab.chat') }}"
+                    class="px-3 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5 text-neutral-600 hover:text-neutral-900"
                 >
                     <i data-lucide="message-circle" class="w-4 h-4"></i>
-                    {{ t('navbar.tab.chat') }}
+                    <span class="nav-tool-label">{{ t('navbar.tab.chat') }}</span>
                 </a>
             </div>
 
@@ -349,6 +373,11 @@
                     <i data-lucide="network" class="w-4 h-4"></i>
                     {{ t('navbar.tab.cluster') }}
                 </button>
+                <a href="/admin/transcribe"
+                   class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2 text-neutral-600 hover:text-neutral-900">
+                    <i data-lucide="captions" class="w-4 h-4"></i>
+                    {{ t('navbar.tab.transcribe') }}
+                </a>
                 <a href="/admin/chat"
                    class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2 text-neutral-600 hover:text-neutral-900">
                     <i data-lucide="message-circle" class="w-4 h-4"></i>
