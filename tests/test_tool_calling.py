@@ -13,8 +13,12 @@ from unittest.mock import MagicMock
 
 from omlx.api.tool_calling import (
     ToolCallStreamFilter,
+    _coerce_param_value,
     _gemma4_args_to_json_robust,
     _parse_gemma4_tool_call_fallback,
+    _parse_namespaced_tool_calls,
+    _parse_xml_tool_calls,
+    _repair_json_value,
     _serialize_tool_call_arguments,
     build_json_system_prompt,
     convert_tools_for_template,
@@ -2209,3 +2213,177 @@ class TestParseToolCallsLlama3JsonContent:
             "filter": {"date": {"gte": "2026-01-01", "lt": "2027-01-01"}}
         }
         assert cleaned == ""
+
+
+class TestSchemaAwareFallbackCoercion:
+    """Regression tests for upstream issue #2332.
+
+    The XML fallback parsers used to parse each parameter value with a
+    bare json.loads and keep the raw string on failure, so a slightly
+    malformed array/object param silently degraded to a string. With the
+    tool schema threaded through, declared container params get a
+    bracket-repair pass and declared string params are no longer
+    json-coerced.
+    """
+
+    MALFORMED_EDITS = '[{"range": ["3#8C", "3#8C"], "lines": ["    value: 100,"}]}'
+    REPAIRED_EDITS = [{"range": ["3#8C", "3#8C"], "lines": ["    value: 100,"]}]
+
+    EDIT_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "edit",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "edits": {"type": "array"},
+                },
+            },
+        },
+    }
+
+    def _qwen_text(self, edits_val):
+        return (
+            "<tool_call>\n<function=edit>\n"
+            "<parameter=path>\nconfig.py\n</parameter>\n"
+            f"<parameter=edits>\n{edits_val}\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+
+    def test_qwen_branch_repairs_malformed_array(self):
+        _, calls = _parse_xml_tool_calls(
+            self._qwen_text(self.MALFORMED_EDITS), [self.EDIT_TOOL]
+        )
+        args = json.loads(calls[0].function.arguments)
+        assert args["edits"] == self.REPAIRED_EDITS
+        assert args["path"] == "config.py"
+
+    def test_glm_branch_repairs_malformed_array(self):
+        text = (
+            "<tool_call>edit<arg_key>edits</arg_key>"
+            f"<arg_value>{self.MALFORMED_EDITS}</arg_value></tool_call>"
+        )
+        _, calls = _parse_xml_tool_calls(text, [self.EDIT_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["edits"] == self.REPAIRED_EDITS
+
+    def test_namespaced_branch_repairs_malformed_array(self):
+        text = (
+            '<minimax:tool_call><invoke name="edit">'
+            f'<parameter name="edits">{self.MALFORMED_EDITS}</parameter>'
+            "</invoke></minimax:tool_call>"
+        )
+        _, calls = _parse_namespaced_tool_calls(text, "minimax", [self.EDIT_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["edits"] == self.REPAIRED_EDITS
+
+    def test_declared_string_param_not_json_coerced(self):
+        """A numeric-looking value for a declared string param stays a string."""
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "edit",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                },
+            },
+        }
+        text = (
+            "<tool_call>\n<function=edit>\n"
+            "<parameter=path>123</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        _, calls = _parse_xml_tool_calls(text, [tool])
+        args = json.loads(calls[0].function.arguments)
+        assert args["path"] == "123"
+
+    def test_string_type_decodes_json_quoted_literal(self):
+        """A JSON-quoted string literal round-trips back to the bare string.
+
+        Upstream 60e03c43: the #2332 early return for string params also
+        stopped quoted literals from being decoded, so a MiniMax-style
+        '"SF"' leaked its quotes into the arguments as '"SF"'.
+        """
+        props = {"city": {"type": "string"}}
+        assert _coerce_param_value('"SF"', "city", props, "t") == "SF"
+        # Plain values stay verbatim.
+        assert _coerce_param_value("SF", "city", props, "t") == "SF"
+        assert _coerce_param_value('say "hi"', "city", props, "t") == 'say "hi"'
+
+    def test_no_tools_keeps_legacy_behavior(self):
+        """Without tools, malformed values still fall back to the raw string."""
+        _, calls = _parse_xml_tool_calls(self._qwen_text(self.MALFORMED_EDITS))
+        args = json.loads(calls[0].function.arguments)
+        assert args["edits"] == self.MALFORMED_EDITS
+        # And valid JSON values still get best-effort parsed.
+        _, calls = _parse_xml_tool_calls(self._qwen_text('[{"a": 1}]'))
+        args = json.loads(calls[0].function.arguments)
+        assert args["edits"] == [{"a": 1}]
+
+    def test_undeclared_param_keeps_legacy_behavior(self):
+        """Params missing from the schema keep the best-effort JSON parse."""
+        text = (
+            "<tool_call>\n<function=edit>\n"
+            "<parameter=extra>42</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        _, calls = _parse_xml_tool_calls(text, [self.EDIT_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["extra"] == 42
+
+    def test_unrepairable_container_keeps_raw_string(self):
+        """When repair fails the raw string survives so the call is not lost."""
+        text = self._qwen_text('[{"a": 1 &&& oops')
+        _, calls = _parse_xml_tool_calls(text, [self.EDIT_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["edits"] == '[{"a": 1 &&& oops'
+
+    def test_python_literal_container_accepted(self):
+        """A Python-literal dict/list (single quotes) parses via literal_eval."""
+        text = self._qwen_text("[{'a': True, 'b': None}]")
+        _, calls = _parse_xml_tool_calls(text, [self.EDIT_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["edits"] == [{"a": True, "b": None}]
+
+    def test_native_failure_fallback_gets_tools(self):
+        """parse_tool_calls threads tools into the per-match XML fallback."""
+
+        def failing_parser(text, tools):
+            raise SyntaxError("invalid syntax (<unknown>, line 1)")
+
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = failing_parser
+        _, calls = parse_tool_calls(
+            self._qwen_text(self.MALFORMED_EDITS), tok, [self.EDIT_TOOL]
+        )
+        assert calls is not None
+        args = json.loads(calls[0].function.arguments)
+        assert args["edits"] == self.REPAIRED_EDITS
+
+    def test_int_and_number_coercion(self):
+        props = {
+            "count": {"type": "integer"},
+            "ratio": {"type": "number"},
+            "flag": {"type": "boolean"},
+        }
+        assert _coerce_param_value("7", "count", props, "t") == 7
+        assert _coerce_param_value("2.5", "ratio", props, "t") == 2.5
+        assert _coerce_param_value("3.0", "ratio", props, "t") == 3
+        assert _coerce_param_value("true", "flag", props, "t") is True
+        assert _coerce_param_value("null", "count", props, "t") is None
+
+    def test_union_type_list_keeps_legacy_behavior(self):
+        """A JSON Schema union type list falls back to best-effort parsing."""
+        props = {"v": {"type": ["string", "null"]}}
+        assert _coerce_param_value("hello", "v", props, "t") == "hello"
+        assert _coerce_param_value("123", "v", props, "t") == 123
+
+    def test_repair_json_value(self):
+        assert _repair_json_value('[{"a": [1, 2}]}') == [{"a": [1, 2]}]
+        assert _repair_json_value('{"a": "unterminated') == {"a": "unterminated"}
+        assert _repair_json_value("not json at all") is None
