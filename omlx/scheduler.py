@@ -1565,9 +1565,17 @@ class Scheduler:
             return None
 
         if request_id not in self._output_parser_sessions:
-            self._output_parser_sessions[request_id] = (
-                self._output_parser_factory.create_session(self.tokenizer)
-            )
+            parser_session = self._output_parser_factory.create_session(self.tokenizer)
+            # Gemma 4's template opens the thought channel in the prompt when
+            # generation resumes after a tool response, so the model emits the
+            # thought body without an opening marker. Seed the session as
+            # already-in-thought or the reasoning leaks into visible content.
+            request = self.requests.get(request_id)
+            if request is not None and getattr(request, "needs_think_prefix", False):
+                notify = getattr(parser_session, "notify_prefilled_thought", None)
+                if callable(notify):
+                    notify()
+            self._output_parser_sessions[request_id] = parser_session
         return self._output_parser_sessions[request_id]
 
     def _cleanup_output_parser_session(self, request_id: str):
@@ -2947,35 +2955,89 @@ class Scheduler:
 
         return None
 
+    def _get_output_parser_thinking_start_text(self) -> Optional[str]:
+        """Return parser-provided thinking open text, if the parser has one."""
+        factory = getattr(self, "_output_parser_factory", None)
+        if factory is None:
+            return None
+        return getattr(factory, "thinking_start_text", None)
+
+    def _get_output_parser_thinking_start_output_text(self) -> Optional[str]:
+        """Return normalized text to prepend when parser thinking starts in prompt."""
+        factory = getattr(self, "_output_parser_factory", None)
+        if factory is None:
+            return None
+        return getattr(factory, "thinking_start_output_text", None)
+
+    def _encode_thinking_marker(self, text: str) -> Optional[list[int]]:
+        """Encode a parser/tokenizer thinking marker into token IDs."""
+        try:
+            ids = self.tokenizer.encode(text, add_special_tokens=False)
+        except TypeError:
+            try:
+                ids = self.tokenizer.encode(text)
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+        if ids:
+            return list(ids)
+        return None
+
     def _detect_needs_think_prefix(self, request: "Request") -> bool:
-        """Detect if prompt ends with an open <think> tag (thinking enabled).
+        """Detect if the prompt ends with an open thinking marker.
 
         Returns False for disabled-thinking patterns like <think></think>
-        where </think> immediately follows <think> in the prompt tail.
+        where the close marker immediately follows the open one.
+
+        The marker is not always a single token. Protocol parsers carry their
+        own opener (Gemma 4's ``<|channel>thought``) which tokenizes to several
+        IDs, so the tail is matched as a subsequence rather than by membership.
         """
+        think_start_ids = None
         think_start_id = self._get_think_token_id("think_start_id")
-        if think_start_id is None:
+        if think_start_id is not None:
+            think_start_ids = [think_start_id]
+        else:
+            think_start_text = (
+                self._get_output_parser_thinking_start_text() or "<think>"
+            )
             try:
-                think_start_id = self.tokenizer.convert_tokens_to_ids("<think>")
-                if think_start_id == getattr(self.tokenizer, "unk_token_id", None):
-                    return False
+                token_id = self.tokenizer.convert_tokens_to_ids(think_start_text)
+                if isinstance(token_id, int) and token_id != getattr(
+                    self.tokenizer, "unk_token_id", None
+                ):
+                    think_start_ids = [token_id]
             except (AttributeError, KeyError, TypeError):
-                return False
+                think_start_ids = None
 
-        if not think_start_id or not request.prompt_token_ids:
+            if think_start_ids is None:
+                think_start_ids = self._encode_thinking_marker(think_start_text)
+
+        if not think_start_ids or not request.prompt_token_ids:
             return False
 
-        last_tokens = list(request.prompt_token_ids[-3:])
-        if think_start_id not in last_tokens:
+        lookback = max(3, len(think_start_ids) + 2)
+        last_tokens = list(request.prompt_token_ids[-lookback:])
+        last_idx = None
+        for idx in range(len(last_tokens) - len(think_start_ids), -1, -1):
+            if last_tokens[idx : idx + len(think_start_ids)] == think_start_ids:
+                last_idx = idx
+                break
+        if last_idx is None:
             return False
 
-        # <think> found. Check if </think> follows it (disabled thinking pattern).
-        last_idx = len(last_tokens) - 1 - last_tokens[::-1].index(think_start_id)
-        after_start = last_tokens[last_idx + 1 :]
+        # Open marker found. Check if the close marker follows it.
+        after_start = last_tokens[last_idx + len(think_start_ids) :]
 
         if after_start:
             think_end_ids = self._resolve_think_end_token_ids()
-            if think_end_ids and think_end_ids[0] in after_start:
+            if think_end_ids and len(after_start) >= len(think_end_ids):
+                for idx in range(len(after_start) - len(think_end_ids) + 1):
+                    if after_start[idx : idx + len(think_end_ids)] == think_end_ids:
+                        return False
+            elif think_end_ids and think_end_ids[0] in after_start:
                 return False
 
         return True
@@ -5487,12 +5549,25 @@ class Scheduler:
                             new_text = ""
                         break
 
-            # Prepend <think> tag for first chunk if this is a reasoning model
-            # (skip when a protocol parser already manages reasoning formatting)
-            if parser_session is None and getattr(request, "needs_think_prefix", False):
+            # Prepend <think> tag for first chunk if this is a reasoning model.
+            # Protocol parsers expose their own normalized prefix: their prompt
+            # opens the thinking channel with a model-specific marker (Gemma 4's
+            # <|channel>thought), so the generated stream carries only the body
+            # and the close marker. Without this the reply would ship a lone
+            # </think> with no opener.
+            if getattr(request, "needs_think_prefix", False):
                 if not getattr(request, "think_prefix_sent", False):
-                    think_tag = getattr(self.tokenizer, "think_start", "<think>")
-                    new_text = think_tag + "\n" + new_text
+                    if parser_session is None:
+                        think_tag = getattr(self.tokenizer, "think_start", "<think>")
+                        prefix_text = think_tag + "\n"
+                    else:
+                        prefix_text = (
+                            self._get_output_parser_thinking_start_output_text() or ""
+                        )
+                    if prefix_text:
+                        new_text = prefix_text + new_text
+                        if parser_session is not None:
+                            request.output_text = prefix_text + request.output_text
                     request.think_prefix_sent = True
 
             # Immediately discard logprobs if not requested to free memory (~800KB per response)

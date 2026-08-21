@@ -59,6 +59,14 @@ class OutputParserFactory:
     kind: str
     create_session: Callable[[Any], OutputParserSession]
     stop_token_ids: set[int] = field(default_factory=set)
+    # Marker this parser's chat template writes into the prompt to open the
+    # thinking channel. The scheduler tokenizes it to detect prompt-prefilled
+    # thinking. None means the parser has no prompt-side opener.
+    thinking_start_text: str | None = None
+    # Text the scheduler prepends when the prompt itself opened the thinking
+    # channel, so the parser emits a well-formed <think> pair instead of a
+    # lone close marker.
+    thinking_start_output_text: str | None = None
 
 
 class HarmonyOutputParserSession:
@@ -164,6 +172,8 @@ def detect_output_parser(
             kind="gemma4",
             create_session=Gemma4OutputParserSession,
             stop_token_ids=set(),
+            thinking_start_text="<|channel>thought",
+            thinking_start_output_text="<think>\n",
         )
 
     return None
