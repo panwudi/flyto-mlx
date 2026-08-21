@@ -575,3 +575,102 @@ PR #76 起全量基线为 0 fail (旧的 3 个 OMLX_SERVER_API_KEY env-override
 wired-limit 警告的 dashboard getter 与 8 语言 i18n (此前模板引用但
 JS 从未移植, 设置页每次渲染报 Alpine 错), 并修 bench/cluster 两处
 null 读取。
+
+## 2026-08-20 同步: 工具调用 / VLM / Gemma 4 正确性修复 (PR #91)
+
+上次同步点是 2026-06-13, 到本次时上游领先 1262 commits (三个月约 997 个).
+共享文件已大幅分化 (scheduler.py 1472+/7546-, tool_calling.py 283+/1808-,
+admin 整目录 9077+/154991-), 抽样 21 个上游 commit 做 `git cherry-pick -n`
+探测, 20 个冲突. **后续同步应按功能点手工移植, 不再按 commit 批量 pick.**
+
+引入 (全部手工移植, 上游测试一并搬入):
+
+- `093e7df1` (#2332) + `60e03c43` XML 工具调用回退路径的 schema 感知类型
+  转换. flyto 的 `_parse_xml_tool_calls` 对每个 `<parameter=k>` 值裸调
+  `json.loads`, 没有 schema 参与. 三个抽取分支 (Qwen/Llama, GLM arg_key,
+  namespaced invoke) 全部接上 `_coerce_param_value`. 含容器类型的括号修复
+  与 JSON 引号字面量回环.
+- `44effa29` (#2339) VLM 模型的 `frequency_penalty`. 两处 SamplingParams
+  构造 (generate / stream_generate) 完全没写该字段, 参数落进 **kwargs 被
+  丢弃. 链路其余部分早已接好 (openai_models / server.py / request /
+  scheduler 两处读 / BatchedEngine 两处传), 只有 VLM 引擎漏了 -- 对 m5max
+  上整个 Gemma 4 系列都是空转.
+- `13997cec` (#2533) + 后续把播种挪进 `_get_output_parser_session` 的重构.
+  Gemma 4 prompt 预开思考通道. 三处同时坏: ① `_detect_needs_think_prefix`
+  只匹配单 token `<think>` id, 而 Gemma 4 开标记 `<|channel>thought` 是多
+  token, 检测恒为 False; ② parser session 起始 `_in_thought=False`, 闭标记
+  被当杂散丢掉, 思考漏进正文; ③ 有 parser 接管流时不发 `<think>` 前缀,
+  导致有闭无开. 取上游最终形态 (播种在 session 创建处), 不依赖检测与创建
+  的先后顺序.
+
+跳过 (本轮明确不引):
+
+- `bddc9f88` (#2483) + `d5637c54` (#2753) tool-adjacent mid-system 模板校验.
+  上游有一整套 probe 机制探测模板是否原地保留 mid-system 消息 (flyto 全仓
+  `_MID_SYSTEM` / `mid_system` 命中 0 次). flyto 的
+  `_consolidate_system_messages` 是无条件把系统消息前置, 与上游是两套语义,
+  不是补丁而是换设计. 需单独 spike.
+- ANE prefill 线 (`fbb98dc2` / `3d8e661c` / `166c8f48` 等, 约 20 commits).
+  三重阻塞: ① 需 `omlx/custom_kernels/` 原生扩展源码构建
+  (`OMLX_WITH_CUSTOM_KERNEL=1`); ② kernel ABI 锁死 `mlx==0.32.0` +
+  nanobind 2.13.0 (上游 `2ce529d4` 2026-07-09 移的 pin), flyto pin
+  `mlx>=0.31.2` 实装 0.31.2; ③ 双 ANE 路径面向 M3 Ultra 双 die, m2max 单
+  die 不适用. 且我们生产的 qwen3.6-dense-27b-nvfp4 不在 ANE 支持的 affine
+  q4/q5/q6/q8 列表内. 上游自测 M3 Ultra 32K 上下文 +18.9%.
+- 分布式集群线 (`cb8ca432` #2423 / `858e0ddc` #2591 等). 上游
+  `omlx/cluster/` 已有 20+ 文件 (rank 生命周期 / collective / 异构
+  Metal+CUDA 池 / SSD boundary-snapshot prompt cache); flyto 的
+  `omlx/cluster/` 只有 `router.py` (自研请求级负载路由, `53e6b116`), 是
+  完全不同的东西 -- 上游拆模型, flyto 分请求. 战略方向, 属业务决策.
+- 内存 / 准入线 (`31700cb3` #2390 / `045694f0` / `4dc9baab` #2573 /
+  `9acccab9` 等). 与 flyto PR#90 自研 phys-based 准入门正面重叠, 实现完全
+  分叉. 上游 `memory_guard_tier` 迁移是 breaking config (旧台账已标 flyto
+  113 处旧字段引用), 现在只会更贵.
+- Chat UI 大改版 (`9cacab80` #2379 + 聊天设置弹窗 / 历史下载 / chat 内 STT).
+  admin 分化 9077+/154991-, 移植等于重写.
+- 新模型支持 (Qwen3.8 FP8/NVFP4, MiniMax M3, Ling 3.0 Flash, MiMo V2.5,
+  Tencent Hy3, Meta Muse Glimmer 30B, DeepSeek V4 Flash 0731,
+  Step-3.7-Flash, Laguna S-2.1, Inkling Small, Baidu Unlimited-OCR).
+  flyto 一个都没在跑.
+
+待评估 (下批候选, 已探测冲突但未逐行核实我们是否真缺):
+
+| 上游 commit | 内容 | 优先级 |
+|---|---|---|
+| `0121b8f1` (#2400) | 停止虚报 Claude Code token 用量, 删 `scale_anthropic_tokens()` | 高 (**已核实命中**: flyto `server.py:1274` 有该函数, 3802/4031/4034/4037 四处用于 Anthropic usage 上报; 但为 breaking config, 换 `autocompact_threshold_pct` 默认 80%) |
+| `d4e3c10a` (#2420) | 流未闭合时释放被扣住的封套后缀 | 高 |
+| `cdeea4c5` (#2507) / `12937527` / `d5592aa0` / `16930223` (#2593) | 工具调用流式解析四个边界修复 | 高 |
+| `acfb863f` (#1854) / `26f3f024` (#1886) | Gemma 4 namespaced 单引号参数 / 括号式工具调用 | 中高 |
+| `5be99248` (#2363) | 多 token decode 窗口内 rope 位置未推进 (影响 MTP verify 窗口) | 中高 (flyto 有 vlm_mtp) |
+| `f46abde3` (#1965) | Gemma4 E2B/E4B shared-KV VLM checkpoint | 中 (两台机都注册了 e2b/e4b) |
+| `b876be8e` (#2740) | 跨 chat template 归一化 reasoning effort (新增 `omlx/reasoning_effort.py`) | 中 |
+| `c59b4cb1` (#2435) | VLM chat-template render 尊重 partial 模式 | 中 |
+| `9f563da6` (#2633) | 并发 prefill 下的 decode 公平性 (scheduler +315, 新增 `omlx/decode_activity.py`) | 中 (scheduler 已分化, 需判断值不值) |
+| `2c10f0fb` (#2561) | grammar 采样 token 延到下一步开头接收 | 中 (flyto grammar 分化小, 28+/24-) |
+
+**上游 cache 修复线与 flyto 的 SSD 写路径 abort 无关** (memory
+`paged-ssd-cache-write-abort`): 逐个验证 `0d6b2667` / `330df4c0` /
+`cbd7daa4` / `f37a773a` 均不触及 `_extract_tensor_bytes` (grep 命中数全 0),
+而那正是 m5max 生产崩溃的栈顶. 不过 `0d6b2667` 的思路 (递归闭包形成自引用
+环把 KV 数组钉住) 值得借鉴 -- flyto `paged_ssd_cache.py` 的
+`_store_nstate_elements` 是同款嵌套闭包, 且同样在异步写线程里跑.
+
+**上游全仓 diarization 命中数 = 0**. 说话人分离 / energy_tripass /
+word_timestamps / forced aligner 整套是 flyto 独有 (audio_routes.py 比上游
+多 1224 行即此). 上游三个月只有 4 个音频 commit, 其中 STT `prompt` 透传
+(`bc63094b` #2082) flyto 早在 `403f886d` (2026-05-17) 就自研了, 早两个月.
+另三个 (`c1624efe` STT stream SSE / `f2c85e80` GET /v1/audio/voices /
+`214fc489` TTS 转码 mp3/opus/flac/pcm) flyto 都没有, 优先级低.
+
+测试: 全量 5154 passed / 0 failed / 19 skipped, 对基线 (0 fail) 零回归,
+新增 18 个测试全绿. 三个修复均通过回退验证是承重的.
+
+部署: m5max (PID 56893) + m2max (PID 96715) 双机部署, 各发真实工具调用
+请求验证 (`gemma4-e2b-4bit` + `frequency_penalty=0.5` + get_weather tool),
+均正确返回 `{"city": "北京"}` 且类型为 str. m5max 部署时用
+stash -> ff-merge -> stash pop 保住 PR#87 的 admin 本地改动 (12 个文件,
+与本次改动零重叠).
+
+**注意**: 旧的「待引入」表 (5 月的 #844 / #822 / #1056 / #805 / #933 /
+#1225 / #1268 / #1149 / memory tier 那条) 已严重过期 -- 上游那时到 #1445,
+现在到 #2946, 表里多数条目早被后续 commit 覆盖或废弃. 下次同步应整表重写.
