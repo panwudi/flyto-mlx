@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch, PropertyMock
 
 import mlx.core as mx
 import pytest
+from types import SimpleNamespace
 
 from omlx.request import Request, RequestOutput, RequestStatus, SamplingParams
 import omlx.scheduler as scheduler_module
@@ -1819,6 +1820,73 @@ class TestDetectNeedsThinkPrefix:
         """No <think> in last 3 tokens -> False."""
         scheduler = self._make_scheduler(mock_model, think_start_id=100, think_end_id=101)
         request = self._make_request([1, 2, 3, 4, 5])
+        assert scheduler._detect_needs_think_prefix(request) is False
+
+    def test_protocol_parser_close_marker_means_thinking_off(self, mock_model):
+        """Gemma 4 with enable_thinking=False must NOT be seeded in-thought.
+
+        Regression anchor. Its template renders "<|channel>thought\\n<channel|>"
+        -- opened and immediately closed, i.e. thinking OFF. The close marker
+        is the parser's ``<channel|>``, not ``</think>``. Before the fix the
+        scheduler resolved the close marker by tokenising the literal string
+        "</think>" (3 tokens that no Gemma 4 prompt contains), so neither close
+        check could fire, this returned True, the parser session was seeded as
+        already-in-thought, and every generated token was filed as reasoning --
+        leaving `content` empty. Observed on m5max with
+        gemma4-moe-26b-a4b-q6: prompt tail [100, 45518, 107, 101], answer "42"
+        landed in reasoning_content with no content at all.
+        """
+        from conftest import MockTokenizer
+
+        tokenizer = MockTokenizer()
+
+        def encode(text, **kwargs):
+            return {
+                "<|channel>thought": [100, 45518],
+                "<channel|>": [101],
+                "</think>": [954, 36345, 236813],
+            }.get(text, [])
+
+        tokenizer.encode = encode
+        scheduler = Scheduler(model=mock_model, tokenizer=tokenizer)
+        scheduler._output_parser_factory = SimpleNamespace(
+            thinking_start_text="<|channel>thought",
+            thinking_end_text="<channel|>",
+        )
+        # ...<|channel>thought \n <channel|>  -> opened then closed
+        request = self._make_request([4368, 107, 100, 45518, 107, 101])
+        assert scheduler._detect_needs_think_prefix(request) is False
+
+    def test_protocol_parser_open_without_close_still_seeds(self, mock_model):
+        """The same prompt WITHOUT the close marker must still return True."""
+        from conftest import MockTokenizer
+
+        tokenizer = MockTokenizer()
+
+        def encode(text, **kwargs):
+            return {
+                "<|channel>thought": [100, 45518],
+                "<channel|>": [101],
+            }.get(text, [])
+
+        tokenizer.encode = encode
+        scheduler = Scheduler(model=mock_model, tokenizer=tokenizer)
+        scheduler._output_parser_factory = SimpleNamespace(
+            thinking_start_text="<|channel>thought",
+            thinking_end_text="<channel|>",
+        )
+        request = self._make_request([4368, 107, 100, 45518, 107])
+        assert scheduler._detect_needs_think_prefix(request) is True
+
+    def test_falls_back_to_think_end_when_parser_has_no_close(self, mock_model):
+        """A parser without thinking_end_text keeps the </think> behaviour."""
+        scheduler = self._make_scheduler(
+            mock_model, think_start_id=100, think_end_id=101
+        )
+        scheduler._output_parser_factory = SimpleNamespace(
+            thinking_start_text=None, thinking_end_text=None
+        )
+        request = self._make_request([1, 2, 100, 101])
         assert scheduler._detect_needs_think_prefix(request) is False
 
     def test_no_think_start_id_on_tokenizer(self, mock_model):

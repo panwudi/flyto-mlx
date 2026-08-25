@@ -2962,6 +2962,31 @@ class Scheduler:
             return None
         return getattr(factory, "thinking_start_text", None)
 
+    def _get_output_parser_thinking_end_text(self) -> Optional[str]:
+        """Return parser-provided thinking close text, if the parser has one."""
+        factory = getattr(self, "_output_parser_factory", None)
+        if factory is None:
+            return None
+        return getattr(factory, "thinking_end_text", None)
+
+    def _resolve_prompt_think_end_token_ids(self) -> list[int] | None:
+        """Close-marker IDs as they appear in a PROMPT, parser first.
+
+        Distinct from _resolve_think_end_token_ids, which answers "what should
+        the thinking-budget processor force the model to emit" and only knows
+        the </think> family. Protocol parsers carry their own close marker
+        (Gemma 4's ``<channel|>``), and that is what their chat template writes.
+        Asking the </think> resolver instead yields the tokenisation of the
+        literal string "</think>" -- a sequence no Gemma 4 prompt contains --
+        so an opened-then-closed channel reads as still open.
+        """
+        end_text = self._get_output_parser_thinking_end_text()
+        if end_text:
+            ids = self._encode_thinking_marker(end_text)
+            if ids:
+                return ids
+        return self._resolve_think_end_token_ids()
+
     def _get_output_parser_thinking_start_output_text(self) -> Optional[str]:
         """Return normalized text to prepend when parser thinking starts in prompt."""
         factory = getattr(self, "_output_parser_factory", None)
@@ -3032,7 +3057,7 @@ class Scheduler:
         after_start = last_tokens[last_idx + len(think_start_ids) :]
 
         if after_start:
-            think_end_ids = self._resolve_think_end_token_ids()
+            think_end_ids = self._resolve_prompt_think_end_token_ids()
             if think_end_ids and len(after_start) >= len(think_end_ids):
                 for idx in range(len(after_start) - len(think_end_ids) + 1):
                     if after_start[idx : idx + len(think_end_ids)] == think_end_ids:
