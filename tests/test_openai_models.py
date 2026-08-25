@@ -31,6 +31,7 @@ from omlx.api.openai_models import (
     ToolCall,
     ToolDefinition,
     Usage,
+    dump_chat_completion_response,
 )
 
 
@@ -500,6 +501,101 @@ class TestChatCompletionRequest:
         )
 
         assert req.chat_template_kwargs == {"reasoning_effort": "xhigh"}
+
+
+class TestDumpChatCompletionResponse:
+    """message.content must survive exclude_none as an explicit null.
+
+    Regression anchor: the non-streaming body was serialised with
+    model_dump_json(exclude_none=True), which dropped the key entirely
+    whenever the assistant produced no visible text -- a tool-call-only reply,
+    or a thinking-only one. Strict OpenAI clients read message["content"]
+    unconditionally and got a KeyError instead of None.
+    """
+
+    def _response(self, **message_kwargs):
+        return ChatCompletionResponse(
+            model="m",
+            choices=[
+                ChatCompletionChoice(
+                    message=AssistantMessage(**message_kwargs),
+                    finish_reason="stop",
+                )
+            ],
+            usage=Usage(
+                prompt_tokens=1,
+                completion_tokens=1,
+                total_tokens=2,
+            ),
+        )
+
+    def test_thinking_only_reply_keeps_a_null_content(self):
+        d = json.loads(
+            dump_chat_completion_response(self._response(reasoning_content="42"))
+        )
+        message = d["choices"][0]["message"]
+        assert "content" in message
+        assert message["content"] is None
+        assert message["reasoning_content"] == "42"
+
+    def test_tool_call_only_reply_keeps_a_null_content(self):
+        d = json.loads(
+            dump_chat_completion_response(
+                self._response(
+                    tool_calls=[
+                        ToolCall(
+                            id="c1",
+                            function=FunctionCall(name="f", arguments="{}"),
+                        )
+                    ]
+                )
+            )
+        )
+        message = d["choices"][0]["message"]
+        assert "content" in message
+        assert message["content"] is None
+
+    def test_matches_the_old_serialisation_when_content_exists(self):
+        """No behaviour change for ordinary replies.
+
+        The optional float metrics are populated on purpose: with them absent
+        this only proves the two payloads have the same shape, not that
+        model_dump() + json.dumps renders floats the same way pydantic's own
+        serialiser does.
+        """
+        response = ChatCompletionResponse(
+            model="m",
+            choices=[
+                ChatCompletionChoice(
+                    message=AssistantMessage(content="42"), finish_reason="stop"
+                )
+            ],
+            usage=Usage(
+                prompt_tokens=1,
+                completion_tokens=1,
+                total_tokens=2,
+                model_load_duration=2.34,
+                total_time=1.5,
+                time_to_first_token=0.125,
+                prompt_tokens_per_second=1234.56,
+            ),
+        )
+        # Raw string, not parsed: this is what catches separator and escaping
+        # drift, which a json.loads comparison silently accepts.
+        assert dump_chat_completion_response(response) == response.model_dump_json(
+            exclude_none=True
+        )
+
+    def test_other_none_fields_are_still_excluded(self):
+        """Only content is forced; exclude_none still trims usage metrics."""
+        d = json.loads(dump_chat_completion_response(self._response(content="42")))
+        assert "model_load_duration" not in d["usage"]
+        assert "reasoning_content" not in d["choices"][0]["message"]
+
+    def test_non_ascii_is_not_escaped(self):
+        """json.dumps must keep ensure_ascii=False, matching model_dump_json."""
+        raw = dump_chat_completion_response(self._response(content="答案是四十二"))
+        assert "答案是四十二" in raw
 
 
 class TestChatCompletionResponse:
