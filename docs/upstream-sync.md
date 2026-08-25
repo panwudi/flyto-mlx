@@ -766,13 +766,71 @@ thinking_budget 3: 转发集合 = 取值域减 off 的不变式). +1 deselected 
 "为什么 high 档思考说到一半就停了"的答案在这里, 调法是 per-model 的
 `ModelSettings.reasoning_effort_budgets`.
 
-未做, 需 owner 点头后才继续:
+真机验证 (owner 批了下权重, 已完成):
 
-- 下载 `unsloth/Qwen3.8-27B-NVFP4` (23.4 GB: `model.safetensors` 22.57G +
-  `model_mtp.safetensors` 0.85G, 共 13 文件), m5max 注册 + 实测.
-  m5max 已清 160G 僵尸 dflash L2 缓存, 2026-08-24 实测容器可用 404.4 GB,
-  空间够.
-- **注意**: owner 批的权重是 **NVFP4**, 所以真机 smoke 只能验证
-  `c82cabca` 那条路, **验不到 `qwen38_fp8.py` 的分块 FP8 反量化** ——
-  那是另一种 checkpoint 格式 (带 `weight_scale_inv`). FP8 这块目前只有单测
-  覆盖.
+`unsloth/Qwen3.8-27B-NVFP4` 从 ModelScope 下到 m5max, 23.4445 GB / 13 个文件,
+每个文件大小与仓库清单逐字节吻合, 53 分钟 (~8 MB/s). 放在
+`~/.cache/modelscope/hub/models/unsloth/Qwen3___8-27B-NVFP4` -- 即
+`omlx/admin/ms_downloader.py` 放真身的位置, 注册表只放软链
+`~/.fmlx/models/qwen3.8-dense-27b-nvfp4`.
+
+**下之前先验判定**, 免得 23 GB 花在一个 dispatch miss 上: 只拉 `config.json`
+跑 `is_supported_config` -> True, `quant_method: compressed-tensors`,
+`model_type: qwen3_5`. 又拿 `model.safetensors.index.json` 对了一遍: checkpoint
+里 `weight_scale` 张量正好 **401** 个, 与集成测试断言的模块数一致.
+
+集成测试在 m5max 通过. 但 23 GB 模型 6.5 秒跑完不足以自证, 所以改写成带
+instrumentation 的脚本重跑:
+
+```
+LOAD_SECONDS: 2.2                    (mmap 惰性加载 -- 权重全程不反量化,
+MLX_ACTIVE_MEMORY_GB: 23.75           所以这个耗时是合理的)
+SCALED_QUANTIZED_LINEAR_COUNT: 401 (expected 401)
+TEXT_OUTPUT:   '...Need answer one word: Paris. Ensure'
+VISION_OUTPUT: '...left is red, right is blue...'
+PEAK_MEMORY_GB: 24.24
+```
+
+23.75 GB 真占住了, 模块数精确对上, 文字答对, 视觉路径通过 NVFP4 权重正确读出
+合成的红蓝图.
+
+### Qwen3.8 模板实测: `off` 不转发是承重的, 不是洁癖
+
+拿真模板逐档渲染:
+
+| 传入 | 结果 |
+|---|---|
+| `low` / `medium` | OK, prompt 真的变了 |
+| `high` | OK, 模板自己映射成 `xhigh`, 与默认同 |
+| `xhigh` | OK (模板默认值) |
+| **`off`** | **TemplateError: Unexpected reasoning effort off** |
+| **`banana`** | **TemplateError** |
+
+模板只认 `xhigh` / `medium` / `low`, 别的直接抛. 所以:
+
+- **不转发 `off` 不是风格问题** -- 转发了的话, 每个对 Qwen3.8 发
+  `reasoning_effort: "off"` 的请求都会 500.
+- **给 `/v1/responses` 加取值域闸门堵的是真洞** -- 那条路的 `reasoning` 是
+  无校验 dict, 没有闸门的话 `banana` 会一路撞到 TemplateError.
+
+端到端 (m5max :8000, 真实请求):
+
+| 请求 | 结果 |
+|---|---|
+| 裸 chat | `content: '51'`, `reasoning_content` 正确分离 |
+| chat `reasoning_effort` = low/medium/high | 全部 200, 答案正确 |
+| chat `reasoning_effort=off` | 200, 思考 token 降到 2 |
+| responses `effort` = low | 200, 转发生效 |
+| responses `effort` = xhigh / banana / off / `["high"]` | **全部 200**, 域外值静默丢弃 |
+
+m2max 回归 (没有 Qwen3.8 权重, 验的是别打坏现役模型): `gemma4-e2b-4bit` 在
+`reasoning_effort=high` / `=off` / `chat_template_kwargs` 逃生口三种请求下均
+正确返回 `42`.
+
+**注意**: owner 批的权重是 **NVFP4**, 所以以上**全都没验到 `qwen38_fp8.py` 的
+分块 FP8 反量化** -- 那是另一种 checkpoint 格式 (带 `weight_scale_inv`).
+FP8 这块目前只有单测覆盖.
+
+部署: PR #93 已合并 (`5b2c7c33`), m5max (PID 22250, model_count 34 -> 35) +
+m2max (PID 50770) 双机部署. m5max 部署用 stash -> ff-merge -> stash pop 保住
+PR#87 的 12 个 admin 本地改动.
