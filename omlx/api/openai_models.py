@@ -316,6 +316,30 @@ class AssistantMessage(BaseModel):
     tool_calls: Optional[List[ToolCall]] = None
 
 
+def dump_chat_completion_response(response: "ChatCompletionResponse") -> str:
+    """Serialise a chat completion with ``message.content`` always present.
+
+    ``exclude_none`` keeps the optional usage metrics out of the payload, but
+    it also drops ``message.content`` whenever the assistant produced no
+    visible text -- a tool-call-only reply, or a thinking-only one. The OpenAI
+    schema has the field present and null in exactly those cases, and strict
+    clients read ``message["content"]`` unconditionally, so omitting the key
+    raises a KeyError instead of yielding None.
+
+    Only the non-streaming body is normalised. Streaming deltas legitimately
+    omit fields that did not change in that chunk, which is what upstream
+    OpenAI does too.
+    """
+    payload = response.model_dump(exclude_none=True)
+    for choice in payload.get("choices", []):
+        message = choice.get("message")
+        if isinstance(message, dict):
+            message.setdefault("content", None)
+    # separators match pydantic's compact output; the default json.dumps
+    # spacing would change every byte of the wire format for no reason.
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
 class ChatCompletionChoice(BaseModel):
     """A single choice in chat completion response."""
     index: int = 0

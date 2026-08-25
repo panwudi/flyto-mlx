@@ -100,6 +100,7 @@ from .api.openai_models import (
     PromptTokensDetails,
     REASONING_EFFORT_LEVELS,
     Usage,
+    dump_chat_completion_response,
 )
 from .api.embedding_models import (
     EmbeddingRequest,
@@ -2747,7 +2748,7 @@ async def create_chat_completion(
 
         finish_reason = "tool_calls" if tool_calls else output.finish_reason
 
-        return ChatCompletionResponse(
+        _response = ChatCompletionResponse(
             model=request.model,
             choices=[ChatCompletionChoice(
                 message=AssistantMessage(
@@ -2767,7 +2768,11 @@ async def create_chat_completion(
                 model_load_duration=round(model_load_duration, 2) if model_load_duration > 1.0 else None,
                 total_time=round(elapsed, 2),
             ),
-        ).model_dump_json(exclude_none=True)
+        )
+        # Not model_dump_json(exclude_none=True): that drops message.content
+        # whenever the reply carries no visible text (tool calls only, or
+        # thinking only), which strict OpenAI clients read unconditionally.
+        return dump_chat_completion_response(_response)
 
     return StreamingResponse(
         _with_json_keepalive(http_request, _build_chat_completion()),
