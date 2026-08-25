@@ -98,6 +98,7 @@ from .api.openai_models import (
     ModelInfo,
     ModelsResponse,
     PromptTokensDetails,
+    REASONING_EFFORT_LEVELS,
     Usage,
 )
 from .api.embedding_models import (
@@ -154,7 +155,7 @@ from .api.tool_calling import (
     sanitize_tool_call_markup,
 )
 from .api.thinking import ThinkingParser, extract_thinking
-from .api.utils import clean_output_text, clean_special_tokens, detect_and_strip_partial, extract_multimodal_content, extract_text_content
+from .api.utils import clean_output_text, clean_special_tokens, detect_and_strip_partial, extract_multimodal_content, extract_text_content, merge_reasoning_effort_chat_template_kwargs
 from .engine import BaseEngine, BatchedEngine, VLMBatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
@@ -1170,6 +1171,11 @@ def get_sampling_params(
 # budget (it disables thinking outright); low/medium/high select a budget.
 # Per-model overrides live in ModelSettings.reasoning_effort_budgets.
 _REASONING_EFFORT_BUDGETS = {"low": 512, "medium": 2048, "high": 8192}
+
+# Effort levels forwarded into chat_template_kwargs so templates with native
+# reasoning levels (Qwen 3.8) can honour them. "off" is excluded: it is flyto
+# sugar for enable_thinking=False, not a template level.
+_TEMPLATE_FORWARDABLE_EFFORTS = REASONING_EFFORT_LEVELS - {"off"}
 
 
 def _effort_to_budget(effort: str | None, ms) -> int | None:
@@ -2403,9 +2409,20 @@ async def create_chat_completion(
         # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
         if ms.preserve_thinking is not None:
             merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
+    # A top-level reasoning_effort also reaches the chat template so templates
+    # with native reasoning levels (Qwen 3.8) can honour it. The field is
+    # already validated into REASONING_EFFORT_LEVELS; only "off" is held back
+    # because that is flyto sugar for enable_thinking=False, not a template
+    # level. An explicit chat_template_kwargs entry always wins.
+    _request_ct_kwargs = merge_reasoning_effort_chat_template_kwargs(
+        request.chat_template_kwargs,
+        request.reasoning_effort
+        if request.reasoning_effort in _TEMPLATE_FORWARDABLE_EFFORTS
+        else None,
+    )
     # Per-request kwargs override model settings (except forced keys)
-    if request.chat_template_kwargs:
-        for k, v in request.chat_template_kwargs.items():
+    if _request_ct_kwargs:
+        for k, v in _request_ct_kwargs.items():
             if k not in forced_keys:
                 merged_ct_kwargs[k] = v
 
@@ -4555,6 +4572,29 @@ async def create_response(
         # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
         if ms.preserve_thinking is not None:
             merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
+    # Responses API carries the effort under reasoning.effort. Unlike
+    # /v1/chat/completions this is an unvalidated dict, so restrict it to the
+    # same domain here -- out-of-domain values are dropped silently (clients
+    # such as Codex CLI send reasoning.effort unprompted; rejecting would
+    # break them) and behave exactly as they did before this field was
+    # forwarded at all. "off" is flyto sugar for enable_thinking=False, not a
+    # template level, so it is not forwarded either.
+    _raw_effort = (
+        request.reasoning.get("effort")
+        if isinstance(request.reasoning, dict)
+        else None
+    )
+    _reasoning_effort = (
+        _raw_effort.strip().lower() if isinstance(_raw_effort, str) else None
+    )
+    if _reasoning_effort not in _TEMPLATE_FORWARDABLE_EFFORTS:
+        _reasoning_effort = None
+    merged_ct_kwargs = (
+        merge_reasoning_effort_chat_template_kwargs(
+            merged_ct_kwargs, _reasoning_effort
+        )
+        or {}
+    )
 
     # Note: extract_text_content/extract_harmony_messages/extract_multimodal_content
     # are NOT called here because convert_responses_input_to_messages() already

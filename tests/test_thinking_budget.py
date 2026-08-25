@@ -297,6 +297,38 @@ class TestResolveThinkingBudget:
 
 
 # ---------------------------------------------------------------------------
+# Effort levels forwarded into chat_template_kwargs
+# ---------------------------------------------------------------------------
+
+
+class TestTemplateForwardableEfforts:
+    """The set of efforts server.py forwards to chat templates.
+
+    Both /v1/chat/completions and /v1/responses gate on this one set, so the
+    unvalidated Responses dict cannot smuggle a level past the domain that
+    ChatCompletionRequest enforces.
+    """
+
+    def test_is_the_validated_domain_minus_off(self):
+        from omlx.api.openai_models import REASONING_EFFORT_LEVELS
+        from omlx.server import _TEMPLATE_FORWARDABLE_EFFORTS
+
+        assert _TEMPLATE_FORWARDABLE_EFFORTS == REASONING_EFFORT_LEVELS - {"off"}
+
+    def test_off_is_never_forwarded(self):
+        from omlx.server import _TEMPLATE_FORWARDABLE_EFFORTS
+
+        assert "off" not in _TEMPLATE_FORWARDABLE_EFFORTS
+
+    def test_template_native_levels_are_not_forwarded(self):
+        """Levels outside flyto's domain ride chat_template_kwargs instead."""
+        from omlx.server import _TEMPLATE_FORWARDABLE_EFFORTS
+
+        for level in ("xhigh", "max", "minimal", "none", "banana"):
+            assert level not in _TEMPLATE_FORWARDABLE_EFFORTS
+
+
+# ---------------------------------------------------------------------------
 # _effort_to_budget (server.py helper)
 # ---------------------------------------------------------------------------
 

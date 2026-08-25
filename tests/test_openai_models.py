@@ -466,6 +466,41 @@ class TestChatCompletionRequest:
         assert req.xtc_probability == 0.5
         assert req.xtc_threshold == 0.1
 
+    def test_reasoning_effort_accepted(self):
+        """Test top-level reasoning_effort is accepted (Qwen 3.8 levels)."""
+        req = ChatCompletionRequest(
+            model="Qwen3.8-27B",
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="high",
+        )
+
+        assert req.reasoning_effort == "high"
+
+    def test_reasoning_effort_rejects_unknown_level(self):
+        """Levels outside flyto's budget mapping are rejected at the top level.
+
+        flyto's reasoning_effort is sugar over thinking_budget, so its domain
+        stays {off, low, medium, high}. Template-native levels beyond that set
+        (e.g. Qwen 3.8's "xhigh") go through chat_template_kwargs instead --
+        see test_reasoning_effort_escape_hatch_via_template_kwargs.
+        """
+        with pytest.raises(ValidationError):
+            ChatCompletionRequest(
+                model="Qwen3.8-27B",
+                messages=[Message(role="user", content="Hello")],
+                reasoning_effort="xhigh",
+            )
+
+    def test_reasoning_effort_escape_hatch_via_template_kwargs(self):
+        """Template-native levels ride chat_template_kwargs unvalidated."""
+        req = ChatCompletionRequest(
+            model="Qwen3.8-27B",
+            messages=[Message(role="user", content="Hello")],
+            chat_template_kwargs={"reasoning_effort": "xhigh"},
+        )
+
+        assert req.chat_template_kwargs == {"reasoning_effort": "xhigh"}
+
 
 class TestChatCompletionResponse:
     """Tests for ChatCompletionResponse model."""
