@@ -21,6 +21,7 @@ from omlx.api.utils import (
     extract_harmony_messages,
     extract_multimodal_content,
     extract_text_content,
+    merge_reasoning_effort_chat_template_kwargs,
 )
 from omlx.api.anthropic_utils import (
     convert_anthropic_to_internal,
@@ -50,6 +51,24 @@ from omlx.api.anthropic_models import (
     MessagesRequest,
     SystemContent,
 )
+
+
+class TestReasoningEffortChatTemplateKwargs:
+    def test_adds_top_level_reasoning_effort(self):
+        assert merge_reasoning_effort_chat_template_kwargs(None, "high") == {
+            "reasoning_effort": "high"
+        }
+
+    def test_explicit_template_kwarg_wins(self):
+        original = {"reasoning_effort": "low", "enable_thinking": True}
+
+        merged = merge_reasoning_effort_chat_template_kwargs(original, "high")
+
+        assert merged == original
+        assert merged is not original
+
+    def test_empty_inputs_return_none(self):
+        assert merge_reasoning_effort_chat_template_kwargs(None, None) is None
 
 
 class TestCleanOutputText:

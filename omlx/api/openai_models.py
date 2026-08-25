@@ -22,6 +22,12 @@ from omlx.api.shared_models import (
     get_unix_timestamp,
 )
 
+# Accepted ``reasoning_effort`` levels. flyto treats the field as sugar over
+# thinking_budget (see server._effort_to_budget), so the domain is fixed here
+# rather than following whatever levels a given chat template understands.
+# Template-native levels outside this set ride chat_template_kwargs instead.
+REASONING_EFFORT_LEVELS = frozenset({"off", "low", "medium", "high"})
+
 
 # =============================================================================
 # Content Types
@@ -294,10 +300,10 @@ class ChatCompletionRequest(BaseModel):
         if not isinstance(v, str):
             raise ValueError("reasoning_effort must be a string")
         v = v.strip().lower()
-        allowed = {"off", "low", "medium", "high"}
-        if v not in allowed:
+        if v not in REASONING_EFFORT_LEVELS:
             raise ValueError(
-                f"reasoning_effort must be one of {sorted(allowed)}, got {v!r}"
+                "reasoning_effort must be one of "
+                f"{sorted(REASONING_EFFORT_LEVELS)}, got {v!r}"
             )
         return v
 

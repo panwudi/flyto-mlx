@@ -40,6 +40,17 @@ def detect_and_strip_partial(messages: list[dict]) -> bool:
     return is_partial
 
 
+def merge_reasoning_effort_chat_template_kwargs(
+    chat_template_kwargs: dict[str, Any] | None,
+    reasoning_effort: Any | None,
+) -> dict[str, Any] | None:
+    """Forward an API reasoning effort without overriding explicit template kwargs."""
+    merged = dict(chat_template_kwargs or {})
+    if reasoning_effort is not None:
+        merged.setdefault("reasoning_effort", reasoning_effort)
+    return merged or None
+
+
 # =============================================================================
 # Special Token Patterns
 # =============================================================================

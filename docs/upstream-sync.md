@@ -628,10 +628,11 @@ admin 整目录 9077+/154991-), 抽样 21 个上游 commit 做 `git cherry-pick 
   113 处旧字段引用), 现在只会更贵.
 - Chat UI 大改版 (`9cacab80` #2379 + 聊天设置弹窗 / 历史下载 / chat 内 STT).
   admin 分化 9077+/154991-, 移植等于重写.
-- 新模型支持 (Qwen3.8 FP8/NVFP4, MiniMax M3, Ling 3.0 Flash, MiMo V2.5,
-  Tencent Hy3, Meta Muse Glimmer 30B, DeepSeek V4 Flash 0731,
-  Step-3.7-Flash, Laguna S-2.1, Inkling Small, Baidu Unlimited-OCR).
-  flyto 一个都没在跑.
+- 新模型支持 (MiniMax M3, Ling 3.0 Flash, MiMo V2.5, Tencent Hy3,
+  Meta Muse Glimmer 30B, DeepSeek V4 Flash 0731, Step-3.7-Flash,
+  Laguna S-2.1, Inkling Small, Baidu Unlimited-OCR). flyto 一个都没在跑.
+  ~~Qwen3.8 FP8/NVFP4~~ **此条已在 2026-08-24 反转, 见下一节** -- 当时判
+  "没在跑"所以跳过, owner 随后决定要上, 已移植.
 
 待评估 (下批候选, 已探测冲突但未逐行核实我们是否真缺):
 
@@ -674,3 +675,104 @@ stash -> ff-merge -> stash pop 保住 PR#87 的 admin 本地改动 (12 个文件
 **注意**: 旧的「待引入」表 (5 月的 #844 / #822 / #1056 / #805 / #933 /
 #1225 / #1268 / #1149 / memory tier 那条) 已严重过期 -- 上游那时到 #1445,
 现在到 #2946, 表里多数条目早被后续 commit 覆盖或废弃. 下次同步应整表重写.
+
+## 2026-08-24 同步: Qwen 3.8 支持 (PR #93)
+
+上一节把 Qwen3.8 归到「跳过」, 理由是"flyto 一个都没在跑". owner 随后决定
+要上, 本次移植. 只动这一条, 上一节其余跳过项不变.
+
+引入:
+
+- `c82cabca` (#2659) Qwen3.8 mixed ModelOpt NVFP4 权重加载器.
+  `git cherry-pick -x` **零冲突直接落地**: 新文件
+  `omlx/patches/qwen38_modelopt_mixed.py` (416 行) + `model_loading.py`
+  11 行接线 + 两个测试文件 (单测 11 个 + 一个 `slow` 标记的真模型集成测试,
+  不下权重, 全量跑时被 deselect).
+- `2bb2cc51` (#2653) Qwen3.8 FP8 + reasoning levels. **手工移植**, 三块里
+  两块原样落地 (`qwen38_fp8.py` 分块 FP8 反量化 + `qwen35_vlm_model.py`
+  的 sanitize 钩子), 第三块 reasoning_effort 改写, 见下.
+
+reasoning_effort 为什么不能照搬:
+
+flyto 早就有这个字段, 语义完全不同 -- 它是 `thinking_budget` 的语法糖
+(`_effort_to_budget`), 取值域 `{off, low, medium, high}` 由 pydantic
+validator 强制, `off` 表示 `enable_thinking=False`. 上游是把原始字符串直接
+转发给 chat template 且不限取值 (他们的测试用 `xhigh`, flyto 会 400).
+
+做法: validator 和预算映射一律不动, 额外把 effort 转发进
+`chat_template_kwargs`. 转发集合 = 校验过的取值域减 `off`
+(`server._TEMPLATE_FORWARDABLE_EFFORTS`). 域外档位继续走原有逃生口
+`chat_template_kwargs={"reasoning_effort": "xhigh"}` -- 那条路本来就通,
+本次没变.
+
+两个端点都接上了, 且**取值域限制是两边同一个常量**:
+
+- `/v1/chat/completions` 读 `request.reasoning_effort`, pydantic 已校验.
+- `/v1/responses` 读 `request.reasoning["effort"]`. **这是个没有任何校验的
+  `Dict[str, Any]`** -- 不显式限制的话 `xhigh` / 整数 / 列表都会直接进模板.
+  所以那一侧显式过一遍同一个集合, 域外值和非字符串值静默丢弃(不报错:
+  Codex CLI 会主动发 `reasoning.effort`, 拒掉会打断它), 对这些值行为与移植
+  前逐字节一致.
+- Anthropic `MessagesRequest` 没有 effort 字段, 不动. 上游也只接了两处.
+
+已实测确认 (下次别重做):
+
+1. **不需要升 mlx.** mlx 0.31.2 上 `mx.quantized_matmul(mode="mxfp8"/"nvfp4")`
+   以及 FP8 路径要的 `mx.to_fp8` / `mx.from_fp8` 全都在, 反量化实跑对得上
+   期望值. 上游钉 `mlx==0.32.0` 是为了他们自编译的 `omlx/custom_kernels/`
+   原生 kernel 的 nanobind ABI 对齐 (见上游 `2ce529d4` commit message),
+   那套 kernel 我们根本没有, 理由对我们不成立.
+2. **架构不用新写.** Qwen3.8 的 `config.model_type` 报的是 `qwen3_5`
+   (加载器第 157 行 `if config.get("model_type") != "qwen3_5"` 即证据),
+   复用现成 qwen3_5 架构; 我们装的 mlx-vlm 0.6.3 有 `qwen3_5` 模块.
+   那 416 行只是权重解包器 (处理 FP8 + NVFP4 混合量化).
+3. FP8 sanitize 钩子**只挂 dense 变体**, 与上游一致. flyto 另有
+   `qwen35_moe_vlm_model.py`, 上游同样没挂 -- 加载器自己注释说判定"刻意严格,
+   只认已发布的 dense 64 层 Qwen3.8 VLM 几何". 权重格式一变就得跟着改,
+   **不要为了通用去放宽这个判定**(放宽会让不匹配的 checkpoint 走错路径).
+
+刻意不引 (但因本次改动升了优先级):
+
+- `b876be8e` (#2740) 跨 chat template 归一化 reasoning effort. 上游新增
+  `omlx/reasoning_effort.py`, 在模板拒绝某个 effort 值时用别名重试渲染,
+  再退到模板原生默认. **这证明了"模板确实会因为不认识的 effort 值报错"**,
+  不是理论风险. 但它接的是 `apply_chat_template` 调用点, 上游只有 4 处,
+  flyto 有十几处 (batched 2 / dflash 2 / vlm 8+, 含 processor 回退、prefix、
+  diffusion 三条上游没有的路径) -- 漏接一处等于洞还在. 本次改为收窄转发取值
+  域, 同样堵住且可证明. 该 commit 留在下表, 若将来放宽取值域则变成必需前置.
+
+测试 (2026-08-24 m2max, 同一台机同一天):
+
+| | passed | failed | skipped | deselected |
+|---|---|---|---|---|
+| 基线 (干净 `main` @ `e1de07bd`, 独立 worktree) | 5222 | 0 | 19 | 59 |
+| 本分支 | 5244 | 0 | 19 | 60 |
+
+**零回归**, 且差值逐条对得上: +22 passed = 上游搬入 16 个
+(qwen38_modelopt 11 + api_utils 3 + vlm_mtp 2) + flyto 自加 6 个
+(openai_models 3: 接受 high / 拒绝 xhigh / chat_template_kwargs 逃生口;
+thinking_budget 3: 转发集合 = 取值域减 off 的不变式). +1 deselected =
+新增的 `slow` 标记真模型集成测试.
+
+**基线数字更正**: 上一节记的 "5154 passed" 在同一棵树上没能复现, 差 68 个,
+未追查原因. 本次是在独立 worktree 上 checkout 干净 `main` 当场重测的, 后续
+同步请以当场实测为准, 不要引用台账里的历史数字.
+
+**Qwen3.8 上 `reasoning_effort` 会同时有两层含义** (真机实测时会撞到):
+`high` 一边经 `_effort_to_budget` 变成 8192 的 thinking token 硬上限 (由
+`ThinkingBudgetProcessor` 执行), 一边作为模板档位让 Qwen3.8 自己决定思考深度.
+两层同时生效时, flyto 的预算表会把模板想花的量截断. 现役模型上看不出来
+(模板根本不读这个 kwarg), Qwen3.8 是第一个两层都活的模型. 不是 bug, 但
+"为什么 high 档思考说到一半就停了"的答案在这里, 调法是 per-model 的
+`ModelSettings.reasoning_effort_budgets`.
+
+未做, 需 owner 点头后才继续:
+
+- 下载 `unsloth/Qwen3.8-27B-NVFP4` (23.4 GB: `model.safetensors` 22.57G +
+  `model_mtp.safetensors` 0.85G, 共 13 文件), m5max 注册 + 实测.
+  m5max 已清 160G 僵尸 dflash L2 缓存, 2026-08-24 实测容器可用 404.4 GB,
+  空间够.
+- **注意**: owner 批的权重是 **NVFP4**, 所以真机 smoke 只能验证
+  `c82cabca` 那条路, **验不到 `qwen38_fp8.py` 的分块 FP8 反量化** ——
+  那是另一种 checkpoint 格式 (带 `weight_scale_inv`). FP8 这块目前只有单测
+  覆盖.
