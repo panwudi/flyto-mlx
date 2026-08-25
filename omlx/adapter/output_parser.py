@@ -63,6 +63,14 @@ class OutputParserFactory:
     # thinking channel. The scheduler tokenizes it to detect prompt-prefilled
     # thinking. None means the parser has no prompt-side opener.
     thinking_start_text: str | None = None
+    # Marker this parser's chat template writes to CLOSE the thinking channel.
+    # Needed as the counterpart to thinking_start_text: a template that opens
+    # and immediately closes the channel (Gemma 4's enable_thinking=False
+    # renders "<|channel>thought\n<channel|>") is declaring thinking OFF, and
+    # without this the scheduler falls back to tokenising the literal
+    # "</think>", which no Gemma 4 prompt ever contains -- so the close is
+    # never seen and the prompt is misread as leaving thinking open.
+    thinking_end_text: str | None = None
     # Text the scheduler prepends when the prompt itself opened the thinking
     # channel, so the parser emits a well-formed <think> pair instead of a
     # lone close marker.
@@ -173,6 +181,7 @@ def detect_output_parser(
             create_session=Gemma4OutputParserSession,
             stop_token_ids=set(),
             thinking_start_text="<|channel>thought",
+            thinking_end_text="<channel|>",
             thinking_start_output_text="<think>\n",
         )
 
