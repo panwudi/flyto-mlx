@@ -3842,6 +3842,7 @@ async def stream_anthropic_messages(
         message_id=message_id,
         model=request.model,
         input_tokens=scale_anthropic_tokens(estimated_input_tokens, request.model),
+        prefix_cache_enabled=engine.prefix_cache_enabled,
     )
 
     # 3. Stream content with thinking/content separation

@@ -1020,9 +1020,29 @@ def format_sse_event(event_type: str, data: dict[str, Any]) -> str:
 
 
 def create_message_start_event(
-    message_id: str, model: str, input_tokens: int = 0
+    message_id: str,
+    model: str,
+    input_tokens: int = 0,
+    prefix_cache_enabled: bool = False,
 ) -> str:
-    """Create message_start SSE event."""
+    """Create message_start SSE event.
+
+    With prefix caching on, usage already takes the disjoint shape that
+    message_delta reports (input 0, the prompt as cache creation until the
+    real split is known). Claude Code keeps message_start's input_tokens when
+    message_delta sends 0, so a full count here was added on top of the
+    delta's cache_read_input_tokens: context usage read about twice the real
+    size and auto-compact fired at roughly half the window.
+    """
+    if prefix_cache_enabled:
+        usage = {
+            "input_tokens": 0,
+            "cache_creation_input_tokens": input_tokens,
+            "cache_read_input_tokens": 0,
+            "output_tokens": 0,
+        }
+    else:
+        usage = {"input_tokens": input_tokens, "output_tokens": 0}
     return format_sse_event(
         "message_start",
         {
@@ -1035,7 +1055,7 @@ def create_message_start_event(
                 "content": [],
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+                "usage": usage,
             },
         },
     )
