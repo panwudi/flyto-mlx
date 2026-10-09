@@ -252,6 +252,14 @@ class BatchedEngine(BaseEngine):
 
         self._model = apply_post_load_transforms(self._model, self._model_settings)
 
+        # Pin this model's MTP choice on the model itself; the process-wide
+        # flag is reset by every later load.
+        from ..patches.mlx_lm_mtp import stamp_model_mtp_active
+
+        stamp_model_mtp_active(
+            self._model, bool(getattr(self._model_settings, "mtp_enabled", False))
+        )
+
         # Materialize lazy buffers on the loader thread so per-engine
         # inference threads can read them (#1304).
         await loop.run_in_executor(

@@ -396,6 +396,75 @@ class TestBatchGeneratorDispatch:
         finally:
             set_mtp_active(prior_active)
 
+    def test_per_model_stamp_survives_later_loads(self):
+        """Loading another model resets the process-wide flag; a model stamped
+        at load time must keep its own MTP choice (Qwen 3.8 lost MTP the
+        moment Gemma 4 loaded next to it)."""
+        from omlx.patches.mlx_lm_mtp import (
+            is_mtp_active,
+            model_mtp_active,
+            set_mtp_active,
+            stamp_model_mtp_active,
+        )
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        _is_mtp_eligible = batch_generator._is_mtp_eligible
+
+        class _MtpModel:
+            def __init__(self):
+                self.mtp = object()
+
+            def mtp_forward(self, *_):
+                pass
+
+        class _VlmRoot:
+            """VLM root whose language_model carries the MTP head."""
+
+            def __init__(self):
+                self.language_model = _MtpModel()
+
+            def mtp_forward(self, *_):
+                pass
+
+        class _GenBatch:
+            def __init__(self, model, uids):
+                self.model = model
+                self.uids = uids
+
+        prior_active = is_mtp_active()
+        try:
+            qwen = _MtpModel()
+            set_mtp_active(True)
+            stamp_model_mtp_active(qwen, True)
+            # A later load of a non-MTP model flips the global flag off...
+            set_mtp_active(False)
+            # ...but the stamped model keeps MTP.
+            assert model_mtp_active(qwen) is True
+            assert _is_mtp_eligible(_GenBatch(qwen, uids=[1])) is True
+
+            # The reverse: stamped off stays off even if the flag is on.
+            other = _MtpModel()
+            stamp_model_mtp_active(other, False)
+            set_mtp_active(True)
+            assert _is_mtp_eligible(_GenBatch(other, uids=[1])) is False
+
+            # VLM root: stamp on the root is visible from its language_model
+            # and vice versa.
+            root = _VlmRoot()
+            stamp_model_mtp_active(root, True)
+            set_mtp_active(False)
+            assert model_mtp_active(root.language_model) is True
+            assert _is_mtp_eligible(_GenBatch(root, uids=[1])) is True
+
+            # Unstamped models fall back to the process-wide flag.
+            plain = _MtpModel()
+            set_mtp_active(False)
+            assert _is_mtp_eligible(_GenBatch(plain, uids=[1])) is False
+            set_mtp_active(True)
+            assert _is_mtp_eligible(_GenBatch(plain, uids=[1])) is True
+        finally:
+            set_mtp_active(prior_active)
+
     def test_mtp_state_valid_requires_single_matching_uid(self):
         from omlx.patches.mlx_lm_mtp.batch_generator import (
             _MtpState,

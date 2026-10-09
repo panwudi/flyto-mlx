@@ -782,6 +782,15 @@ class VLMBatchedEngine(BaseEngine):
             get_mlx_executor(), _load_vlm_sync
         )
 
+        # Pin this model's MTP choice on the model itself; the process-wide
+        # flag is reset by every later load.
+        from ..patches.mlx_lm_mtp import stamp_model_mtp_active
+
+        stamp_model_mtp_active(
+            self._vlm_model,
+            bool(getattr(self._model_settings, "mtp_enabled", False)),
+        )
+
         # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
         # loader thread so per-engine inference threads can read them (#1304).
         from ..utils.model_loading import materialize_lazy_state
