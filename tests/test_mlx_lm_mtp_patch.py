@@ -609,8 +609,11 @@ class TestBatchGeneratorDispatch:
         def fake_rebuild(model):
             return [_FakeCache()]
 
+        calls = []
+
         def fake_backbone(model, inputs, cache, n_confirmed=0):
-            cache[0].offset = int(inputs.shape[1])
+            calls.append(int(inputs.shape[1]))
+            cache[0].offset += int(inputs.shape[1])
             arr = np.full((1, int(inputs.shape[1]), vocab), -10.0, dtype=np.float32)
             arr[0, -1, 5] = 10.0  # last-position argmax -> token 5
             return mx.array(arr), None, None
@@ -640,7 +643,26 @@ class TestBatchGeneratorDispatch:
             prompt_cache=[object()],  # old MTP-advanced cache, to be replaced
             _omlx_mtp_state=state,
         )
+        batch._backbone_calls = calls
         return batch_generator, batch, state
+
+    def test_reconcile_reprefills_in_bounded_chunks(self, monkeypatch):
+        """A long sequence is re-prefilled chunk by chunk (never one forward
+        over the whole context), and the cache ends at the full length."""
+        bg, batch, state = self._make_reconcile_batch(
+            monkeypatch,
+            uid=7,
+            tokens=list(range(10, 10 + 25)),
+            queue_entries=[],
+        )
+        monkeypatch.setattr(bg, "_RECONCILE_CHUNK_TOKENS", 8)
+
+        assert bg._reconcile_mtp_to_standard(batch, state) is True
+        assert batch._backbone_calls == [8, 8, 8, 1]
+        assert max(batch._backbone_calls) <= 8
+        assert batch.prompt_cache[0].offset == 25
+        # next token still comes from the last position of the final chunk
+        assert batch._next_tokens.tolist() == [5]
 
     def test_reconcile_uses_queue_front_as_next_token(self, monkeypatch):
         import mlx.core as mx
