@@ -1892,6 +1892,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "dflash_in_memory_cache_max_bytes": settings.dflash_in_memory_cache_max_bytes,
                 "dflash_ssd_cache": settings.dflash_ssd_cache,
                 "mtp_enabled": settings.mtp_enabled,
+                "max_concurrent_requests": settings.max_concurrent_requests,
                 "vlm_mtp_enabled": settings.vlm_mtp_enabled,
                 "vlm_mtp_draft_model": settings.vlm_mtp_draft_model,
                 "vlm_mtp_draft_block_size": settings.vlm_mtp_draft_block_size,

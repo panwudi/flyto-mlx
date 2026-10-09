@@ -93,6 +93,8 @@ EXCLUDED_FROM_PROFILES = frozenset({
     "model_type_override",
     "active_profile_name",
     "ttl_seconds",
+    # Per-model scheduling cap, set deliberately per model (MTP models).
+    "max_concurrent_requests",
     # Security flag must be explicit per model — never propagated via profiles.
     "trust_remote_code",
 })
