@@ -156,10 +156,13 @@ def convert_anthropic_to_internal(
     processed_messages: list[dict[str, Any]] = []
     native_tool_calling = bool(tokenizer and getattr(tokenizer, "has_tool_calling", False))
 
-    # Normalize: extract any role="system" entries from messages[] and merge
-    # with the canonical request.system field (claude-code 2.1.154+ sends
-    # system content inline instead of using the separate field).
-    system_text, normalized_messages = _normalize_in_messages_system(request)
+    # Normalize: merge leading role="system" entries from messages[] into the
+    # canonical request.system field (claude-code 2.1.154+ sends system
+    # content inline). Later ones (mid-conversation-system beta) stay in
+    # place and become user notes below, so the prompt head stays stable.
+    system_text, normalized_messages = _normalize_in_messages_system(
+        request, leading_only=True
+    )
     if system_text:
         processed_messages.append({"role": "system", "content": system_text})
 
@@ -167,6 +170,12 @@ def convert_anthropic_to_internal(
     for msg in normalized_messages:
         role = msg.role
         content = msg.content
+
+        if role == "system":
+            text = _anthropic_system_message_text(msg)
+            if text:
+                processed_messages.append({"role": "system", "content": text})
+            continue
 
         if isinstance(content, str):
             # Simple text message
@@ -356,8 +365,10 @@ def convert_anthropic_to_internal(
         ):
             msg["content"] = _strip_client_budget_markers(msg["content"])
 
-    from .utils import _merge_consecutive_roles
+    # Markers are stripped first so they never leak into a user note.
+    from .utils import _merge_consecutive_roles, place_mid_conversation_system_messages
 
+    processed_messages = place_mid_conversation_system_messages(processed_messages)
     return _merge_consecutive_roles(processed_messages)
 
 
@@ -605,8 +616,27 @@ def _extract_system_text(system: str | list[SystemContent]) -> str:
     return ""
 
 
+def _anthropic_system_message_text(msg: AnthropicMessage) -> str:
+    """Join the text of an inline role="system" message from messages[]."""
+    content = msg.content
+    if isinstance(content, str):
+        return content
+    parts: list[str] = []
+    if isinstance(content, list):
+        for block in content:
+            block_dict = _content_block_to_dict(block)
+            if block_dict is None:
+                continue
+            if block_dict.get("type") == "text":
+                text = block_dict.get("text", "")
+                if text:
+                    parts.append(text)
+    return "\n".join(parts)
+
+
 def _normalize_in_messages_system(
     request: MessagesRequest,
+    leading_only: bool = False,
 ) -> tuple[str, list[AnthropicMessage]]:
     """Extract role="system" entries from messages[] and merge with request.system.
 
@@ -614,26 +644,22 @@ def _normalize_in_messages_system(
     array instead of (or in addition to) the canonical Anthropic ``system``
     field. Returns the combined system text and the message list with system
     entries removed, so downstream conversion sees the canonical shape.
+
+    With ``leading_only`` only the system entries before the first non-system
+    message are merged; later ones stay in the list so the caller can fold
+    them into user notes without changing the prompt head.
     """
     extracted_parts: list[str] = []
     filtered_messages: list[AnthropicMessage] = []
+    seen_non_system = False
     for msg in request.messages:
-        if msg.role != "system":
+        if msg.role != "system" or (leading_only and seen_non_system):
             filtered_messages.append(msg)
+            seen_non_system = seen_non_system or msg.role != "system"
             continue
-        content = msg.content
-        if isinstance(content, str):
-            if content:
-                extracted_parts.append(content)
-        elif isinstance(content, list):
-            for block in content:
-                block_dict = _content_block_to_dict(block)
-                if block_dict is None:
-                    continue
-                if block_dict.get("type") == "text":
-                    text = block_dict.get("text", "")
-                    if text:
-                        extracted_parts.append(text)
+        text = _anthropic_system_message_text(msg)
+        if text:
+            extracted_parts.append(text)
 
     base = _extract_system_text(request.system) if request.system else ""
     if extracted_parts:

@@ -109,8 +109,10 @@ class TestAnthropicAdapter:
         assert internal.messages[1].role == "user"
 
     def test_parse_request_in_messages_system(self, adapter):
-        """role="system" entries inside messages[] are lifted into the
-        canonical system position (claude-code 2.1.154+ behavior)."""
+        """A mid-conversation role="system" entry (claude-code
+        mid-conversation-system beta) becomes a note on the preceding user
+        message instead of moving to the front, so the prompt head is
+        unchanged."""
         request = MessagesRequest(
             model="claude-3-sonnet",
             max_tokens=1024,
@@ -123,10 +125,10 @@ class TestAnthropicAdapter:
 
         internal = adapter.parse_request(request)
 
-        assert internal.messages[0].role == "system"
-        assert internal.messages[0].content == "Be terse."
-        roles = [m.role for m in internal.messages[1:]]
-        assert roles == ["user", "assistant"]
+        assert [m.role for m in internal.messages] == ["user", "assistant"]
+        assert internal.messages[0].content == (
+            "Hi there\n\n[System note]\nBe terse.\n[/System note]"
+        )
 
     def test_parse_request_system_field_and_in_messages_merge(self, adapter):
         """System field and in-messages system content merge into one block,
@@ -150,7 +152,7 @@ class TestAnthropicAdapter:
         assert internal.messages[1].role == "user"
 
     def test_parse_request_multiple_in_messages_system(self, adapter):
-        """Multiple inline role="system" entries concatenate in source order."""
+        """Leading and mid-conversation inline system entries are split."""
         request = MessagesRequest(
             model="claude-3-sonnet",
             max_tokens=1024,
@@ -163,10 +165,13 @@ class TestAnthropicAdapter:
 
         internal = adapter.parse_request(request)
 
-        assert internal.messages[0].role == "system"
-        assert internal.messages[0].content == "First.\nSecond."
-        # The user message survives and no stray system entries remain.
-        assert [m.role for m in internal.messages[1:]] == ["user"]
+        # Leading inline system joins the canonical system block; the later
+        # one becomes a note on the user turn before it.
+        assert [m.role for m in internal.messages] == ["system", "user"]
+        assert internal.messages[0].content == "First."
+        assert internal.messages[1].content == (
+            "Hi\n\n[System note]\nSecond.\n[/System note]"
+        )
 
     # =========================================================================
     # parse_request Tests - Generation Parameters
