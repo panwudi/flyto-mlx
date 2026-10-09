@@ -1178,6 +1178,26 @@ _REASONING_EFFORT_BUDGETS = {"low": 512, "medium": 2048, "high": 8192}
 # sugar for enable_thinking=False, not a template level.
 _TEMPLATE_FORWARDABLE_EFFORTS = REASONING_EFFORT_LEVELS - {"off"}
 
+# Anthropic output_config.effort levels above flyto's domain fold onto its top
+# level. Qwen 3.8's template maps "high" to its own top level xhigh, so a
+# client choosing xhigh or max still gets the deepest thinking the template
+# has, without widening what is forwarded.
+_ANTHROPIC_EFFORT_ALIASES = {"xhigh": "high", "max": "high"}
+
+
+def _anthropic_template_effort(output_config: dict | None) -> str | None:
+    """Map Anthropic ``output_config.effort`` onto a forwardable effort.
+
+    Returns None when absent or out of domain, so the template keeps its own
+    default exactly as before this field was read.
+    """
+    raw = output_config.get("effort") if isinstance(output_config, dict) else None
+    if not isinstance(raw, str):
+        return None
+    effort = raw.strip().lower()
+    effort = _ANTHROPIC_EFFORT_ALIASES.get(effort, effort)
+    return effort if effort in _TEMPLATE_FORWARDABLE_EFFORTS else None
+
 
 def _effort_to_budget(effort: str | None, ms) -> int | None:
     """Map an OpenAI ``reasoning_effort`` level to a thinking-token budget.
@@ -4151,9 +4171,16 @@ async def create_anthropic_message(
         # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
         if ms.preserve_thinking is not None:
             merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
+    # output_config.effort reaches the chat template the same way a
+    # top-level reasoning_effort does on /v1/chat/completions. An explicit
+    # chat_template_kwargs entry always wins.
+    _request_ct_kwargs = merge_reasoning_effort_chat_template_kwargs(
+        request.chat_template_kwargs,
+        _anthropic_template_effort(request.output_config),
+    )
     # Per-request kwargs override model settings (except forced keys)
-    if request.chat_template_kwargs:
-        for k, v in request.chat_template_kwargs.items():
+    if _request_ct_kwargs:
+        for k, v in _request_ct_kwargs.items():
             if k not in forced_keys:
                 merged_ct_kwargs[k] = v
 
