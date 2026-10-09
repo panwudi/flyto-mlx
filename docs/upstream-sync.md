@@ -834,3 +834,35 @@ FP8 这块目前只有单测覆盖.
 部署: PR #93 已合并 (`5b2c7c33`), m5max (PID 22250, model_count 34 -> 35) +
 m2max (PID 50770) 双机部署. m5max 部署用 stash -> ff-merge -> stash pop 保住
 PR#87 的 12 个 admin 本地改动.
+
+## 2026-10-10 同步: 卸载模型时 serve 进程 SIGSEGV (sync/compile-cache-thread-exit)
+
+引入: `e623151a` fix(engine): clear MLX thread_local compile cache before
+worker thread exit. cherry-pick 零冲突.
+
+起因是生产事故. 2026-10-10 m5max 上同一晚崩了两次 (03:23 卸载 Qwen3.8,
+03:31 `POST /admin/api/reload` 先卸载已加载模型), 崩溃报告的栈与上游 commit
+描述逐帧一致: `_pthread_exit -> ThreadLocalVariables::finalizeList ->
+CompilerCache::~CompilerCache -> tupledealloc`, KERN_INVALID_ADDRESS 0x10.
+菜单栏 app 会在 2 到 10 秒内拉起 serve, 但在途请求全断. TTL 闲置卸载走的是
+同一条 `EngineCore.close()` 路径, 所以不只是手动卸载会碰上.
+
+根因: mlx 0.31 起 `@mx.compile` 的缓存是 C++ `thread_local`. 每个 engine 有
+自己的 MLX 工作线程 (#1248), 卸载时线程退出, 析构缓存时在没有 GIL 的情况下
+释放 Python 对象. 修法是在线程退出前, 在该线程上 (持有 GIL) 用 ctypes 调
+`libmlx` 导出的 `mlx::core::detail::compile_clear_cache()` 清空缓存. 符号解析
+不到时退回为让线程常驻不退出.
+
+本地复现补充了上游没写的触发条件: **只有多输出 (元组 / 字典) 的编译图会崩**,
+单输出的不崩 (它们的缓存项不持有 Python 输出结构对象). 上游自带的测试恰好用的
+是单输出函数, 撤掉修复照样通过, 守不住回归. 所以 flyto 加了一个子进程测试,
+跑元组和字典输出的编译图: mlx 0.31.2 上不清缓存以 SIGSEGV (-11) 退出, 清缓存
+正常退出. 回退验证: 撤掉 `close()` 里的清缓存调用,
+`test_close_clears_compile_cache_then_shuts_down` 变红.
+
+为什么有的卸载不崩 (比如 10-01 的 TTL 卸载): 取决于这个 engine 线程上有没有
+跑过多输出的编译图, 这又取决于请求走了哪条路径. 不是模型特有的问题.
+
+刻意不引: `1d071cb1` (#2052) / `0fb48c5c` (#2053) 给 embedding / reranker 卸载
+也加了清缓存. 它们跑在全局 executor 上, 那个线程不退出, 不会触发本崩溃,
+上游加的目的是释放显存. flyto 生产没有挂 embedding / reranker, 暂不需要.
