@@ -183,6 +183,9 @@ class MessagesRequest(BaseModel):
     tools: list[AnthropicTool] | None = None
     tool_choice: ToolChoice | dict[str, Any] | None = None
     thinking: ThinkingConfig | None = None
+    # Anthropic output_config (e.g. {"effort": "high"}). Claude Code sends
+    # this on every request; only ``effort`` is read.
+    output_config: dict[str, Any] | None = None
     # Chat template kwargs (e.g. enable_thinking, reasoning_effort)
     chat_template_kwargs: dict[str, Any] | None = None
 

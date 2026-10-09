@@ -818,6 +818,51 @@ class TestAnthropicMessagesEndpoint:
 
         assert response.status_code == 200
 
+    def _anthropic_template_kwargs(self, client, mock_llm_engine, **extra):
+        mock_llm_engine.chat = AsyncMock(return_value=MockGenerationOutput(
+            text="ok", prompt_tokens=3, completion_tokens=1,
+        ))
+        body = {
+            "model": "test-model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        body.update(extra)
+        response = client.post("/v1/messages", json=body)
+        assert response.status_code == 200
+        return mock_llm_engine.chat.call_args.kwargs.get("chat_template_kwargs") or {}
+
+    def test_anthropic_output_config_effort_reaches_template(self, client, mock_llm_engine):
+        """Claude Code's output_config.effort becomes the template reasoning_effort."""
+        kwargs = self._anthropic_template_kwargs(
+            client, mock_llm_engine,
+            thinking={"type": "adaptive"}, output_config={"effort": "low"},
+        )
+        assert kwargs.get("reasoning_effort") == "low"
+        assert kwargs.get("enable_thinking") is True
+
+    def test_anthropic_output_config_effort_above_domain_folds_to_high(self, client, mock_llm_engine):
+        kwargs = self._anthropic_template_kwargs(
+            client, mock_llm_engine, output_config={"effort": "max"},
+        )
+        assert kwargs.get("reasoning_effort") == "high"
+
+    def test_anthropic_unknown_effort_is_not_forwarded(self, client, mock_llm_engine):
+        """Out-of-domain values would raise in strict templates; drop them."""
+        for raw in ("off", "banana"):
+            kwargs = self._anthropic_template_kwargs(
+                client, mock_llm_engine, output_config={"effort": raw},
+            )
+            assert "reasoning_effort" not in kwargs
+
+    def test_anthropic_explicit_template_kwarg_beats_output_config(self, client, mock_llm_engine):
+        kwargs = self._anthropic_template_kwargs(
+            client, mock_llm_engine,
+            output_config={"effort": "low"},
+            chat_template_kwargs={"reasoning_effort": "medium"},
+        )
+        assert kwargs.get("reasoning_effort") == "medium"
+
     def test_anthropic_messages_sanitize_thinking_tool_call_markup(self, client, mock_llm_engine):
         """Anthropic thinking blocks should not expose raw tool-call markup."""
         mock_llm_engine.chat = AsyncMock(return_value=MockGenerationOutput(
