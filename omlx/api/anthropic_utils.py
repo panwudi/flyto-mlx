@@ -8,10 +8,12 @@ Handles conversion between Anthropic API format and internal oMLX format.
 import base64
 import json
 import logging
+import re
 import uuid
 from typing import Any
 
 from .anthropic_models import (
+    AnthropicMessage,
     AnthropicTool,
     AnthropicUsage,
     ContentBlockText,
@@ -154,16 +156,26 @@ def convert_anthropic_to_internal(
     processed_messages: list[dict[str, Any]] = []
     native_tool_calling = bool(tokenizer and getattr(tokenizer, "has_tool_calling", False))
 
-    # Handle system message (Anthropic has separate 'system' field)
-    if request.system:
-        system_text = _extract_system_text(request.system)
-        if system_text:
-            processed_messages.append({"role": "system", "content": system_text})
+    # Normalize: merge leading role="system" entries from messages[] into the
+    # canonical request.system field (claude-code 2.1.154+ sends system
+    # content inline). Later ones (mid-conversation-system beta) stay in
+    # place and become user notes below, so the prompt head stays stable.
+    system_text, normalized_messages = _normalize_in_messages_system(
+        request, leading_only=True
+    )
+    if system_text:
+        processed_messages.append({"role": "system", "content": system_text})
 
     # Process messages
-    for msg in request.messages:
+    for msg in normalized_messages:
         role = msg.role
         content = msg.content
+
+        if role == "system":
+            text = _anthropic_system_message_text(msg)
+            if text:
+                processed_messages.append({"role": "system", "content": text})
+            continue
 
         if isinstance(content, str):
             # Simple text message
@@ -343,8 +355,20 @@ def convert_anthropic_to_internal(
             # Unknown format
             processed_messages.append({"role": role, "content": str(content)})
 
-    from .utils import _merge_consecutive_roles
+    # Claude Code 2.1.154+ may carry system content inline in messages[]
+    # (see _normalize_in_messages_system); with consolidation off those
+    # blocks bypass _extract_system_text, so the budget markers are
+    # stripped here too before role merging.
+    for msg in processed_messages:
+        if msg.get("role") in ("system", "developer") and isinstance(
+            msg.get("content"), str
+        ):
+            msg["content"] = _strip_client_budget_markers(msg["content"])
 
+    # Markers are stripped first so they never leak into a user note.
+    from .utils import _merge_consecutive_roles, place_mid_conversation_system_messages
+
+    processed_messages = place_mid_conversation_system_messages(processed_messages)
     return _merge_consecutive_roles(processed_messages)
 
 
@@ -371,14 +395,15 @@ def convert_anthropic_to_internal_harmony(
     """
     processed_messages: list[dict[str, Any]] = []
 
-    # Handle system message (Anthropic has separate 'system' field)
-    if request.system:
-        system_text = _extract_system_text(request.system)
-        if system_text:
-            processed_messages.append({"role": "system", "content": system_text})
+    # Normalize: extract any role="system" entries from messages[] and merge
+    # with the canonical request.system field (claude-code 2.1.154+ sends
+    # system content inline instead of using the separate field).
+    system_text, normalized_messages = _normalize_in_messages_system(request)
+    if system_text:
+        processed_messages.append({"role": "system", "content": system_text})
 
     # Process messages
-    for msg in request.messages:
+    for msg in normalized_messages:
         role = msg.role
         content = msg.content
 
@@ -531,6 +556,16 @@ def convert_anthropic_to_internal_harmony(
             # Unknown format
             processed_messages.append({"role": role, "content": str(content)})
 
+    # Claude Code 2.1.154+ may carry system content inline in messages[]
+    # (see _normalize_in_messages_system); with consolidation off those
+    # blocks bypass _extract_system_text, so the budget markers are
+    # stripped here too before role merging.
+    for msg in processed_messages:
+        if msg.get("role") in ("system", "developer") and isinstance(
+            msg.get("content"), str
+        ):
+            msg["content"] = _strip_client_budget_markers(msg["content"])
+
     from .utils import _merge_consecutive_roles
 
     return _merge_consecutive_roles(processed_messages)
@@ -540,11 +575,30 @@ def convert_anthropic_to_internal_harmony(
 # contains randomly changing values, breaking prefix cache).
 _BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
 
+# Claude Code appends a `<total_tokens>N tokens left</total_tokens>` budget
+# marker to the end of the system prompt with a freshly decremented N on
+# every request, keeping the stale copies, so the prompt head both changes
+# and grows each call and no prefix past it can ever be reused (measured as
+# full ~60k-token re-prefills per turn). The marker is informational only —
+# nothing downstream parses it — so it is stripped wholesale, like the
+# billing header above.
+_TOTAL_TOKENS_MARKER_RE = re.compile(
+    r"\n{0,2}<total_tokens>\d+ tokens left</total_tokens>"
+)
+
+
+def _strip_client_budget_markers(text: str) -> str:
+    """Remove Claude Code per-request token-budget markers from system text."""
+    if "<total_tokens>" not in text:
+        return text
+
+    return _TOTAL_TOKENS_MARKER_RE.sub("", text)
+
 
 def _extract_system_text(system: str | list[SystemContent]) -> str:
     """Extract text from system field."""
     if isinstance(system, str):
-        return system
+        return _strip_client_budget_markers(system)
     elif isinstance(system, list):
         text_parts = []
         for block in system:
@@ -558,8 +612,62 @@ def _extract_system_text(system: str | list[SystemContent]) -> str:
             if text.startswith(_BILLING_HEADER_PREFIX):
                 continue
             text_parts.append(text)
-        return "\n".join(text_parts)
+        return _strip_client_budget_markers("\n".join(text_parts))
     return ""
+
+
+def _anthropic_system_message_text(msg: AnthropicMessage) -> str:
+    """Join the text of an inline role="system" message from messages[]."""
+    content = msg.content
+    if isinstance(content, str):
+        return content
+    parts: list[str] = []
+    if isinstance(content, list):
+        for block in content:
+            block_dict = _content_block_to_dict(block)
+            if block_dict is None:
+                continue
+            if block_dict.get("type") == "text":
+                text = block_dict.get("text", "")
+                if text:
+                    parts.append(text)
+    return "\n".join(parts)
+
+
+def _normalize_in_messages_system(
+    request: MessagesRequest,
+    leading_only: bool = False,
+) -> tuple[str, list[AnthropicMessage]]:
+    """Extract role="system" entries from messages[] and merge with request.system.
+
+    Claude Code 2.1.154+ began sending system content inline in the messages
+    array instead of (or in addition to) the canonical Anthropic ``system``
+    field. Returns the combined system text and the message list with system
+    entries removed, so downstream conversion sees the canonical shape.
+
+    With ``leading_only`` only the system entries before the first non-system
+    message are merged; later ones stay in the list so the caller can fold
+    them into user notes without changing the prompt head.
+    """
+    extracted_parts: list[str] = []
+    filtered_messages: list[AnthropicMessage] = []
+    seen_non_system = False
+    for msg in request.messages:
+        if msg.role != "system" or (leading_only and seen_non_system):
+            filtered_messages.append(msg)
+            seen_non_system = seen_non_system or msg.role != "system"
+            continue
+        text = _anthropic_system_message_text(msg)
+        if text:
+            extracted_parts.append(text)
+
+    base = _extract_system_text(request.system) if request.system else ""
+    if extracted_parts:
+        extra = "\n".join(extracted_parts)
+        system_text = "\n\n".join(p for p in (base, extra) if p)
+    else:
+        system_text = base
+    return system_text, filtered_messages
 
 
 def truncate_tool_result(

@@ -610,6 +610,9 @@ admin 整目录 9077+/154991-), 抽样 21 个上游 commit 做 `git cherry-pick 
   `_MID_SYSTEM` / `mid_system` 命中 0 次). flyto 的
   `_consolidate_system_messages` 是无条件把系统消息前置, 与上游是两套语义,
   不是补丁而是换设计. 需单独 spike.
+  (2026-10-10 补记: Anthropic 路径已改为把中间系统消息并成用户备注, 见
+  "2026-10-10 同步: Claude Code 对话中间的系统消息"一节. OpenAI 路径仍是
+  无条件前置, 上游的模板探测机制仍未引入.)
 - ANE prefill 线 (`fbb98dc2` / `3d8e661c` / `166c8f48` 等, 约 20 commits).
   三重阻塞: ① 需 `omlx/custom_kernels/` 原生扩展源码构建
   (`OMLX_WITH_CUSTOM_KERNEL=1`); ② kernel ABI 锁死 `mlx==0.32.0` +
@@ -866,3 +869,42 @@ CompilerCache::~CompilerCache -> tupledealloc`, KERN_INVALID_ADDRESS 0x10.
 刻意不引: `1d071cb1` (#2052) / `0fb48c5c` (#2053) 给 embedding / reranker 卸载
 也加了清缓存. 它们跑在全局 executor 上, 那个线程不退出, 不会触发本崩溃,
 上游加的目的是释放显存. flyto 生产没有挂 embedding / reranker, 暂不需要.
+
+## 2026-10-10 同步: Claude Code 对话中间的系统消息 (sync/anthropic-mid-system)
+
+起因: owner 在 m5max 上装了 Claude Code 2.1.296 接本地 fmlx, 第一个请求就
+422 (`messages -> 1 -> role: Input should be 'user' or 'assistant'`). 这个版本
+带 `anthropic-beta: mid-conversation-system-2026-04-07`, 在第一条用户消息
+之后放一条约 5600 字的 role="system" 环境说明, 客户端没有开关能关掉.
+
+引入:
+
+- `6a9eb746` (#1511) `AnthropicMessage.role` 放开 `"system"`. 零冲突.
+- `d86461e6` 把 messages[] 里的 role="system" 并入标准 system 字段. 零冲突.
+- `4ee255bc` (#2882) 剥掉 Claude Code 每轮都会变的
+  `<total_tokens>N tokens left</total_tokens>` 预算标记, 否则提示词开头每轮都
+  变, 前缀缓存永远用不上. 测试文件冲突: 丢掉冲突块里无关的上游音频测试,
+  删掉一条测试的 `consolidate_system_messages=False` 参数 (来自未引入的
+  `473f6291`). 上游提交信息里的 AI 共同作者行按本仓规定去掉了.
+
+flyto 自己的改动 (Anthropic 主路径): 只有开头的内联系统消息并入标准系统块,
+后面的留在原位, 以 `[System note]...[/System note]` 并入相邻用户消息. 辅助
+函数移植自 `473f6291` (#1826) 的 `_downgrade_mid_system_to_user_notes` 一族,
+只搬函数, 没搬它的模板探测和配置项. 挨着工具调用边界或带图片的用户消息时,
+照旧整体上提 (`_consolidate_system_messages`), 这对严格模板总是合法的.
+预算标记先剥再并, 保证不会进备注. Harmony 路径 (gpt-oss) 保留 `d86461e6`
+的整体上提, 两条路径行为不同是刻意的.
+
+为什么不直接用 `d86461e6` 的整体上提: 只有一条固定环境说明时两种做法前缀都
+稳定, 区别在后续轮次出现新的中间系统消息时. 整体上提会把它塞进开头, 从第一
+条消息起整段提示词都变; 备注只改尾部. 测试用真实 Qwen3.8 模板渲染两轮, 断言
+第二轮以第一轮 "到第一条用户消息结束" 为前缀. 回退验证: 把备注步骤换成纯上提,
+这条和另外四条测试变红.
+
+离线验证: omlx-4d 抓到的 Claude Code 2.1.296 首个真实请求 (21 个工具, 列表
+形式 system, `thinking: adaptive`, `output_config`) 在 main 上校验失败, 与线上
+422 一致; 本分支通过校验, 转换后渲染正常. 多轮带 tool_result 的真实样本要等
+部署后才能抓到.
+
+没验证到的: 前缀缓存实际命中率. 按设计第二轮应大部分命中, 要部署后看服务端
+日志才算数.
