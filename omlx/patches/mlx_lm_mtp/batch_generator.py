@@ -510,18 +510,17 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         procs = _proc_list(gen_batch)
         _set_singleton_mrope_delta(gen_batch)
         tok_arr = _ensure_uint32(mx.array(list(tokens)))
-        # Re-prefill in chunks and keep only the last position's logits. One
-        # forward over the whole sequence materialises (L, vocab) float logits
-        # plus full-length activations: ~25 GB at 25K tokens on Qwen 3.8, which
-        # took m5max past its Metal limit (abort in check_error) whenever a
-        # second request joined a long MTP decode. Chunking also matches the
-        # 2048-token prefill step, so recurrent state is built the same way.
+        # Re-prefill with a plain forward (no per-position rollback capture,
+        # see _call_forward), in chunks, keeping only the last position's
+        # logits, so memory stays bounded however long the sequence is.
+        # Chunking also matches the 2048-token prefill step, so recurrent
+        # state is built the same way as the original prefill.
         # Inherits the per-engine stream from the enclosing BatchGenerator context.
         n_tokens = int(tok_arr.shape[0])
         last_logits = None
         for start in range(0, n_tokens, _RECONCILE_CHUNK_TOKENS):
             piece = tok_arr[None, start : start + _RECONCILE_CHUNK_TOKENS]
-            logits, _, _ = _call_backbone(gen_batch.model, piece, new_cache)
+            logits = _call_forward(gen_batch.model, piece, new_cache)
             last_logits = logits[:, -1, :]  # (1, vocab) — dist after the chunk's last token
             del logits
             mx.eval(last_logits, *_cache_state_arrays(new_cache))
@@ -713,6 +712,21 @@ def _call_backbone(
     raise TypeError(
         f"backbone returned unexpected shape: {type(result).__name__}"
     )
+
+
+def _call_forward(model: Any, inputs: Any, cache: List[Any]) -> Any:
+    """Plain backbone forward returning logits only.
+
+    Unlike ``_call_backbone`` this never asks for ``return_hidden``. On the
+    mlx-vlm path ``return_hidden`` captures every position's GatedDeltaNet
+    state for draft rollback: harmless for a 2-4 token verify, but ~150 MB
+    per token on Qwen 3.8, so a re-prefill of a few hundred tokens took
+    m5max past 100 GB and aborted the serve.
+    """
+    result = model(inputs, cache=cache)
+    if isinstance(result, tuple):
+        return result[0]
+    return getattr(result, "logits", result)
 
 
 def _clear_rollback(prompt_cache: List[Any]) -> None:

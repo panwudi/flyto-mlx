@@ -611,15 +611,22 @@ class TestBatchGeneratorDispatch:
 
         calls = []
 
-        def fake_backbone(model, inputs, cache, n_confirmed=0):
+        def fake_forward(model, inputs, cache):
             calls.append(int(inputs.shape[1]))
             cache[0].offset += int(inputs.shape[1])
             arr = np.full((1, int(inputs.shape[1]), vocab), -10.0, dtype=np.float32)
             arr[0, -1, 5] = 10.0  # last-position argmax -> token 5
-            return mx.array(arr), None, None
+            return mx.array(arr)
+
+        def no_backbone(*_a, **_k):
+            raise AssertionError(
+                "reconcile must not use the return_hidden backbone "
+                "(captures per-position recurrent state)"
+            )
 
         monkeypatch.setattr(batch_generator, "_rebuild_singleton_cache", fake_rebuild)
-        monkeypatch.setattr(batch_generator, "_call_backbone", fake_backbone)
+        monkeypatch.setattr(batch_generator, "_call_forward", fake_forward)
+        monkeypatch.setattr(batch_generator, "_call_backbone", no_backbone)
         # ``_get_generation_stream`` was removed in #1304 when the patch
         # moved stream selection to the enclosing BatchGenerator context.
         # The fake_backbone / fake_rebuild monkeypatches above bypass the
@@ -663,6 +670,29 @@ class TestBatchGeneratorDispatch:
         assert batch.prompt_cache[0].offset == 25
         # next token still comes from the last position of the final chunk
         assert batch._next_tokens.tolist() == [5]
+
+    def test_call_forward_never_requests_hidden_capture(self):
+        """_call_forward passes no return_hidden / capture kwargs and unwraps
+        tuple and .logits results."""
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        seen = {}
+
+        class _Model:
+            def __init__(self, result):
+                self.result = result
+
+            def __call__(self, inputs, **kwargs):
+                seen.update(kwargs)
+                return self.result
+
+        assert batch_generator._call_forward(_Model("L"), "x", ["c"]) == "L"
+        assert seen == {"cache": ["c"]}
+        assert batch_generator._call_forward(_Model(("L", "h", "g")), "x", []) == "L"
+        assert (
+            batch_generator._call_forward(_Model(SimpleNamespace(logits="L")), "x", [])
+            == "L"
+        )
 
     def test_reconcile_uses_queue_front_as_next_token(self, monkeypatch):
         import mlx.core as mx
