@@ -456,6 +456,26 @@ class TestBatchGeneratorDispatch:
             assert model_mtp_active(root.language_model) is True
             assert _is_mtp_eligible(_GenBatch(root, uids=[1])) is True
 
+            # VLMModelAdapter keeps the stamped objects in private attributes;
+            # the stamp must be found through it (this is what BatchGenerator
+            # holds for Qwen 3.8 on the VLM engine).
+            class _Adapter:
+                def __init__(self, vlm):
+                    self._vlm_model = vlm
+                    self._language_model = vlm.language_model
+
+                @property
+                def mtp(self):
+                    return getattr(self._language_model, "mtp", None)
+
+                def mtp_forward(self, *_):
+                    pass
+
+            vlm = _VlmRoot()
+            stamp_model_mtp_active(vlm, True)
+            set_mtp_active(False)
+            assert _is_mtp_eligible(_GenBatch(_Adapter(vlm), uids=[1])) is True
+
             # Unstamped models fall back to the process-wide flag.
             plain = _MtpModel()
             set_mtp_active(False)
