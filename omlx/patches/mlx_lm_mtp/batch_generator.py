@@ -166,13 +166,14 @@ def _model_has_mtp_module(model: Any) -> bool:
 def _is_mtp_eligible(gen_batch: Any) -> bool:
     """``__init__`` and ``next`` only engage MTP for single-sequence batches
     when the model exposes ``mtp_forward``, has an attached MTP head, and
-    the process-wide ``mtp_active`` flag is on.
+    MTP was enabled for that model when it loaded.
 
     The MTP head may be attached unconditionally (e.g. by the mlx-vlm
     runtime patches, which need it for weight-load matching even when
     inference-time MTP is off) — so head presence alone is not enough
-    to decide whether to run the draft/verify cycle. ``is_mtp_active``
-    reflects the per-load ``model_settings.mtp_enabled`` choice.
+    to decide whether to run the draft/verify cycle. ``model_mtp_active``
+    reads the ``model_settings.mtp_enabled`` choice stamped on the model at
+    load time, so loading another model cannot switch it off.
     """
     if not hasattr(gen_batch, "model"):
         return False
@@ -181,8 +182,8 @@ def _is_mtp_eligible(gen_batch: Any) -> bool:
     if not _model_has_mtp_module(gen_batch.model):
         return False
     try:
-        from . import is_mtp_active
-        if not is_mtp_active():
+        from . import model_mtp_active
+        if not model_mtp_active(gen_batch.model):
             return False
     except Exception:
         return False

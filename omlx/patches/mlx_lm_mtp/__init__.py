@@ -55,6 +55,38 @@ def is_mtp_active() -> bool:
     return _MTP_ACTIVE
 
 
+# Per-model record of the mtp_enabled choice made when that model loaded.
+# The process-wide flag above only describes the most recent load: loading
+# a second model with mtp_enabled=False (e.g. Gemma 4 next to Qwen 3.8)
+# resets it, which used to switch MTP off for every model already serving.
+_MODEL_MTP_ATTR = "_omlx_mtp_active"
+
+
+def stamp_model_mtp_active(model, active: bool) -> None:
+    """Record on a loaded model whether inference-time MTP is enabled.
+
+    Stamped on the root object and its ``language_model`` so it is found
+    whichever of the two BatchGenerator ends up holding.
+    """
+    for target in (model, getattr(model, "language_model", None)):
+        if target is None:
+            continue
+        try:
+            setattr(target, _MODEL_MTP_ATTR, bool(active))
+        except Exception:
+            pass
+
+
+def model_mtp_active(model) -> bool:
+    """Per-model MTP choice; falls back to the process-wide flag when the
+    model was never stamped (loaded outside the serving engines)."""
+    for target in (model, getattr(model, "language_model", None)):
+        value = getattr(target, _MODEL_MTP_ATTR, None) if target is not None else None
+        if value is not None:
+            return bool(value)
+    return is_mtp_active()
+
+
 def apply_mlx_lm_mtp_patch() -> bool:
     """Apply the model-side and BatchGenerator monkey-patches.
 
