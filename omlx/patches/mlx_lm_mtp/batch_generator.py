@@ -448,6 +448,35 @@ def _rebuild_singleton_cache(model: Any) -> Optional[List[Any]]:
         return None
 
 
+# Re-prefill chunk for _reconcile_mtp_to_standard; matches prefill_step_size.
+_RECONCILE_CHUNK_TOKENS = 2048
+
+
+def _cache_state_arrays(cache: List[Any]) -> List[Any]:
+    """Every mx.array in the per-layer cache states, so each chunk's cache
+    update is evaluated before the next one is built on top of it."""
+    import mlx.core as mx
+
+    out: List[Any] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, mx.array):
+            out.append(value)
+        elif isinstance(value, dict):
+            for item in value.values():
+                collect(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                collect(item)
+
+    for c in cache or []:
+        try:
+            collect(getattr(c, "state", None))
+        except Exception:
+            continue
+    return out
+
+
 def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
     """Rewind a to-be-dropped MTP singleton into a standard-resumable state.
 
@@ -481,9 +510,21 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         procs = _proc_list(gen_batch)
         _set_singleton_mrope_delta(gen_batch)
         tok_arr = _ensure_uint32(mx.array(list(tokens)))
+        # Re-prefill in chunks and keep only the last position's logits. One
+        # forward over the whole sequence materialises (L, vocab) float logits
+        # plus full-length activations: ~25 GB at 25K tokens on Qwen 3.8, which
+        # took m5max past its Metal limit (abort in check_error) whenever a
+        # second request joined a long MTP decode. Chunking also matches the
+        # 2048-token prefill step, so recurrent state is built the same way.
         # Inherits the per-engine stream from the enclosing BatchGenerator context.
-        logits, _, _ = _call_backbone(gen_batch.model, tok_arr[None, :], new_cache)
-        last_logits = logits[:, -1, :]  # (1, vocab) — dist after tokens[-1]
+        n_tokens = int(tok_arr.shape[0])
+        last_logits = None
+        for start in range(0, n_tokens, _RECONCILE_CHUNK_TOKENS):
+            piece = tok_arr[None, start : start + _RECONCILE_CHUNK_TOKENS]
+            logits, _, _ = _call_backbone(gen_batch.model, piece, new_cache)
+            last_logits = logits[:, -1, :]  # (1, vocab) — dist after the chunk's last token
+            del logits
+            mx.eval(last_logits, *_cache_state_arrays(new_cache))
 
         if state.queue:
             next_id, next_lp_1d, _src = state.queue[0]
