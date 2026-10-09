@@ -79,9 +79,16 @@ def stamp_model_mtp_active(model, active: bool) -> None:
 
 def model_mtp_active(model) -> bool:
     """Per-model MTP choice; falls back to the process-wide flag when the
-    model was never stamped (loaded outside the serving engines)."""
-    for target in (model, getattr(model, "language_model", None)):
-        value = getattr(target, _MODEL_MTP_ATTR, None) if target is not None else None
+    model was never stamped (loaded outside the serving engines).
+
+    BatchGenerator may hold the model itself or ``VLMModelAdapter``, which
+    keeps the stamped objects as ``_vlm_model`` / ``_language_model``.
+    """
+    for name in (None, "language_model", "_language_model", "_vlm_model"):
+        target = model if name is None else getattr(model, name, None)
+        if target is None:
+            continue
+        value = getattr(target, _MODEL_MTP_ATTR, None)
         if value is not None:
             return bool(value)
     return is_mtp_active()
