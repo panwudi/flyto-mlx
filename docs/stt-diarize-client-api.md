@@ -21,7 +21,6 @@ POST  <base_url>/v1/audio/transcriptions
 | Environment | `<base_url>` |
 |---|---|
 | Production (m5max) | `http://m5max:8000/v1` |
-| Dev / staging (m2max) | `http://m2max:8000/v1` |
 
 Authentication is by API key, sent via the `Authorization: Bearer <key>`
 header (the endpoint accepts the OpenAI-style header for tooling
@@ -444,7 +443,6 @@ POST  <base_url>/v1/audio/transcriptions
 | 环境 | `<base_url>` |
 |---|---|
 | 生产 (m5max) | `http://m5max:8000/v1` |
-| 开发 / staging (m2max) | `http://m2max:8000/v1` |
 
 认证用 API key, 通过 `Authorization: Bearer <key>` header 传 (这个 header
 是兼容 OpenAI 调用风格写的, 服务端内部当 `X-API-Key` 处理)。
