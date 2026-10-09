@@ -866,6 +866,9 @@ class VLMBatchedEngine(BaseEngine):
             else SchedulerConfig()
         )
         scheduler_config.model_name = self._model_name
+        from ..scheduler import apply_model_concurrency_override
+
+        apply_model_concurrency_override(scheduler_config, self._model_settings)
 
         engine_config = EngineConfig(
             model_name=self._model_name,

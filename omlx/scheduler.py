@@ -147,6 +147,19 @@ def _safe_sync_stream(stream=None):
             raise
 
 
+def apply_model_concurrency_override(config, model_settings) -> None:
+    """Apply ModelSettings.max_concurrent_requests to an engine's own copy of
+    SchedulerConfig (positive ints only; anything else keeps the global cap)."""
+    value = getattr(model_settings, "max_concurrent_requests", None)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return
+    config.max_num_seqs = value
+    config.completion_batch_size = min(
+        getattr(config, "completion_batch_size", value) or value, value
+    )
+    logger.info("Per-model max concurrent requests: %d", value)
+
+
 class _StoreCacheGate:
     """Bounded gate that throttles store-cache submissions.
 

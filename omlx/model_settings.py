@@ -176,6 +176,12 @@ class ModelSettings:
     # uses MTP draft+verify path for single-request decoding. Compatible model_types:
     # qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive with dflash and turboquant.
     mtp_enabled: bool = False
+    # Per-model cap on requests decoding at once; overrides the global
+    # scheduler.max_concurrent_requests for this model's engine. 1 keeps an
+    # MTP model on its single-sequence path: a second request queues instead
+    # of joining the batch, which would drop MTP and re-prefill the running
+    # request's whole context (tens of seconds at Claude Code lengths).
+    max_concurrent_requests: Optional[int] = None
 
     # VLM MTP speculative decoding via external assistant drafter (mlx-vlm f96138e+).
     # Target = Gemma4 VLM body, drafter = "gemma-4-26B-A4B-it-assistant"
