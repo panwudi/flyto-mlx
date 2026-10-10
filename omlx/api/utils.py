@@ -5,10 +5,13 @@ Utility functions for text processing.
 """
 
 import json
+import logging
 import re
 from typing import Any, List
 
 from .openai_models import Message
+
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -356,6 +359,27 @@ def _is_safe_user_note_target(msg: dict | None) -> bool:
     )
 
 
+def _is_safe_tool_result_note_target(msg: dict | None) -> bool:
+    """A tool-result turn whose text can take an appended note.
+
+    Native tool calling yields role="tool" messages; without it the results
+    are user text marked with the role-boundary key. Appending keeps the
+    role sequence unchanged, so this is safe even at a tool-call boundary.
+    """
+    if not msg:
+        return False
+    role = msg.get("role")
+    if role == "tool":
+        pass
+    elif role == "user" and msg.get(_PRESERVE_BOUNDARY_KEY):
+        if msg.get("tool_calls") or msg.get("tool_responses"):
+            return False
+    else:
+        return False
+    content = msg.get("content", "")
+    return isinstance(content, str) or _is_text_only_content_list(content)
+
+
 def _message_has_tool_calls(msg: dict | None) -> bool:
     return bool(msg and msg.get("role") == "assistant" and msg.get("tool_calls"))
 
@@ -405,10 +429,14 @@ def _downgrade_mid_system_to_user_notes(messages: list[dict]) -> list[dict] | No
 
     Leading system messages stay where they are. Each later run of system
     messages becomes a ``[System note]`` block appended to the preceding user
-    message (when the run is followed by an assistant turn or ends the list)
-    or prepended to the following user message. Returns None when a run sits
-    next to a tool-call boundary or multimodal user content, where changing
-    roles is too risky; the caller then falls back to hoisting.
+    or tool-result message (when the run is followed by an assistant turn or
+    ends the list) or prepended to the following user message. Returns None
+    when no such target exists, e.g. next to multimodal user content; the
+    caller then falls back to hoisting.
+
+    Claude Code appends a system "# Environment update" right after the tool
+    result whose command changed the working directory. Hoisting that would
+    rewrite the prompt head and force a full re-prefill on every cd.
     """
     rewritten: list[dict] = []
     seen_non_system = False
@@ -442,9 +470,11 @@ def _downgrade_mid_system_to_user_notes(messages: list[dict]) -> list[dict] | No
         next_msg = messages[i] if i < len(messages) else None
         next_role = next_msg.get("role") if next_msg is not None else None
 
-        if _is_safe_user_note_target(rewritten[-1] if rewritten else None) and (
-            next_msg is None or next_role == "assistant"
-        ):
+        prev_msg = rewritten[-1] if rewritten else None
+        if (
+            _is_safe_user_note_target(prev_msg)
+            or _is_safe_tool_result_note_target(prev_msg)
+        ) and (next_msg is None or next_role == "assistant"):
             rewritten[-1] = _rewrite_user_content_with_note(
                 rewritten[-1],
                 note,
@@ -483,6 +513,15 @@ def place_mid_conversation_system_messages(messages: list[dict]) -> list[dict]:
     downgraded = _downgrade_mid_system_to_user_notes(messages)
     if downgraded is not None:
         return downgraded
+    # Hoisting rewrites the prompt head, so the next request misses the
+    # prefix cache from the system prompt on. Log the shape to spot it.
+    logger.info(
+        "Mid-conversation system message hoisted to the front "
+        "(%d messages, last roles: %s); prefix cache will miss from the "
+        "system prompt",
+        len(messages),
+        [m.get("role") for m in messages[-6:]],
+    )
     return _consolidate_system_messages(messages)
 
 
