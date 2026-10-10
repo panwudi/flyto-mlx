@@ -10,6 +10,7 @@ whenever a new one appears and force a full re-prefill.
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from jinja2.exceptions import TemplateError
@@ -109,25 +110,60 @@ def test_markers_are_stripped_before_becoming_a_note():
     assert messages[-1]["content"] == "hi\n\n[System note]\nnote\n[/System note]"
 
 
-def test_system_after_tool_result_falls_back_to_hoisting():
-    """A note cannot go on a tool-result turn; hoist instead (valid shape)."""
-    tool_use = {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"cmd": "ls"}}
-    tool_result = {"type": "tool_result", "tool_use_id": "t1", "content": "a.txt"}
+_NATIVE_TOOLS = SimpleNamespace(has_tool_calling=True)
+ENV_UPDATE = (
+    "# Environment update\n - Primary working directory: /tmp/sub (was /tmp)"
+)
+
+
+def _cd_turn():
+    """Claude Code after a Bash cd: env update lands right after the result."""
+    tool_use = {
+        "type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "cd sub"},
+    }
+    tool_result = {"type": "tool_result", "tool_use_id": "t1", "content": "/tmp/sub"}
+    return _turn1() + [
+        AnthropicMessage(role="assistant", content=[tool_use]),
+        AnthropicMessage(role="user", content=[tool_result]),
+    ]
+
+
+@pytest.mark.parametrize("tokenizer", [None, _NATIVE_TOOLS])
+def test_system_after_tool_result_becomes_note_on_the_result(tokenizer):
     messages = convert_anthropic_to_internal(
-        _request(
-            [
-                AnthropicMessage(role="user", content="list files"),
-                AnthropicMessage(role="assistant", content=[tool_use]),
-                AnthropicMessage(role="user", content=[tool_result]),
-                AnthropicMessage(role="system", content=REMINDER),
-            ]
-        )
+        _request(_cd_turn() + [AnthropicMessage(role="system", content=ENV_UPDATE)]),
+        tokenizer=tokenizer,
     )
 
-    system = [m for m in messages if m["role"] == "system"]
-    assert messages[0]["role"] == "system"
-    assert len(system) == 1 and REMINDER in system[0]["content"]
+    assert [m["role"] for m in messages].count("system") == 1
+    assert messages[0]["content"] == "You are Claude Code."
+    assert messages[-1]["role"] == ("tool" if tokenizer else "user")
+    assert messages[-1]["content"].endswith(
+        f"/tmp/sub\n\n[System note]\n{ENV_UPDATE}\n[/System note]"
+    )
     _render(messages)  # must not raise
+
+
+def test_prefix_is_stable_across_a_cd():
+    """The env update after a cd must not rewrite the prompt head.
+
+    Hoisting it moved every inline system block into the leading system
+    message, so a 150K-token Claude Code session re-prefilled from the end
+    of the system prompt on every cd.
+    """
+    tools = [{"name": "Bash", "input_schema": {"type": "object"}}]
+    before = convert_anthropic_to_internal(
+        _request(_cd_turn()), tokenizer=_NATIVE_TOOLS
+    )
+    after = convert_anthropic_to_internal(
+        _request(_cd_turn() + [AnthropicMessage(role="system", content=ENV_UPDATE)]),
+        tokenizer=_NATIVE_TOOLS,
+    )
+    first, second = _render(before, tools), _render(after, tools)
+
+    result_at = first.index("/tmp/sub") + len("/tmp/sub")
+    assert second.startswith(first[:result_at])
+    assert ENV_UPDATE in second[result_at:]
 
 
 def test_system_next_to_image_turn_falls_back_to_hoisting():
