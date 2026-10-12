@@ -40,7 +40,7 @@ from typing import TYPE_CHECKING, Any
 import mlx.core as mx
 import psutil
 
-from .utils.proc_memory import get_phys_footprint
+from .utils.proc_memory import get_phys_footprint, resident_usage_bytes
 
 if TYPE_CHECKING:
     from .engine_pool import EnginePool
@@ -725,9 +725,13 @@ class ProcessMemoryEnforcer:
         ``current + prefill_transient_margin`` would breach the ceiling, so the
         caller must reject the request with HTTP 503 + Retry-After BEFORE
         streaming instead of letting the forward gate raise a mid-stream error
-        event after HTTP 200. Uses the same ``max(active, phys, recent_peak)``
-        current and the same margin as the forward gate, so it rejects exactly
-        the requests the forward gate would -- only earlier and cleanly.
+        event after HTTP 200. Uses the same final test as the forward gate --
+        resident memory (phys net of MLX's free-buffer pool, see
+        ``resident_usage_bytes``) plus the transient margin against the
+        ceiling -- so it admits exactly what the forward gate would run.
+        The rolling ``recent_peak`` is not used here: a one-tick spike that is
+        already gone (e.g. a finishing request's cache store) used to keep
+        rejecting every new request for the whole 5-tick window.
         Returns ``(True, 0, 0)`` when the guard is disabled.
         """
         if not self._prefill_memory_guard:
@@ -735,12 +739,17 @@ class ProcessMemoryEnforcer:
         ceiling = self._cached_ceiling()
         if ceiling <= 0:
             return True, 0, ceiling
-        current = max(
-            mx.get_active_memory(),
-            get_phys_footprint(),
-            self._recent_peak_bytes,
-        )
+        current, active, phys, cache = resident_usage_bytes()
         ok = (current + self._prefill_transient_margin_bytes) <= ceiling
+        if not ok:
+            logger.warning(
+                "[memadmit] resident %s (active %s, phys %s, mlx free pool %s, "
+                "recent peak %s) + margin %s > ceiling %s",
+                _format_gb(current), _format_gb(active), _format_gb(phys),
+                _format_gb(cache), _format_gb(self._recent_peak_bytes),
+                _format_gb(self._prefill_transient_margin_bytes),
+                _format_gb(ceiling),
+            )
         return ok, current, ceiling
 
     def recent_peak_bytes(self) -> int:
@@ -998,9 +1007,11 @@ class ProcessMemoryEnforcer:
         if new_level != prev_level:
             self._pressure_level = new_level
             self._propagate_memory_limit()
+            _, active, phys, cache = resident_usage_bytes()
             logger.info(
                 f"Memory pressure level: {prev_level} -> {new_level} "
-                f"(current={_format_gb(current)}, "
+                f"(current={_format_gb(current)}, active={_format_gb(active)}, "
+                f"phys={_format_gb(phys)}, mlx_free_pool={_format_gb(cache)}, "
                 f"soft={_format_gb(soft)}, hard={_format_gb(hard)}, "
                 f"ceiling={_format_gb(ceiling)})"
             )

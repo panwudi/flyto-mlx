@@ -116,3 +116,23 @@ def get_phys_footprint(pid: int | None = None) -> int:
     if rc != 0:
         return 0
     return info.ri_phys_footprint
+
+
+def resident_usage_bytes() -> tuple[int, int, int, int]:
+    """Memory this process actually holds, net of MLX's free-buffer pool.
+
+    The server raises MLX's buffer cache limit to the whole machine (see
+    cli.py, issue #300), so buffers MLX has freed stay in its pool and keep
+    counting toward ``phys_footprint`` until ``mx.clear_cache()``. Those
+    bytes are reused by the next allocation or returned by a clear, so they
+    are headroom, not usage.
+
+    Returns ``(resident, active, phys, cache)`` where
+    ``resident = max(active, phys - cache)``.
+    """
+    import mlx.core as mx
+
+    active = mx.get_active_memory()
+    phys = get_phys_footprint()
+    cache = mx.get_cache_memory()
+    return max(active, phys - cache), active, phys, cache
