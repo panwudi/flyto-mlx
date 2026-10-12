@@ -45,7 +45,7 @@ from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .speculative.vlm_mtp import VLMMTPDrafter, run_vlm_mtp_decode
-from .utils.proc_memory import get_phys_footprint
+from .utils.proc_memory import get_phys_footprint, resident_usage_bytes
 from .utils.sampling import make_sampler as omlx_make_sampler
 
 # Module-level alias so Scheduler.__init__ can fall back to mlx-lm's default
@@ -1851,6 +1851,33 @@ class Scheduler:
         predicted_peak = current + predicted_transient
 
         if predicted_peak > self._memory_hard_limit_bytes:
+            # The high-water reading above counts buffers MLX has freed but
+            # kept in its pool (cache limit = whole machine, see cli.py) and
+            # spikes from the last few ticks that are already gone. Before
+            # refusing, drain the GPU and return the pool, then decide on what
+            # is actually resident -- the same test the HTTP admission gate
+            # applies, so the two cannot disagree.
+            _sync_and_clear_cache(self._stream)
+            resident, active, phys, cache = resident_usage_bytes()
+            if resident + predicted_transient <= self._memory_hard_limit_bytes:
+                logger.info(
+                    "[memgate:%s] rid=%s high-water %.3fGB tripped the gate; "
+                    "after reclaim resident %.3fGB (active %.3fGB, phys %.3fGB, "
+                    "mlx free pool %.3fGB) + transient %.3fGB fits cap %.3fGB, "
+                    "proceeding",
+                    loop_label,
+                    request_id,
+                    current / 1024**3,
+                    resident / 1024**3,
+                    active / 1024**3,
+                    phys / 1024**3,
+                    cache / 1024**3,
+                    predicted_transient / 1024**3,
+                    self._memory_hard_limit_bytes / 1024**3,
+                )
+                return
+            current = resident
+            predicted_peak = current + predicted_transient
             logger.warning(
                 "[memgate:%s] rid=%s refusing prefill chunk (n=%d) BEFORE "
                 "forward: predicted peak %.3fGB = current %.3fGB + transient "

@@ -1307,8 +1307,19 @@ class TestWorkingHeadroom:
         assert enforcer.get_working_headroom() == 0
 
 
+GB = 1024**3
+
+
 class TestPrefillAdmissionOk:
     """prefill_admission_ok(): pre-stream request gate, mirrors forward gate."""
+
+    @staticmethod
+    def _resident(monkeypatch, *, active, phys, cache):
+        resident = max(active, phys - cache)
+        monkeypatch.setattr(
+            "omlx.process_memory_enforcer.resident_usage_bytes",
+            lambda: (resident, active, phys, cache),
+        )
 
     def test_ok_when_current_plus_margin_under_ceiling(
         self, mock_engine_pool, monkeypatch
@@ -1317,20 +1328,12 @@ class TestPrefillAdmissionOk:
             mock_engine_pool, ceiling=100 * 1024**3,
             prefill_transient_margin_gb=12.0,
         )
-        monkeypatch.setattr(
-            "omlx.process_memory_enforcer.mx.get_active_memory",
-            lambda: 50 * 1024**3,
-        )
-        monkeypatch.setattr(
-            "omlx.process_memory_enforcer.get_phys_footprint",
-            lambda *a: 50 * 1024**3,
-        )
-        enforcer._recent_peak_bytes = 60 * 1024**3
+        self._resident(monkeypatch, active=50 * GB, phys=60 * GB, cache=0)
         ok, current, ceiling = enforcer.prefill_admission_ok()
-        # current = max(50,50,60)=60GB; 60+12=72 <= 100 -> ok
+        # resident = 60GB; 60+12=72 <= 100 -> ok
         assert ok is True
-        assert current == 60 * 1024**3
-        assert ceiling == 100 * 1024**3
+        assert current == 60 * GB
+        assert ceiling == 100 * GB
 
     def test_reject_when_margin_would_breach(
         self, mock_engine_pool, monkeypatch
@@ -1339,19 +1342,27 @@ class TestPrefillAdmissionOk:
             mock_engine_pool, ceiling=100 * 1024**3,
             prefill_transient_margin_gb=12.0,
         )
-        monkeypatch.setattr(
-            "omlx.process_memory_enforcer.mx.get_active_memory",
-            lambda: 90 * 1024**3,
-        )
-        monkeypatch.setattr(
-            "omlx.process_memory_enforcer.get_phys_footprint",
-            lambda *a: 90 * 1024**3,
-        )
-        enforcer._recent_peak_bytes = 92 * 1024**3
+        self._resident(monkeypatch, active=90 * GB, phys=92 * GB, cache=0)
         ok, current, _ = enforcer.prefill_admission_ok()
-        # current = 92GB (recent_peak dominates); 92+12=104 > 100 -> reject
+        # resident = 92GB; 92+12=104 > 100 -> reject
         assert ok is False
-        assert current == 92 * 1024**3
+        assert current == 92 * GB
+
+    def test_free_buffer_pool_and_stale_peak_do_not_reject(
+        self, mock_engine_pool, monkeypatch
+    ):
+        """2026-10-13 m5max: phys 100GB of which ~30GB was MLX's free-buffer
+        pool, and a one-tick spike kept recent_peak at 100GB; every request
+        got 503 for seconds while resident memory was ~68GB."""
+        enforcer = _make_enforcer(
+            mock_engine_pool, ceiling=107 * 1024**3,
+            prefill_transient_margin_gb=12.0,
+        )
+        enforcer._recent_peak_bytes = 100 * GB
+        self._resident(monkeypatch, active=60 * GB, phys=100 * GB, cache=32 * GB)
+        ok, current, _ = enforcer.prefill_admission_ok()
+        assert ok is True
+        assert current == 68 * GB
 
     def test_ok_when_guard_disabled(self, mock_engine_pool):
         enforcer = _make_enforcer(
@@ -1445,3 +1456,18 @@ class TestExternalGrowthCeiling:
         e = self._enforcer(monkeypatch, 50, 100, current=50)
         e._video_worker_pid = 4242
         assert e._external_pids_to_exclude() == {os.getpid(), 4242}
+
+
+class TestResidentUsageBytes:
+    """resident = max(active, phys - MLX free-buffer pool)."""
+
+    def test_subtracts_free_pool_but_never_below_active(self, monkeypatch):
+        from omlx.utils import proc_memory
+
+        monkeypatch.setattr(proc_memory, "get_phys_footprint", lambda *a: 100 * GB)
+        monkeypatch.setattr("mlx.core.get_active_memory", lambda: 60 * GB)
+        monkeypatch.setattr("mlx.core.get_cache_memory", lambda: 30 * GB)
+        assert proc_memory.resident_usage_bytes() == (70 * GB, 60 * GB, 100 * GB, 30 * GB)
+
+        monkeypatch.setattr("mlx.core.get_cache_memory", lambda: 50 * GB)
+        assert proc_memory.resident_usage_bytes()[0] == 60 * GB

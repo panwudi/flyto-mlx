@@ -56,15 +56,27 @@ def _gate_scheduler(
     return s
 
 
-def _call_gate(s, chunk_tokens, *, instant):
-    """Invoke the gate with patched instant memory probes."""
+def _call_gate(s, chunk_tokens, *, instant, resident=None):
+    """Invoke the gate with patched memory probes.
+
+    ``instant`` is the raw active/phys reading; ``resident`` is what
+    ``resident_usage_bytes`` reports after the reclaim (defaults to
+    ``instant``: nothing reclaimable). Returns the reclaim mock.
+    """
+    if resident is None:
+        resident = instant
     with patch("omlx.scheduler.mx") as mock_mx, patch(
         "omlx.scheduler.get_phys_footprint", return_value=instant
-    ):
+    ), patch(
+        "omlx.scheduler.resident_usage_bytes",
+        return_value=(resident, resident, instant, instant - resident),
+    ), patch("omlx.scheduler._sync_and_clear_cache") as reclaim:
         mock_mx.get_active_memory.return_value = instant
+        s._stream = None
         s._prefill_forward_gate(
             chunk_tokens, request_id="rid-1", loop_label="external"
         )
+    return reclaim
 
 
 class TestPrefillForwardGateUnit:
@@ -93,8 +105,9 @@ class TestPrefillForwardGateUnit:
             estimate=estimate,
             margin=margin,
         )
+        # Still that high after the reclaim -> refuse.
         with pytest.raises(RuntimeError, match="refused before forward"):
-            _call_gate(s, 256, instant=instant)
+            _call_gate(s, 256, instant=instant, resident=recent_peak)
 
     def test_passes_when_predicted_peak_fits(self):
         """current + estimate + margin <= cap -> no raise."""
@@ -141,20 +154,41 @@ class TestPrefillForwardGateUnit:
         )
         _call_gate(s0, 256, instant=instant)  # must not raise
 
-    def test_uses_recent_peak_high_water_not_just_instant(self):
-        """A mid-prefill trough in the instant reading must not mask the
-        real footprint: recent_peak high + low instant still refuses."""
+    def test_high_water_trips_reclaim_then_resident_decides(self):
+        """A high-water reading (recent spike or MLX's free-buffer pool) only
+        triggers a reclaim; the decision is made on what is resident after it.
+        This is the 2026-10-13 m5max false 503: a one-tick 100GB spike kept
+        refusing prefills while resident memory was back at ~68GB."""
         hard = 107 * GB
         s = _gate_scheduler(
             hard_limit=hard,
-            recent_peak=100 * GB,  # real footprint
+            recent_peak=100 * GB,
             estimate=2 * GB,
             margin=10 * GB,
         )
-        # Instant reads a trough at 50GB; without recent_peak it would pass.
-        assert 50 * GB + 2 * GB + 10 * GB < hard
-        with pytest.raises(RuntimeError):
-            _call_gate(s, 256, instant=50 * GB)
+        reclaim = _call_gate(s, 256, instant=100 * GB, resident=68 * GB)
+        reclaim.assert_called_once()
+
+    def test_still_refuses_when_resident_is_really_high(self):
+        hard = 107 * GB
+        s = _gate_scheduler(
+            hard_limit=hard,
+            recent_peak=100 * GB,
+            estimate=2 * GB,
+            margin=10 * GB,
+        )
+        with pytest.raises(RuntimeError, match="refused before forward"):
+            _call_gate(s, 256, instant=100 * GB, resident=98 * GB)
+
+    def test_no_reclaim_when_high_water_fits(self):
+        s = _gate_scheduler(
+            hard_limit=107 * GB,
+            recent_peak=80 * GB,
+            estimate=2 * GB,
+            margin=10 * GB,
+        )
+        reclaim = _call_gate(s, 256, instant=80 * GB)
+        reclaim.assert_not_called()
 
     def test_noop_when_guard_off(self):
         s = _gate_scheduler(
