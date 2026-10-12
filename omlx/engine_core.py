@@ -429,9 +429,20 @@ class EngineCore:
         # prefix cache reconstruction (mx.load, mx.concatenate) never
         # races with scheduler.step() on the Metal stream.  See #95.
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            self._mlx_executor, self.scheduler.add_request, request
-        )
+        try:
+            await loop.run_in_executor(
+                self._mlx_executor, self.scheduler.add_request, request
+            )
+        except BaseException:
+            # Cancelled (client gone while queued behind a long step) or
+            # failed before the caller got the id, so no consumer will ever
+            # clean up: the collector would stay forever and count as an
+            # active request. The executor job may still run and add the
+            # request; the deferred abort removes it then, and is a no-op if
+            # the job never runs.
+            self.scheduler.abort_request(request_id)
+            self._cleanup_request(request_id)
+            raise
 
         return request_id
 
