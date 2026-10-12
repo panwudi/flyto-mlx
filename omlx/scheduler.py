@@ -1645,6 +1645,10 @@ class Scheduler:
             stop_tokens_set.update(sampling_params.stop_token_ids)
         stop_tokens_seq = [[t] for t in stop_tokens_set] if stop_tokens_set else None
 
+        from .patches.batch_decode_mask import apply_batch_decode_mask_patch
+
+        apply_batch_decode_mask_patch()
+
         bg = BatchGenerator(
             model=self.model,
             max_tokens=sampling_params.max_tokens,
