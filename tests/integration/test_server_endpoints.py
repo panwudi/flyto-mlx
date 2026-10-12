@@ -908,6 +908,49 @@ class TestAnthropicMessagesEndpoint:
         assert tool_use_blocks[0]["input"] == {"city": "SF"}
         assert data["stop_reason"] == "tool_use"
 
+    def test_anthropic_deferred_tool_is_callable_but_not_rendered(self, client, mock_llm_engine):
+        """Tool search: defer_loading tools stay out of the template, yet parse."""
+        mock_llm_engine.chat = AsyncMock(return_value=MockGenerationOutput(
+            text='<tool_call>{"name":"mcp__rea__inspect_macho","arguments":{"binary":"/bin/ls"}}</tool_call>',
+            prompt_tokens=10,
+            completion_tokens=5,
+            finish_reason="stop",
+            finished=True,
+        ))
+
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "test-model",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "inspect /bin/ls"}],
+                "tools": [
+                    {
+                        "name": "Read",
+                        "description": "Read a file",
+                        "input_schema": {"type": "object", "properties": {}},
+                    },
+                    {
+                        "name": "mcp__rea__inspect_macho",
+                        "description": "Inspect Mach-O",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"binary": {"type": "string"}},
+                        },
+                        "defer_loading": True,
+                    },
+                ],
+            },
+        )
+
+        assert response.status_code == 200
+        rendered = mock_llm_engine.chat.call_args.kwargs["tools"]
+        assert [t["function"]["name"] for t in rendered] == ["Read"]
+        tool_use_blocks = [b for b in response.json()["content"] if b["type"] == "tool_use"]
+        assert len(tool_use_blocks) == 1
+        assert tool_use_blocks[0]["name"] == "mcp__rea__inspect_macho"
+        assert tool_use_blocks[0]["input"] == {"binary": "/bin/ls"}
+
 
 class TestEmbeddingsEndpoint:
     """Tests for the /v1/embeddings endpoint."""

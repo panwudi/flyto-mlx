@@ -3774,6 +3774,7 @@ async def stream_anthropic_messages(
     messages: list,
     request: AnthropicMessagesRequest,
     resolved_model: Optional[str] = None,
+    parse_tools: Optional[list] = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """
@@ -3808,8 +3809,13 @@ async def stream_anthropic_messages(
     block_index = 0
     last_output = None  # Track last output for tool_calls and token counts
 
+    # Tools the parser accepts: the template's list plus loaded deferred
+    # (tool search) tools, which the template never renders.
+    if parse_tools is None:
+        parse_tools = kwargs.get("tools")
+
     # Filter tool-call markup from streamed content when tools are present.
-    has_tools = bool(kwargs.get("tools"))
+    has_tools = bool(parse_tools)
     tool_filter = None
     thinking_filter = None
     if has_tools:
@@ -3897,7 +3903,7 @@ async def stream_anthropic_messages(
                         # tool_use blocks.
                         if (
                             not text_block_started
-                            and kwargs.get("tools")
+                            and parse_tools
                             and not content_delta.strip()
                         ):
                             pass  # drop leading whitespace adjacent to tool envelopes
@@ -4002,7 +4008,7 @@ async def stream_anthropic_messages(
             )
             for tc in last_output.tool_calls
         ]
-    elif kwargs.get("tools"):
+    elif parse_tools:
         # Non-Harmony: separate thinking, then parse tool calls from content
         # (falls back to thinking content for small models)
         thinking_content, regular_content = extract_thinking(accumulated_text)
@@ -4010,7 +4016,7 @@ async def stream_anthropic_messages(
             thinking_content,
             regular_content,
             tokenizer=engine.tokenizer,
-            tools=kwargs.get("tools"),
+            tools=parse_tools,
         )
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
@@ -4270,8 +4276,15 @@ async def create_anthropic_message(
     ):
         merged_ct_kwargs["preserve_thinking"] = True
 
-    # Merge MCP tools with user-provided Anthropic tools
-    user_internal = convert_anthropic_tools_to_internal(request.tools)
+    # Merge MCP tools with user-provided Anthropic tools. Tool-search tools
+    # (defer_loading) stay out of the template; their definitions arrive
+    # inline via tool_reference, so only the parser needs to know them.
+    user_internal = convert_anthropic_tools_to_internal(
+        request.tools, include_deferred=False
+    )
+    deferred_internal = convert_anthropic_tools_to_internal(
+        request.tools, only_deferred=True
+    )
     if getattr(engine, "is_diffusion_model", False):
         if user_internal:
             raise InvalidRequestError(
@@ -4298,6 +4311,9 @@ async def create_anthropic_message(
         internal_tools = enrich_tool_params_for_gemma4(internal_tools)
     if internal_tools:
         chat_kwargs["tools"] = internal_tools
+    parse_tools = internal_tools
+    if deferred_internal and not getattr(engine, "is_diffusion_model", False):
+        parse_tools = (internal_tools or []) + deferred_internal
 
     # Add chat template kwargs
     if merged_ct_kwargs:
@@ -4334,7 +4350,10 @@ async def create_anthropic_message(
     if request.stream:
         return StreamingResponse(
             _with_sse_keepalive(
-                stream_anthropic_messages(engine, messages, request, resolved_model=resolved_model, **chat_kwargs),
+                stream_anthropic_messages(
+                    engine, messages, request, resolved_model=resolved_model,
+                    parse_tools=parse_tools, **chat_kwargs,
+                ),
                 http_request=http_request,
                 keepalive_chunk=_resolve_keepalive("anthropic"),
             ),
@@ -4389,7 +4408,7 @@ async def create_anthropic_message(
                 thinking_content,
                 regular_content,
                 tokenizer=engine.tokenizer,
-                tools=internal_tools,
+                tools=parse_tools,
             )
             cleaned_text = extraction.cleaned_text
             tool_calls = extraction.tool_calls
@@ -4460,8 +4479,10 @@ async def count_anthropic_tokens(
     )
     messages = convert_anthropic_to_internal(temp_request)
 
-    # Convert tools if present
-    internal_tools = convert_anthropic_tools_to_internal(request.tools)
+    # Convert tools if present (deferred tool-search tools are not rendered)
+    internal_tools = convert_anthropic_tools_to_internal(
+        request.tools, include_deferred=False
+    )
 
     # Apply chat template to get prompt
     tokenizer = engine.tokenizer
