@@ -23,12 +23,18 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple, Union
 import mlx.core as mx
 
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
-from .scheduler import Scheduler, SchedulerConfig, SchedulerOutput
+from .scheduler import (
+    Scheduler,
+    SchedulerConfig,
+    SchedulerOutput,
+    clear_thread_streams,
+)
 from .output_collector import RequestOutputCollector, RequestStreamState
 from .model_registry import get_registry, ModelOwnershipError
 from .utils.compile_cache import (
     clear_thread_compile_cache,
     compile_cache_clear_available,
+    thread_exit_is_safe,
 )
 
 logger = logging.getLogger(__name__)
@@ -791,7 +797,14 @@ class EngineCore:
             # ml-explore/mlx #3280). Clear the cache ON this worker thread (GIL
             # held) before the thread is torn down so the destructor runs on an
             # empty cache, then shut down normally. See utils/compile_cache.py.
-            if compile_cache_clear_available():
+            # MLX >= 0.32.2 makes that teardown safe itself (mlx #4391).
+            if thread_exit_is_safe():
+                try:
+                    self._mlx_executor.submit(clear_thread_streams).result()
+                except RuntimeError:
+                    pass
+                self._mlx_executor.shutdown(wait=True)
+            elif compile_cache_clear_available():
                 try:
                     self._mlx_executor.submit(clear_thread_compile_cache).result()
                 except RuntimeError:

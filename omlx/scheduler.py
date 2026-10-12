@@ -131,6 +131,24 @@ def _sync_and_clear_cache(stream=None):
         mx.clear_cache()
 
 
+def clear_thread_streams() -> None:
+    """Release every MLX stream owned by the calling worker thread.
+
+    MLX >= 0.32 keeps a per-thread stream registry that synchronizing and
+    clearing the buffer cache does not empty, so a worker thread that touched
+    MLX calls this right before it exits (upstream oMLX 8b2ade32). No-op on
+    MLX builds without ``mx.clear_streams``.
+    """
+    try:
+        mx.synchronize()
+    except RuntimeError:
+        # Lazily started worker with no default stream yet: nothing to drain.
+        pass
+    clear_streams = getattr(mx, "clear_streams", None)
+    if clear_streams is not None:
+        clear_streams()
+
+
 def _safe_sync_stream(stream=None):
     """mx.synchronize(stream) that tolerates cross-thread calls.
 
@@ -6482,6 +6500,9 @@ class Scheduler:
                     )
                     concurrent.futures.wait(inflight, timeout=30.0)
                 self._drain_pending_async_removes()
+                self._store_cache_executor.submit(clear_thread_streams).result(
+                    timeout=30.0
+                )
                 self._store_cache_executor.shutdown(wait=True)
             except Exception as e:
                 logger.warning(f"Async store_cache shutdown error: {e}")
