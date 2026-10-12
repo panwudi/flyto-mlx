@@ -1105,3 +1105,106 @@ class TestGlobalMLXExecutor:
             f"Expected concurrent execution (max_concurrent >= 2), got {max_concurrent}. "
             f"Per-engine executors should allow parallel step() calls."
         )
+
+
+class TestEngineCoreAddRequestCancellation:
+    """A client that leaves while add_request() waits for the MLX executor.
+
+    The collector exists before the executor hop, but the caller has no
+    request id yet, so nothing else can clean it up. Before the fix it
+    stayed forever and the admin stats kept counting an active request
+    while the server was idle (seen on m5max, 2026-10-12).
+    """
+
+    @staticmethod
+    def _blocking_add(engine, started, release):
+        def add(request):
+            started.set()
+            release.wait(timeout=5)
+        engine.scheduler.add_request = add
+
+    @pytest.mark.asyncio
+    async def test_cancel_while_executor_job_runs(self, mock_model, mock_tokenizer):
+        import threading
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            started, release = threading.Event(), threading.Event()
+            self._blocking_add(engine, started, release)
+            try:
+                task = asyncio.create_task(
+                    engine.add_request(prompt="Hello", request_id="r-running")
+                )
+                while not started.is_set():
+                    await asyncio.sleep(0.01)
+                assert "r-running" in engine._output_collectors
+
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                release.set()
+
+                assert "r-running" not in engine._output_collectors
+                assert "r-running" not in engine._stream_states
+                assert "r-running" not in engine._finished_events
+                # The job still finishes adding the request; the deferred
+                # abort removes it on the next step.
+                assert "r-running" in engine.scheduler._pending_abort_ids
+            finally:
+                release.set()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_cancel_while_queued_behind_another_job(self, mock_model, mock_tokenizer):
+        import threading
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            busy, release = threading.Event(), threading.Event()
+            added = []
+
+            def long_step():
+                busy.set()
+                release.wait(timeout=5)
+
+            engine.scheduler.add_request = added.append
+            try:
+                loop = asyncio.get_running_loop()
+                step = loop.run_in_executor(engine._mlx_executor, long_step)
+                while not busy.is_set():
+                    await asyncio.sleep(0.01)
+
+                task = asyncio.create_task(
+                    engine.add_request(prompt="Hello", request_id="r-queued")
+                )
+                await asyncio.sleep(0.05)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                release.set()
+                await step
+
+                assert "r-queued" not in engine._output_collectors
+                assert added == []  # the queued job never ran
+            finally:
+                release.set()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_scheduler_error_does_not_leave_collector(self, mock_model, mock_tokenizer):
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            def fail(request):
+                raise ValueError("bad request")
+
+            engine.scheduler.add_request = fail
+            try:
+                with pytest.raises(ValueError):
+                    await engine.add_request(prompt="Hello", request_id="r-error")
+                assert "r-error" not in engine._output_collectors
+            finally:
+                engine.close()
