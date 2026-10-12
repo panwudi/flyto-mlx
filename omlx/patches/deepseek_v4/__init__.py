@@ -12,8 +12,6 @@ without modifying the pinned mlx-lm. The patch:
    path used by ``_get_classes`` finds them.
 3. Replaces ``mlx_lm.utils.load_model`` with a copy that handles
    ``F8_E8M0`` dtype fallback and the DeepSeek V4 ``fp8`` quant_method.
-4. Replaces ``mlx_lm.generate._make_cache`` with a copy aware of
-   ``PoolingCache`` → ``BatchPoolingCache`` conversion.
 5. Wraps ``mlx_lm.tokenizer_utils.AutoTokenizer`` with a fallback that
    retries with an empty ``PreTrainedConfig()`` when transformers does
    not yet recognize the ``deepseek_v4`` model_type (PR 45643 was
@@ -145,11 +143,6 @@ def apply_deepseek_v4_patch() -> bool:
     from .utils_patch import apply_utils_patch
 
     apply_utils_patch()
-
-    # 5. Patch generate._make_cache (PoolingCache → BatchPoolingCache).
-    from .generate_patch import apply_generate_patch
-
-    apply_generate_patch()
 
     # 6. Wrap tokenizer_utils.AutoTokenizer (deepseek_v4 fallback for
     #    transformers releases that pre-date PR 45643 / 2026-05-02).

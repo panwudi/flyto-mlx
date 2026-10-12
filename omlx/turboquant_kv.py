@@ -44,6 +44,29 @@ from mlx_vlm.turboquant import (
 
 logger = logging.getLogger(__name__)
 
+_vlm_from_cache = TurboQuantKVCache.from_cache.__func__
+
+
+@classmethod
+def _from_cache(cls, cache, bits, *args, **kwargs):
+    """mlx-vlm's ``from_cache`` unpacks ``cache.state`` as ``(keys, values)``;
+    since mlx-lm 0.32 an mlx-lm ``KVCache.state`` also carries the offset and
+    untrimmed buffers. Feed it the trimmed ``keys_and_values()`` instead."""
+    if callable(getattr(cache, "keys_and_values", None)):
+        trimmed = _KeysAndValues(
+            cache.keys_and_values() if cache.keys is not None else (None, None)
+        )
+        return _vlm_from_cache(cls, trimmed, bits, *args, **kwargs)
+    return _vlm_from_cache(cls, cache, bits, *args, **kwargs)
+
+
+class _KeysAndValues:
+    def __init__(self, state):
+        self.state = state
+
+
+TurboQuantKVCache.from_cache = _from_cache
+
 __all__ = [
     "TurboQuantKVCache",
     "BatchTurboQuantKVCache",

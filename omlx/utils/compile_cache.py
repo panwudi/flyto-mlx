@@ -25,6 +25,9 @@ normally.
 If the symbol cannot be resolved (e.g. a future MLX rename or a non-macOS
 build), the helper is a no-op and callers fall back to keeping the worker
 thread alive for the process lifetime instead of exiting it.
+
+MLX 0.32.2 fixed the destructor itself (``thread_exit_is_safe``); there the
+workaround is skipped and worker threads shut down normally.
 """
 
 import ctypes
@@ -87,6 +90,21 @@ def _resolve_clear_fn():
             )
             _clear_fn = None
         return _clear_fn
+
+
+def thread_exit_is_safe() -> bool:
+    """True when MLX itself makes compile-cache teardown at thread exit safe.
+
+    MLX 0.32.2 acquires the GIL before compiled graph data is destroyed at
+    thread exit (ml-explore/mlx #4391), and changed the private
+    ``compile_clear_cache`` signature so the symbol above no longer resolves.
+    On those versions worker threads can simply shut down.
+    """
+    try:
+        major, minor, patch = (int(x) for x in mx.__version__.split(".")[:3])
+    except (AttributeError, ValueError):
+        return False
+    return (major, minor, patch) >= (0, 32, 2)
 
 
 def compile_cache_clear_available() -> bool:

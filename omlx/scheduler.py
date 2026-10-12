@@ -31,7 +31,7 @@ from mlx_lm.generate import (
     BatchGenerator,
     GenerationBatch,
     PromptProcessingBatch,
-    SequenceStateMachine,
+    StopSequences,
     generation_stream,
 )
 from mlx_lm.models.cache import make_prompt_cache
@@ -40,6 +40,7 @@ from mlx_lm.sample_utils import make_logits_processors
 from .cache.observability import CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.prefix_cache import BlockAwarePrefixCache
+from .cache.state_compat import legacy_meta_state, legacy_state
 from .exceptions import is_cache_corruption_error
 from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
@@ -69,7 +70,7 @@ class _VLMMTPDecodeState:
     state_machine: Any
     max_tokens: int
     # Plain stop-token set (EOS + request-specific) for direct membership
-    # check; mlx-lm's SequenceStateMachine doesn't expose a "did the last
+    # check; mlx-lm's StopSequences doesn't expose a "did the last
     # token finish" helper, so we keep a copy.
     stop_token_ids: set[int] = field(default_factory=set)
     emitted: int = 0
@@ -1535,7 +1536,7 @@ class Scheduler:
         return stop_tokens
 
     # _update_stop_tokens deleted — per-request stop tokens are now
-    # handled via SequenceStateMachine passed to insert().
+    # handled via StopSequences passed to insert().
 
     def _get_detokenizer(self, request_id: str):
         """Get or create a streaming detokenizer for a request.
@@ -2556,7 +2557,7 @@ class Scheduler:
             caches=[state.cache] if state.cache else None,
             samplers=[state.sampler],
             logits_processors=[per_row_lps],
-            state_machines=[state.sm],
+            stop_sequences=[state.sm],
         )
 
         if uids:
@@ -2675,8 +2676,8 @@ class Scheduler:
 
         self.prefilling = still_prefilling
 
-    def _build_state_machine(self, request: "Request") -> SequenceStateMachine:
-        """Build a SequenceStateMachine for per-request stop tokens.
+    def _build_state_machine(self, request: "Request") -> StopSequences:
+        """Build a StopSequences automaton for per-request stop tokens.
 
         Combines base stop tokens (EOS, Harmony) with request-specific
         stop_token_ids and tokenized stop strings into a single state
@@ -2687,12 +2688,10 @@ class Scheduler:
         if request.sampling_params.stop_token_ids:
             stop_tokens_set.update(request.sampling_params.stop_token_ids)
 
-        transitions: dict[str, list] = {
-            "normal": [([t], None) for t in stop_tokens_set]
-        }
+        sequences: list[list[int]] = [[t] for t in stop_tokens_set]
 
         # Tokenize stop strings into token sequences. mlx-lm's
-        # SequenceStateMachine uses Aho-Corasick, so per-token match
+        # StopSequences uses Aho-Corasick, so per-token match
         # cost stays O(1) regardless of how many sequences are added.
         # BPE merge edge cases (where a stop string boundary lands
         # mid-token) may miss; that is a known limitation.
@@ -2704,11 +2703,9 @@ class Scheduler:
             except TypeError:
                 seq = self.tokenizer.encode(stop_str)
             if seq:
-                transitions["normal"].append((list(seq), None))
+                sequences.append(list(seq))
 
-        if transitions["normal"]:
-            return SequenceStateMachine(transitions, initial="normal")
-        return SequenceStateMachine({}, initial="normal")
+        return StopSequences(sequences)
 
     def _emit_prefill_boundary_snapshot(
         self,
@@ -3738,9 +3735,11 @@ class Scheduler:
                         sub_class_names = []
                         sub_meta_states = []
                         for sc in sub_caches:
-                            sub_states.append(sc.state if hasattr(sc, "state") else ())
+                            sub_states.append(
+                                legacy_state(sc) if hasattr(sc, "state") else ()
+                            )
                             sub_class_names.append(type(sc).__name__)
-                            sub_meta_states.append(getattr(sc, "meta_state", ()))
+                            sub_meta_states.append(legacy_meta_state(sc))
                         extracted.append(
                             {
                                 "state": sub_states,
@@ -3752,8 +3751,8 @@ class Scheduler:
                     continue
 
                 if hasattr(layer_cache, "state"):
-                    state = layer_cache.state
-                    meta = getattr(layer_cache, "meta_state", ())
+                    state = legacy_state(layer_cache)
+                    meta = legacy_meta_state(layer_cache)
 
                     if class_name in ("RotatingKVCache", "BatchRotatingKVCache"):
                         state, meta = self._normalize_rotating_snapshot_state(
@@ -5456,7 +5455,7 @@ class Scheduler:
                 caches=[cache_to_use] if cache_to_use else None,
                 samplers=[sampler],
                 logits_processors=[per_row_lps],
-                state_machines=[sm],
+                stop_sequences=[sm],
                 all_tokens=all_tokens,
             )
 

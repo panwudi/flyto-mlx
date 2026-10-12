@@ -51,19 +51,19 @@ def test_apply_accepts_model_arg_for_backward_compat():
 
 
 def test_mlx_vlm_gated_delta_class_is_not_patched():
-    """The no-op must leave 041f889's GatedDeltaNet.__call__ intact, including
-    its ``target_verify`` parameter and the 12-tuple ``gdn_sink`` capture that
-    stock ``rollback_speculative_cache`` consumes."""
+    """The no-op must leave mlx-vlm's GatedDeltaNet.__call__ intact: the method
+    is still the one defined in mlx-vlm's own module, and it keeps the
+    batch-shape guards and per-row ``cache.lengths`` handling this patch used
+    to add (mlx-vlm 0.7 moved them into ``update_window``)."""
     apply_gated_delta_advance_patch()
     try:
         from mlx_vlm.models.qwen3_5.language import Qwen3_5GatedDeltaNet
     except ImportError:
         pytest.skip("mlx-vlm not installed in this environment")
 
-    sig = inspect.signature(Qwen3_5GatedDeltaNet.__call__)
-    # Upstream 041f889 signature carries target_verify; the old flyto patch did
-    # not. Its presence proves the class is the unpatched upstream one.
-    assert "target_verify" in sig.parameters
+    call = Qwen3_5GatedDeltaNet.__call__
+    assert call.__module__ == "mlx_vlm.models.qwen3_5.language"
 
-    src = inspect.getsource(Qwen3_5GatedDeltaNet.__call__)
-    assert "intermediate_states" in src
+    src = inspect.getsource(call)
+    assert "conv_state.shape[0] != B" in src
+    assert "lengths=cache.lengths" in src

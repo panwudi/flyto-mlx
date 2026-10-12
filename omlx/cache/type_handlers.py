@@ -14,6 +14,8 @@ from typing import Any
 
 from ._rotating_subclass import PrefillReadyRotatingKVCache
 
+from .state_compat import legacy_meta_state, legacy_state
+
 logger = logging.getLogger(__name__)
 
 # Try to import mlx for tensor operations
@@ -218,9 +220,12 @@ class CacheTypeHandler(ABC):
         of going through the legacy ``extract_state`` dict (which is still
         supported via the default ``deserialize_state`` below).
 
-        Default = pass-through ``cache_obj.state`` cast to tuple.
+        Default = ``cache_obj.state`` in the mlx-lm 0.31 layout (see
+        ``state_compat``), cast to tuple.
         """
-        state = getattr(cache_obj, "state", None)
+        if not hasattr(cache_obj, "state"):
+            return ()
+        state = legacy_state(cache_obj)
         if isinstance(state, (list, tuple)):
             return tuple(state)
         return ()
@@ -302,7 +307,7 @@ class KVCacheHandler(CacheTypeHandler):
 
     def extract_state(self, cache_obj: Any) -> dict[str, Any]:
         """Extract state from KVCache object."""
-        keys, values = cache_obj.state
+        keys, values = legacy_state(cache_obj)
         return {
             "keys": keys,
             "values": values,
@@ -441,10 +446,10 @@ class RotatingKVCacheHandler(CacheTypeHandler):
 
     def extract_state(self, cache_obj: Any) -> dict[str, Any]:
         """Extract state from RotatingKVCache object."""
-        keys, values = cache_obj.state
+        keys, values = legacy_state(cache_obj)
 
         # Get meta_state: (keep, max_size, offset, _idx)
-        meta_state = getattr(cache_obj, "meta_state", ())
+        meta_state = legacy_meta_state(cache_obj)
 
         return {
             "keys": keys,
@@ -745,7 +750,7 @@ class ArraysCacheHandler(CacheTypeHandler):
         inner = (
             cache_obj._inner if isinstance(cache_obj, SizedArraysCache) else cache_obj
         )
-        state_list = inner.state if hasattr(inner, "state") else inner.cache
+        state_list = legacy_state(inner) if hasattr(inner, "state") else inner.cache
 
         return {
             "states": list(state_list) if state_list else [],
@@ -875,7 +880,7 @@ class CacheListHandler(CacheTypeHandler):
         for sc in sub_caches:
             # Get state
             if hasattr(sc, "state"):
-                sub_states.append(sc.state)
+                sub_states.append(legacy_state(sc))
             else:
                 sub_states.append(())
 
@@ -888,7 +893,7 @@ class CacheListHandler(CacheTypeHandler):
             sub_class_names.append(normalized)
 
             # Get meta_state
-            sub_meta_states.append(getattr(sc, "meta_state", ()))
+            sub_meta_states.append(legacy_meta_state(sc))
 
         return {
             "sub_states": sub_states,
@@ -944,9 +949,12 @@ class CacheListHandler(CacheTypeHandler):
     ) -> Any:
         """Reconstruct CacheList from stored state.
 
-        Tries new mlx-lm CacheList.from_state() first, then falls back to
-        manual sub-cache reconstruction using CacheTypeRegistry (local import
-        to avoid circular dependency).
+        Rebuilds sub-caches through omlx handlers (local CacheTypeRegistry
+        import to avoid a circular dependency). mlx-lm's own
+        ``CacheList.from_state`` is not used: since mlx-lm 0.32 it takes the
+        full-state layout, not the stored 0.31 layout, and the handler route
+        is needed anyway for caches like RotatingKVCache that must be
+        rebuilt as PrefillReadyRotatingKVCache.
 
         Args:
             state: Dict with 'sub_states' key containing per-sub-cache states.
@@ -977,28 +985,6 @@ class CacheListHandler(CacheTypeHandler):
             )
             return None
 
-        # Sanitize sub_meta_states for sub-cache types that don't support
-        # meta_state (inherit _BaseCache's strict setter which rejects
-        # truthy values).  Use "" to match _BaseCache.meta_state getter.
-        _NO_META_STATE_TYPES = frozenset(
-            {"KVCache", "ConcatenateKVCache", "ArraysCache"}
-        )
-        sanitized_sub_meta_states = [
-            "" if cls_name in _NO_META_STATE_TYPES else sub_meta
-            for cls_name, sub_meta in zip(class_names, sub_meta_states)
-        ]
-
-        # Try new mlx-lm CacheList.from_state() first
-        try:
-            from mlx_lm.models.cache import CacheList
-
-            return CacheList.from_state(
-                sub_states, (class_names, sanitized_sub_meta_states)
-            )
-        except (ImportError, AttributeError, TypeError, KeyError, Exception) as e:
-            logger.debug(f"CacheList.from_state() unavailable or failed: {e}")
-
-        # Fallback: manually reconstruct sub-caches
         # NOTE: CacheTypeRegistry must be imported locally to avoid circular import
         # (type_handlers.py is imported by type_registry.py)
         try:
@@ -1079,7 +1065,7 @@ class DefaultCacheHandler(KVCacheHandler):
         """Try to extract state assuming KVCache-like structure."""
         try:
             if hasattr(cache_obj, "state"):
-                state = cache_obj.state
+                state = legacy_state(cache_obj)
                 if isinstance(state, tuple) and len(state) == 2:
                     keys, values = state
                     return {

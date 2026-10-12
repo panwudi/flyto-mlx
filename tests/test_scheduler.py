@@ -2175,7 +2175,7 @@ class TestBuildStateMachineStopStrings:
     """Tests for _build_state_machine stop-string tokenization.
 
     The scheduler must convert SamplingParams.stop (a list of strings)
-    into token-sequence transitions on the per-request state machine,
+    into token sequences on the per-request StopSequences automaton,
     so mlx-lm's BatchGenerator can halt on user-supplied stop sequences.
     """
 
@@ -2189,14 +2189,22 @@ class TestBuildStateMachineStopStrings:
             sampling_params=SamplingParams(max_tokens=10, stop=stop),
         )
 
+    @staticmethod
+    def _stops_on(sm, tokens):
+        """Feed tokens to a fresh matcher; True if the last one completes a stop."""
+        matcher = sm.matcher()
+        hit = False
+        for tok in tokens:
+            hit = matcher.advance(tok)
+        return hit
+
     def test_no_stop_string_only_eos_transitions(
         self, mock_model, mock_tokenizer
     ):
         scheduler = self._make_scheduler(mock_model, mock_tokenizer)
         sm = scheduler._build_state_machine(self._request_with_stop([]))
-        # SequenceStateMachine has internal _states dict; non-empty implies
-        # at least the EOS transitions are present.
-        assert sm._states
+        eos = next(iter(scheduler._get_stop_tokens()))
+        assert self._stops_on(sm, [eos])
 
     def test_stop_string_added_as_token_sequence(
         self, mock_model, mock_tokenizer
@@ -2207,13 +2215,7 @@ class TestBuildStateMachineStopStrings:
         assert expected_seq, "MockTokenizer must produce a token for 'delta'"
 
         sm = scheduler._build_state_machine(self._request_with_stop(["delta"]))
-        # Walk the trie following expected_seq; the terminal node must
-        # have a __match__ entry, meaning the sequence is registered.
-        node = sm._states["normal"][0]
-        for tok in expected_seq:
-            assert tok in node, f"token {tok} missing from trie"
-            node = node[tok]
-        assert "__match__" in node, "stop sequence not terminated in trie"
+        assert self._stops_on(sm, expected_seq)
 
     def test_empty_or_non_string_entries_skipped(
         self, mock_model, mock_tokenizer
@@ -2225,11 +2227,7 @@ class TestBuildStateMachineStopStrings:
             self._request_with_stop(["", "real", 123])
         )
         real_seq = mock_tokenizer.encode("real", add_special_tokens=False)
-        node = sm._states["normal"][0]
-        for tok in real_seq:
-            assert tok in node
-            node = node[tok]
-        assert "__match__" in node
+        assert self._stops_on(sm, real_seq)
 
     def test_multiple_stop_strings_all_registered(
         self, mock_model, mock_tokenizer
@@ -2240,11 +2238,18 @@ class TestBuildStateMachineStopStrings:
         )
         for stop_str in ("foo", "bar"):
             seq = mock_tokenizer.encode(stop_str, add_special_tokens=False)
-            node = sm._states["normal"][0]
-            for tok in seq:
-                assert tok in node
-                node = node[tok]
-            assert "__match__" in node
+            assert self._stops_on(sm, seq)
+
+    def test_unrelated_token_does_not_stop(self, mock_model, mock_tokenizer):
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        sm = scheduler._build_state_machine(self._request_with_stop(["delta"]))
+        stops = scheduler._get_stop_tokens() | set(
+            mock_tokenizer.encode("delta", add_special_tokens=False)
+        )
+        other = next(t for t in range(1, 10_000) if t not in stops)
+        assert not self._stops_on(sm, [other])
+
+
 class TestTokenBufferSeedOnCacheHit:
     """Tests for TokenBuffer seeding via all_tokens parameter (#fix).
 

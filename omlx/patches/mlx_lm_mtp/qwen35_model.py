@@ -243,6 +243,14 @@ def _patch_gated_delta_net(q35: Any) -> None:
     from mlx.nn.layers.distributed import sum_gradients
     from mlx_lm.models.gated_delta import gated_delta_update
 
+    try:
+        from mlx_lm.models.gated_delta import normalize_qk
+    except ImportError:  # mlx-lm < 0.32
+        def normalize_qk(q, k, *, inv_scale, eps):
+            q = (inv_scale**2) * mx.fast.rms_norm(q, None, eps)
+            k = inv_scale * mx.fast.rms_norm(k, None, eps)
+            return q, k
+
     def _process_chunk(
         self,
         qkv_chunk,
@@ -272,9 +280,9 @@ def _patch_gated_delta_net(q35: Any) -> None:
                 [self.head_k_dim, self.head_k_dim, self.head_v_dim],
             )
         ]
-        inv_scale = k.shape[-1] ** -0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        # Same q/k normalization as stock GatedDeltaNet; mlx-lm 0.32 fixed
+        # the eps scaling (mlx-lm #1896) inside normalize_qk.
+        q, k = normalize_qk(q, k, inv_scale=self.head_k_dim**-0.5, eps=1e-6)
 
         out, new_ssm_state = gated_delta_update(
             q,

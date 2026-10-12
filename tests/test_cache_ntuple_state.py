@@ -94,6 +94,7 @@ class TestDeserializeStateLegacyContract:
         import mlx.core as mx
         from mlx_lm.models.cache import KVCache
 
+        from omlx.cache.state_compat import legacy_meta_state, legacy_state
         from omlx.cache.type_handlers import KVCacheHandler
 
         original = KVCache()
@@ -103,12 +104,14 @@ class TestDeserializeStateLegacyContract:
         )
         h = KVCacheHandler()
         elements = h.serialize_state(original)
-        restored = h.deserialize_state(elements, meta_state=original.meta_state)
+        restored = h.deserialize_state(
+            elements, meta_state=legacy_meta_state(original)
+        )
         assert restored is not None
-        # Compare trimmed state tuples (KVCache.state returns sliced view
-        # without internal padding chunks).
-        orig_keys, orig_values = original.state
-        rest_keys, rest_values = restored.state
+        # Compare trimmed (keys, values): the stored layout has no internal
+        # padding chunks.
+        orig_keys, orig_values = legacy_state(original)
+        rest_keys, rest_values = legacy_state(restored)
         assert orig_keys.shape == rest_keys.shape
         assert mx.max(mx.abs(rest_keys - orig_keys)).item() == 0.0
         assert mx.max(mx.abs(rest_values - orig_values)).item() == 0.0

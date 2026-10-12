@@ -681,11 +681,22 @@ class VLMBatchedEngine(BaseEngine):
             return False
 
     def _detect_diffusion_family(self) -> str | None:
-        """Return the mlx-vlm diffusion generation family for loaded models."""
+        """Return the mlx-vlm diffusion generation family for loaded models.
+
+        mlx-vlm <= 0.6 reported canvas (block) diffusion models as "block".
+        mlx-vlm 0.7 unified the router and reports every diffusion model as
+        "diffusion"; the canvas models this engine drives through
+        ``stream_diffusion_generate`` are the ones whose config declares
+        ``canvas_length``.
+        """
         try:
             from mlx_vlm.generate.diffusion import diffusion_generation_family
 
             family = diffusion_generation_family(self._vlm_model)
+            if family == "diffusion":
+                config = getattr(self._vlm_model, "config", None)
+                if getattr(config, "canvas_length", None) is not None:
+                    return "block"
             if family == "block":
                 return family
             if family is not None:
@@ -1014,50 +1025,28 @@ class VLMBatchedEngine(BaseEngine):
         """Inject tool calling attributes into VLM tokenizer.
 
         mlx-vlm's TokenizerWrapper lacks tool calling support (has_tool_calling,
-        tool_parser, etc). We prefer mlx_vlm.tool_parsers which is a superset of
-        mlx_lm's — it recognises additional markers such as Gemma4's <|tool_call>
-        and loads the correct per-model parser.  Falls back to mlx_lm if the
-        mlx_vlm.tool_parsers package is not present.
+        tool_parser, etc). The lookup (``omlx.api.vlm_tool_parsers``) is
+        mlx-lm's template inference plus the Gemma 4 / Cohere2 markers, with
+        the parsers mlx-vlm <= 0.6 shipped for those two.
         """
         chat_template = getattr(tokenizer, "chat_template", None)
         if not chat_template:
             return
 
-        # Prefer mlx_vlm.tool_parsers (superset; knows about Gemma4 etc.)
+        from ..api.vlm_tool_parsers import infer_tool_parser, load_tool_module
+
         try:
-            from mlx_vlm.tool_parsers import (
-                _infer_tool_parser,
-                load_tool_module,
-            )
-
-            tool_parser_type = _infer_tool_parser(chat_template)
-            if tool_parser_type is None:
-                return
-            try:
-                tool_module = load_tool_module(tool_parser_type)
-            except ImportError:
-                logger.warning(f"VLM tool parser module not found: {tool_parser_type}")
-                return
+            tool_parser_type = infer_tool_parser(tokenizer)
+        except Exception as exc:
+            logger.warning(f"VLM tool parser inference failed: {exc}")
+            return
+        if tool_parser_type is None:
+            return
+        try:
+            tool_module = load_tool_module(tool_parser_type)
         except ImportError:
-            # Fallback: mlx_lm only (no Gemma4 support)
-            try:
-                import importlib
-
-                from mlx_lm.tokenizer_utils import (
-                    _infer_tool_parser as _mlx_lm_infer,
-                )
-            except ImportError:
-                return
-            tool_parser_type = _mlx_lm_infer(chat_template)
-            if tool_parser_type is None:
-                return
-            try:
-                tool_module = importlib.import_module(
-                    f"mlx_lm.tool_parsers.{tool_parser_type}"
-                )
-            except ImportError:
-                logger.warning(f"VLM tool parser module not found: {tool_parser_type}")
-                return
+            logger.warning(f"VLM tool parser module not found: {tool_parser_type}")
+            return
 
         tool_call_start = tool_module.tool_call_start
         tool_call_end = tool_module.tool_call_end

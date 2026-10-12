@@ -20,6 +20,9 @@ def apply_mlx_vlm_diffusion_patch() -> bool:
     have no affine biases, so MLX interpreted them as affine and raised:
 
         [dequantize] Biases must be provided for affine quantization.
+
+    mlx-vlm >= 0.7 removed the helper (the soft embedding now uses
+    ``quantized_matmul`` with the embedding's mode), so this is a no-op there.
     """
     global _APPLIED
     if _APPLIED:

@@ -112,29 +112,14 @@ class TestUtilsPatch:
         assert loaded["x"].shape == (4, 4)
 
 
-class TestGeneratePatch:
-    """mlx_lm.generate._make_cache replaced."""
+class TestPoolingCacheBatching:
+    """mlx-lm >= 0.32 batches prompt caches with ``merge``, not ``_make_cache``."""
 
-    def test_make_cache_replaced(self, applied_patch):
-        gen_mod = importlib.import_module("mlx_lm.generate")
-
-        assert hasattr(gen_mod, "_make_cache")
-        # Source must include PoolingCache → BatchPoolingCache branch.
-        # We can't easily compare functions, so just verify the new
-        # behavior: passing a model with a PoolingCache in make_cache
-        # produces a BatchPoolingCache.
+    def test_pooling_cache_merges_into_batch_pooling_cache(self, applied_patch):
         from mlx_lm.models.cache import BatchPoolingCache, PoolingCache
 
-        class FakeModel:
-            def __init__(self):
-                self.layers = [None]
-
-            def make_cache(self):
-                return [PoolingCache(ratio=4)]
-
-        result = gen_mod._make_cache(FakeModel(), [0], None)
-        assert len(result) == 1
-        assert isinstance(result[0], BatchPoolingCache)
+        merged = PoolingCache.merge([PoolingCache(ratio=4)])
+        assert isinstance(merged, BatchPoolingCache)
 
 
 class TestTokenizerPatch:

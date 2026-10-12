@@ -1370,7 +1370,9 @@ class TestArraysCacheLastBlockOnly:
         assert len(reconstructed) == 1
         layer_cache = reconstructed[0]
         if hasattr(layer_cache, "state"):
-            reconstructed_keys, reconstructed_values = layer_cache.state
+            from omlx.cache.state_compat import legacy_state
+
+            reconstructed_keys, reconstructed_values = legacy_state(layer_cache)
         elif isinstance(layer_cache, (list, tuple)) and len(layer_cache) == 2:
             reconstructed_keys, reconstructed_values = layer_cache
         else:
