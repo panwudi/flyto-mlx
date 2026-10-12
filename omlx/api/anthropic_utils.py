@@ -18,6 +18,7 @@ from .anthropic_models import (
     AnthropicUsage,
     ContentBlockText,
     ContentBlockThinking,
+    ContentBlockToolResult,
     ContentBlockToolUse,
     MessagesRequest,
     MessagesResponse,
@@ -162,6 +163,9 @@ def convert_anthropic_to_internal(
     # place and become user notes below, so the prompt head stays stable.
     system_text, normalized_messages = _normalize_in_messages_system(
         request, leading_only=True
+    )
+    normalized_messages = _expand_tool_references(
+        normalized_messages, getattr(request, "tools", None)
     )
     if system_text:
         processed_messages.append({"role": "system", "content": system_text})
@@ -399,6 +403,9 @@ def convert_anthropic_to_internal_harmony(
     # with the canonical request.system field (claude-code 2.1.154+ sends
     # system content inline instead of using the separate field).
     system_text, normalized_messages = _normalize_in_messages_system(request)
+    normalized_messages = _expand_tool_references(
+        normalized_messages, getattr(request, "tools", None)
+    )
     if system_text:
         processed_messages.append({"role": "system", "content": system_text})
 
@@ -796,8 +803,139 @@ def _is_server_side_tool(tool_dict: dict[str, Any]) -> bool:
     return tool_type.startswith(SERVER_SIDE_TOOL_TYPE_PREFIXES)
 
 
+def _is_deferred_tool(tool_dict: dict[str, Any]) -> bool:
+    """Return True if the tool is marked ``defer_loading`` (tool search).
+
+    Deferred tools are callable but must not be rendered into the prompt's
+    tool list: their definitions reach the model inline, where a
+    ``tool_reference`` block in a tool result names them.
+    """
+    return tool_dict.get("defer_loading") is True
+
+
+def _tool_dict(tool: Any) -> dict[str, Any] | None:
+    if hasattr(tool, "model_dump"):
+        return tool.model_dump()
+    if isinstance(tool, dict):
+        return tool
+    return None
+
+
+def _render_tool_reference_definitions(
+    names: list[str], tools_by_name: dict[str, dict[str, Any]]
+) -> str:
+    """Render referenced tools the way Claude Code's ToolSearch describes.
+
+    Its tool description promises one ``<function>{json}</function>`` line
+    per matched tool inside a ``<functions>`` block, so the model is told to
+    expect exactly this shape.
+    """
+    lines = ["<functions>"]
+    for name in names:
+        tool = tools_by_name.get(name)
+        if tool is None:
+            lines.append(
+                f"Tool {name} was referenced but its definition is not in this request."
+            )
+            continue
+        definition = {
+            "description": tool.get("description") or "",
+            "name": name,
+            "parameters": tool.get("input_schema") or {},
+        }
+        lines.append(
+            "<function>" + json.dumps(definition, ensure_ascii=False) + "</function>"
+        )
+    lines.append("</functions>")
+    return "\n".join(lines)
+
+
+def _expand_tool_result_references(
+    content: list[Any], tools_by_name: dict[str, dict[str, Any]]
+) -> list[Any]:
+    """Replace each run of tool_reference items with one rendered text item."""
+    expanded: list[Any] = []
+    pending: list[str] = []
+
+    def flush() -> None:
+        if pending:
+            expanded.append({
+                "type": "text",
+                "text": _render_tool_reference_definitions(pending, tools_by_name),
+            })
+            pending.clear()
+
+    for item in content:
+        if isinstance(item, dict) and item.get("type") == "tool_reference":
+            pending.append(str(item.get("tool_name", "")))
+            continue
+        flush()
+        expanded.append(item)
+    flush()
+    return expanded
+
+
+def _expand_tool_references(
+    messages: list[AnthropicMessage],
+    tools: list[AnthropicTool] | None,
+) -> list[AnthropicMessage]:
+    """Inline the definitions that ``tool_reference`` blocks point to.
+
+    With tool search (Claude Code ``ENABLE_TOOL_SEARCH``), the client sends
+    rarely used tools with ``defer_loading: true`` and loads one by returning
+    a ``tool_reference`` block from its ToolSearch tool. The Anthropic API
+    expands that block into the tool's definition at that point of the
+    conversation. Doing the same here keeps the prompt head (system + tool
+    list) unchanged when a tool is loaded, so the prefix cache stays valid.
+    """
+    tools_by_name: dict[str, dict[str, Any]] = {}
+    for tool in tools or []:
+        tool_dict = _tool_dict(tool)
+        if tool_dict and tool_dict.get("name"):
+            tools_by_name[tool_dict["name"]] = tool_dict
+
+    result: list[AnthropicMessage] = []
+    for msg in messages:
+        if not isinstance(msg.content, list):
+            result.append(msg)
+            continue
+        changed = False
+        new_content: list[Any] = []
+        for block in msg.content:
+            block_dict = _content_block_to_dict(block)
+            inner = block_dict.get("content") if block_dict else None
+            if (
+                block_dict is not None
+                and block_dict.get("type") == "tool_result"
+                and isinstance(inner, list)
+                and any(
+                    isinstance(item, dict) and item.get("type") == "tool_reference"
+                    for item in inner
+                )
+            ):
+                new_content.append(
+                    ContentBlockToolResult(
+                        **{
+                            **block_dict,
+                            "content": _expand_tool_result_references(
+                                inner, tools_by_name
+                            ),
+                        }
+                    )
+                )
+                changed = True
+            else:
+                new_content.append(block)
+        result.append(
+            msg.model_copy(update={"content": new_content}) if changed else msg
+        )
+    return result
+
+
 def convert_anthropic_tools_to_internal(
     tools: list[AnthropicTool] | None,
+    include_deferred: bool = True,
+    only_deferred: bool = False,
 ) -> list[dict[str, Any]] | None:
     """
     Convert Anthropic tools to internal/OpenAI format.
@@ -810,6 +948,10 @@ def convert_anthropic_tools_to_internal(
 
     Args:
         tools: List of Anthropic tool definitions
+        include_deferred: If False, skip ``defer_loading`` tools (the list
+            rendered into the chat template).
+        only_deferred: If True, return only ``defer_loading`` tools (added to
+            the tool-call parser's list so loaded tools stay callable).
 
     Returns:
         List of internal tool definitions, or None if no executable tools
@@ -821,16 +963,16 @@ def convert_anthropic_tools_to_internal(
     dropped: list[str] = []
 
     for tool in tools:
-        # Handle both Pydantic models and dicts
-        if hasattr(tool, "model_dump"):
-            tool_dict = tool.model_dump()
-        elif isinstance(tool, dict):
-            tool_dict = tool
-        else:
+        tool_dict = _tool_dict(tool)
+        if tool_dict is None:
             continue
 
         if _is_server_side_tool(tool_dict):
             dropped.append(f"{tool_dict.get('type')}:{tool_dict.get('name', '')}")
+            continue
+
+        deferred = _is_deferred_tool(tool_dict)
+        if (deferred and not include_deferred) or (only_deferred and not deferred):
             continue
 
         internal_tools.append(
