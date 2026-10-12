@@ -2322,3 +2322,32 @@ class TestTokenBufferSeedOnCacheHit:
         call_kwargs = scheduler.batch_generator.insert.call_args.kwargs
         assert "all_tokens" in call_kwargs
         assert call_kwargs["all_tokens"] == [[]]
+
+
+def test_step_keeps_refused_prefill_output_when_decode_runs(mock_model, mock_tokenizer):
+    """A refused prefill's error output must survive a decode step.
+
+    step() used to assign the decode outputs over the list that already
+    held this step's rejections, so a request refused by the memory gate
+    while another one was decoding never got its error output: its client
+    waited forever and its collector counted as active (m5max, 2026-10-13).
+    """
+    scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+    refused = RequestOutput(
+        request_id="refused", finished=True, finish_reason="error",
+        error="Prefill refused before forward",
+    )
+    decoded = RequestOutput(request_id="decoding", new_text="x")
+
+    scheduler._schedule_waiting = lambda: ([], [refused])
+    scheduler.batch_generator = MagicMock()
+    scheduler.batch_generator.next_generated.return_value = [object()]
+    scheduler.running = {"decoding": MagicMock()}
+    scheduler._process_batch_responses = lambda responses: ([decoded], [])
+    scheduler._cleanup_finished = lambda finished_ids: None
+
+    output = scheduler.step()
+
+    ids = [o.request_id for o in output.outputs]
+    assert "refused" in ids
+    assert "decoding" in ids

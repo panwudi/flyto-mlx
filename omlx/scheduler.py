@@ -6187,7 +6187,10 @@ class Scheduler:
 
                 if responses:
                     outputs, finished_ids = self._process_batch_responses(responses)
-                    output.outputs = outputs
+                    # extend, not assign: outputs may already hold this
+                    # step's rejections (refused prefills), whose error
+                    # output is the only thing that ends their streams.
+                    output.outputs.extend(outputs)
                     output.finished_request_ids = finished_ids
                     self._cleanup_finished(finished_ids)
 
