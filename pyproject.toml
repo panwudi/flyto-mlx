@@ -82,7 +82,10 @@ dependencies = [
     # mlx-vlm 0.7 rewrote the speculative-decode API; moving to it needs the
     # Qwen3.5/3.6 VLM MTP integration ported first. MLX 0.32 compatibility
     # for this pin comes from omlx/patches/mlx_vlm_mlx0322_compat.py.
-    "mlx-vlm>=0.6.2",
+    # Published metadata pins 0.6.3 (the release production ran before this
+    # pin): 0.6.4 rewrote the caches, RoPE handling and the diffusion
+    # generation path and has not been verified with oMLX.
+    "mlx-vlm==0.6.3",
     "Pillow>=9.0.0",
     # PyPI spec for publish; dev pinned to commit 20d68db (bstnxbt repo: Gemma4
     # support, runtime package refactor, stable prefix snapshot reuse) via
