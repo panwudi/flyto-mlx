@@ -98,6 +98,15 @@ def test_multi_output_compile_survives_thread_exit_after_clear():
     SIGSEGV. The clear must make the same sequence exit cleanly. Runs in a
     subprocess because the failure mode kills the interpreter.
     """
+    if cc.thread_exit_is_safe():
+        # MLX >= 0.32.2 fixed the destructor: the unprotected sequence must
+        # now exit cleanly on its own, which is what lets close() drop the
+        # workaround.
+        unfixed = _run_thread_exit_script("noclear")
+        assert unfixed.returncode == 0, unfixed.stderr[-2000:]
+        assert "survived" in unfixed.stdout
+        return
+
     if not cc.compile_cache_clear_available():
         import pytest
 

@@ -40,12 +40,22 @@ from typing import Any, Callable, Generator, List, Optional, Set, Union
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_vlm.speculative import load_drafter as _vlm_load_drafter
+from ..patches.mlx_vlm_mlx0322_compat import apply_mlx_vlm_mlx0322_compat_patch
+
+# Install the MLX 0.32 source hook before importing mlx_vlm.speculative:
+# importing that package eagerly loads speculative.common, whose RNG-state
+# restore needs the in-place update MLX 0.32.2 requires.
+apply_mlx_vlm_mlx0322_compat_patch()
+
+from mlx_vlm.speculative import load_drafter as _vlm_load_drafter  # noqa: E402
 
 # PR #1169 (f96138e) moved the MTP round loop helpers from ``mlx_vlm.generate``
 # into ``mlx_vlm.speculative.utils``. Import directly from the new location —
 # the symbols are still ``_``-prefixed but this is now their canonical home.
-from mlx_vlm.speculative.utils import _mtp_rounds, _mtp_rounds_batch  # noqa: SLF001
+from mlx_vlm.speculative.utils import (  # noqa: E402, SLF001
+    _mtp_rounds,
+    _mtp_rounds_batch,
+)
 
 logger = logging.getLogger(__name__)
 

@@ -13,6 +13,17 @@ def test_diffusion_embedding_dequantize_passes_quantization_mode(monkeypatch):
 
     monkeypatch.setattr(mlx_vlm_diffusion, "_APPLIED", False)
 
+    if not hasattr(diffusion_mod, "_diffusion_soft_embedding_weight"):
+        # mlx-vlm >= 0.7 builds the soft embedding with quantized_matmul and
+        # passes the embedding's quantization mode itself; nothing to patch.
+        import inspect
+
+        from mlx_vlm.models.diffusion_gemma import language
+
+        assert mlx_vlm_diffusion.apply_mlx_vlm_diffusion_patch() is False
+        assert 'mode=getattr(self.embed_tokens, "mode"' in inspect.getsource(language)
+        return
+
     captured = {}
 
     def fake_dequantize(weight, scales, biases, **kwargs):
