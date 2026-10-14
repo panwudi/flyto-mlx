@@ -278,6 +278,17 @@ class BatchedEngine(BaseEngine):
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 logger.info(f"TurboQuant KV cache enabled: {tq_bits} bits")
 
+        # head_dim=256 long-context prefill (Qwen3.5/3.6/3.8) -> MLX's fused
+        # SDPA kernel. Installed after TurboQuant so quantized caches keep
+        # their own path. Strictly shape-gated; everything else passes
+        # through unchanged (upstream sdpa256_attention).
+        try:
+            from ..patches.sdpa256_attention import apply_sdpa256_attention_patch
+
+            apply_sdpa256_attention_patch()
+        except Exception:
+            logger.debug("sdpa256 attention patch not applied", exc_info=True)
+
         # Create engine config (copy to avoid mutating the shared instance)
         scheduler_config = (
             copy.copy(self._scheduler_config)

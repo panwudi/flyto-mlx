@@ -96,7 +96,11 @@ dependencies = [
     # xgrammar 0.2.x dropped torch (~24MB total: xgrammar + apache-tvm-ffi),
     # so structured output works out of the box — no silent prompt-only
     # degrade when the extra was simply never installed.
-    "xgrammar>=0.1.32",
+    # Pinned exactly: 0.2.8 rejects wrong-type values for optional typed
+    # properties under additionalProperties (xgrammar #595) and turns inputs
+    # that used to segfault the process into exceptions (#869). Unpinned,
+    # a venv rebuild could land on any 0.2.x.
+    "xgrammar==0.2.8",
 ]
 
 [project.optional-dependencies]

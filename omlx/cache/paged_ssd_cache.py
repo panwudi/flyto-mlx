@@ -203,28 +203,38 @@ _ST_DTYPE_TO_NP = {
 
 
 def _extract_tensor_bytes(arr: mx.array) -> tuple[bytes, str, list[int]]:
-    """Extract raw bytes from an evaluated mx.array.
+    """Extract raw bytes from an mx.array.
 
-    Caller MUST ensure ``arr`` is already mx.eval'd before calling. This
-    function does NOT call mx.eval — it only reads the materialized buffer
-    via the Python buffer protocol. That keeps the call cross-thread safe
-    when the source array was evaluated on the inference thread.
+    Runs on the omlx-store-cache worker thread. MLX streams are thread-local
+    (each engine's generation stream comes from mx.new_thread_local_stream on
+    the inference thread), so a source op still lazy on that stream cannot be
+    materialized here: the worker has no such stream index ("There is no
+    Stream(gpu, N) in current thread" -> SIGABRT). The scheduler therefore
+    does a FULL mx.eval of every KV array on the inference thread before
+    submitting the store (_cleanup_finished, and _eval_snapshot_cache for
+    in-memory boundary snapshots).
 
-    For bfloat16 arrays, uses view(uint16) since the buffer protocol does
-    not support bfloat16 directly. The view shares the source buffer; no
-    Metal command is issued by view() alone, and bytes(memoryview(view))
-    on an already-materialized source returns the raw bf16 bits unchanged.
+    With concrete sources, the slices, clones and placeholders that
+    store_cache creates on this thread bind to the default stream, and are
+    materialized explicitly here so the buffer-protocol read below never
+    triggers an implicit eval. bfloat16 goes through view(uint16), since
+    the buffer protocol has no bfloat16; the view is evaluated too.
+    Callers hold _mx_buffer_access_lock, so mx.clear_cache on the inference
+    thread cannot reclaim the buffer mid-read.
 
     Args:
-        arr: Evaluated MLX array (caller's responsibility).
+        arr: MLX array to serialize.
 
     Returns:
         Tuple of (raw_bytes, safetensors_dtype_string, shape_list).
     """
+    mx.eval(arr)
     dtype_str = _MX_TO_ST_DTYPE[arr.dtype]
     shape = list(arr.shape)
     if arr.dtype == mx.bfloat16:
-        raw = bytes(memoryview(arr.view(mx.uint16)))
+        u16 = arr.view(mx.uint16)
+        mx.eval(u16)
+        raw = bytes(memoryview(u16))
     else:
         raw = bytes(memoryview(arr))
     return raw, dtype_str, shape
@@ -1279,20 +1289,13 @@ class PagedSSDCacheManager(CacheManager):
             # Merge CacheList sub_count metadata
             metadata.update(cache_list_meta)
 
-            # Caller (scheduler._cleanup_finished, async store-cache path)
-            # dispatches real KV arrays via mx.async_eval on the inference
-            # thread's generation_stream before submitting to the
-            # omlx-store-cache executor. The worker then waits on that same
-            # stream via mx.synchronize(generation_stream) (see
-            # _async_store_cache_worker) before reaching this code path,
-            # so the arrays are fully materialized by the time
-            # _extract_tensor_bytes hits the buffer protocol. The tiny
-            # mx.zeros((1,)) placeholders allocated above are lazy nodes
-            # whose buffer materialization happens implicitly via the buffer
-            # protocol. Skipping any explicit mx.eval here keeps save_block
-            # off the Metal command-submission path when invoked from a
-            # non-inference thread, which is the source of the cross-thread
-            # race tracked in #978/#1040/#1106/#1437.
+            # Cross-thread contract: the scheduler fully mx.eval's every real
+            # KV array on the inference thread before submitting the store,
+            # so the slices and placeholders built above have concrete
+            # inputs (or none) and bind to this thread's default stream.
+            # _extract_tensor_bytes evaluates each one explicitly before the
+            # buffer-protocol read. Race history: #978/#1040/#1106/#1437,
+            # upstream 74d71687 / eed2576a.
             tensors_raw = {}
             for name, arr in arrays.items():
                 tensors_raw[name] = _extract_tensor_bytes(arr)

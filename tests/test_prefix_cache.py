@@ -637,10 +637,39 @@ class TestArraysCacheLastBlockOnly:
             paged_cache_manager=paged_cache,
         )
 
-    def test_extract_block_arrays_cache_last_block_stores_full_state(
+    def test_extract_block_arrays_cache_last_block_stores_verified_live_state(
         self, prefix_cache, mx
     ):
-        """Last block should store the full ArraysCache state."""
+        """Last block stores live ArraysCache state when the caller verified
+        the live state sits exactly at the block end."""
+        conv_state = mx.ones((1, 3, 64))
+        ssm_state = mx.ones((1, 32, 128, 128))
+        cache_data = [
+            {
+                "state": (conv_state, ssm_state),
+                "cache_type": "ArraysCache",
+                "class_name": "ArraysCache",
+            },
+        ]
+
+        result = prefix_cache._extract_block_tensor_slice(
+            cache_data, 0, 4, model_cache_config=None, is_last_block=True,
+            live_state_at_true_end=True,
+        )
+
+        assert result is not None
+        assert len(result) == 1
+        keys, values = result[0]
+        # Should be full state, not placeholder
+        assert keys.shape == (1, 3, 64)
+        assert values.shape == (1, 32, 128, 128)
+
+    def test_extract_block_arrays_cache_last_block_without_snapshot_is_placeholder(
+        self, prefix_cache, mx
+    ):
+        """is_last_block alone does not justify storing live ArraysCache
+        state: the live state may have ingested tokens past this block
+        (upstream 8986da14)."""
         conv_state = mx.ones((1, 3, 64))
         ssm_state = mx.ones((1, 32, 128, 128))
         cache_data = [
@@ -655,12 +684,33 @@ class TestArraysCacheLastBlockOnly:
             cache_data, 0, 4, model_cache_config=None, is_last_block=True,
         )
 
-        assert result is not None
-        assert len(result) == 1
         keys, values = result[0]
-        # Should be full state, not placeholder
+        assert keys.shape == (1,)
+        assert values.shape == (1,)
+
+    def test_extract_block_arrays_cache_last_block_prefers_snapshot(
+        self, prefix_cache, mx
+    ):
+        """With a boundary snapshot the last block stores the snapshot,
+        never the live state."""
+        cache_data = [
+            {
+                "state": (mx.ones((1, 3, 64)), mx.ones((1, 32, 128, 128))),
+                "cache_type": "ArraysCache",
+                "class_name": "ArraysCache",
+            },
+        ]
+        snap_conv = mx.zeros((1, 3, 64))
+        snapshot = [{"state": (snap_conv, mx.zeros((1, 32, 128, 128)))}]
+
+        result = prefix_cache._extract_block_tensor_slice(
+            cache_data, 0, 4, model_cache_config=None, is_last_block=True,
+            snapshot_cache_data=snapshot,
+        )
+
+        keys, _ = result[0]
         assert keys.shape == (1, 3, 64)
-        assert values.shape == (1, 32, 128, 128)
+        assert bool((keys == snap_conv).all().item())
 
     def test_extract_block_arrays_cache_non_last_block_stores_placeholder(
         self, prefix_cache, mx
@@ -726,9 +776,10 @@ class TestArraysCacheLastBlockOnly:
         # ArraysCache layer should be placeholder
         assert result[1][0].shape == (1,)
 
-        # Last block
+        # Last block, live state verified at the block end
         result = prefix_cache._extract_block_tensor_slice(
             cache_data, 4, 8, model_cache_config=config, is_last_block=True,
+            live_state_at_true_end=True,
         )
         assert result is not None
         assert len(result) == 2
@@ -736,6 +787,13 @@ class TestArraysCacheLastBlockOnly:
         assert result[0][0].shape[2] == 4
         # ArraysCache layer should have full state
         assert result[1][0].shape == (1, 3, 64)
+
+        # Last block without that guarantee: placeholder
+        result = prefix_cache._extract_block_tensor_slice(
+            cache_data, 4, 8, model_cache_config=config, is_last_block=True,
+        )
+        assert result[0][0].shape[2] == 4
+        assert result[1][0].shape == (1,)
 
     def test_reconstruct_arrays_cache_partial_match_returns_none(
         self, prefix_cache, mx
@@ -900,8 +958,14 @@ class TestArraysCacheLastBlockOnly:
         assert stats.last_partial_tokens_skipped == 2
         assert stats.last_tokens_to_next_block == 2
 
-    def test_store_cache_arrayscache_partial_trailing_uses_last_full_block_state(self, mx):
-        """ArraysCache with trailing partial tokens stores only full blocks safely."""
+    def test_store_cache_arrayscache_partial_trailing_stores_placeholder(self, mx):
+        """7 tokens / block_size 4 stores one full block and skips 3 trailing
+        tokens, but the ArraysCache state passed in is the live state after
+        all 7. Storing it as the block's boundary would make a restore feed
+        tokens 4-6 into a state that has already seen them. Without a
+        snapshot the block must hold a placeholder, even when the caller
+        claims live_state_at_end (that claim is about len(tokens), which is
+        past the last stored block)."""
         from omlx.cache.hybrid_cache import ModelCacheConfig
 
         block_size = 4
@@ -941,6 +1005,7 @@ class TestArraysCacheLastBlockOnly:
             tokens,
             cache_data,
             model_cache_config=model_cache_config,
+            live_state_at_end=True,
         )
 
         assert result is not None
@@ -950,8 +1015,60 @@ class TestArraysCacheLastBlockOnly:
 
         saved_data = mock_ssd.save_block.call_args.kwargs["cache_data"]
         saved_conv_state, saved_ssm_state = saved_data[0]
-        assert saved_conv_state.shape == conv_state.shape
-        assert saved_ssm_state.shape == ssm_state.shape
+        assert saved_conv_state.shape == (1,)
+        assert saved_ssm_state.shape == (1,)
+
+    @pytest.mark.parametrize(
+        "live_state_at_end, expect_live", [(True, True), (False, False)]
+    )
+    def test_store_cache_arrayscache_exact_multiple_needs_verified_live_state(
+        self, mx, live_state_at_end, expect_live
+    ):
+        """8 tokens / block_size 4: nothing is skipped, but the live state
+        can still sit past len(tokens) (a reasoning request stores only the
+        prompt while the state has ingested the output). Only the caller
+        knows, so the live state is stored only on its say-so."""
+        from omlx.cache.hybrid_cache import ModelCacheConfig
+
+        paged_cache = PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        mock_ssd = MagicMock()
+        mock_ssd.save_block.return_value = True
+        cache = BlockAwarePrefixCache(
+            model=MockModel(num_layers=1),
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+        conv_state = mx.ones((1, 3, 64))
+        ssm_state = mx.ones((1, 32, 128, 128))
+        cache_data = [
+            {
+                "state": (conv_state, ssm_state),
+                "cache_type": "ArraysCache",
+                "class_name": "ArraysCache",
+            }
+        ]
+
+        result = cache.store_cache(
+            "req-001",
+            list(range(8)),
+            cache_data,
+            model_cache_config=ModelCacheConfig.from_type_list(
+                ["ArraysCache"], model_name="test-model"
+            ),
+            live_state_at_end=live_state_at_end,
+        )
+
+        assert len(result.block_ids) == 2
+        last_saved = mock_ssd.save_block.call_args_list[-1].kwargs["cache_data"]
+        first_saved = mock_ssd.save_block.call_args_list[0].kwargs["cache_data"]
+        assert first_saved[0][0].shape == (1,)
+        expected = conv_state.shape if expect_live else (1,)
+        assert last_saved[0][0].shape == expected
 
     def test_store_cache_all_partial_creates_no_blocks(self, mx):
         """Tokens fewer than block_size should create no blocks."""

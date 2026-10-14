@@ -384,7 +384,8 @@ class TestPrefixCacheNTupleSubState:
         ]
 
         block_slices = prefix_cache._extract_block_tensor_slice(
-            cache_data, start_idx=0, end_idx=16, is_last_block=True
+            cache_data, start_idx=0, end_idx=16, is_last_block=True,
+            live_state_at_true_end=True,
         )
         assert block_slices is not None
         assert len(block_slices) == 1

@@ -107,9 +107,12 @@ class TestValidateContextWindow:
         with patch("omlx.server._server_state", state):
             with pytest.raises(HTTPException) as exc_info:
                 validate_context_window(1001)
+            # Overflow markers that clients match before compacting.
+            detail = exc_info.value.detail.lower()
             assert exc_info.value.status_code == 400
-            assert "1001 tokens" in exc_info.value.detail
-            assert "1000 tokens" in exc_info.value.detail
+            assert exc_info.value.code == "context_length_exceeded"
+            assert "prompt is too long: 1001 tokens > 1000" in detail
+            assert "maximum context length" in detail
 
     def test_raises_with_model_specific_limit(self):
         """Test uses model-specific limit when available."""
@@ -126,8 +129,7 @@ class TestValidateContextWindow:
             with pytest.raises(HTTPException) as exc_info:
                 validate_context_window(200, "test-model")
             assert exc_info.value.status_code == 400
-            assert "200 tokens" in exc_info.value.detail
-            assert "100 tokens" in exc_info.value.detail
+            assert "200 tokens > 100" in exc_info.value.detail
 
 
 class TestCountChatTokens:
@@ -176,3 +178,45 @@ class TestCountChatTokens:
         count = engine.count_chat_tokens(messages, tools)
 
         assert count == 7
+
+
+class TestContextOverflowResponse:
+    """The 400 body must be one Claude Code recognizes as an overflow.
+
+    Claude Code 2.1.296 lowercases the error message and checks
+    ``includes("prompt is too long")``, then reads the gap with
+    ``/prompt is too long[^0-9]*(\\d+)\\s*tokens?\\s*>\\s*(\\d+)/i``. Any
+    other wording is treated as a plain 400: no auto-compact, and the
+    session stays stuck over the limit.
+    """
+
+    @pytest.mark.asyncio
+    async def test_messages_route_body_matches_claude_code(self):
+        import json
+        import re
+        from unittest.mock import MagicMock
+
+        from omlx import server
+        from omlx.server import SamplingDefaults, validate_context_window
+
+        state = MagicMock()
+        state.sampling = SamplingDefaults(max_context_window=1000)
+        state.settings_manager = None
+        with patch("omlx.server._server_state", state):
+            with pytest.raises(HTTPException) as exc_info:
+                validate_context_window(1001)
+
+        req = MagicMock()
+        req.url.path = "/v1/messages"
+        req.method = "POST"
+        resp = await server.http_exception_handler(req, exc_info.value)
+        body = json.loads(resp.body)
+
+        assert resp.status_code == 400
+        assert body["error"]["code"] == "context_length_exceeded"
+        message = body["error"]["message"].lower()
+        assert "prompt is too long" in message
+        m = re.search(
+            r"prompt is too long[^0-9]*(\d+)\s*tokens?\s*>\s*(\d+)", message
+        )
+        assert m and m.groups() == ("1001", "1000")

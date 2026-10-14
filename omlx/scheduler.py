@@ -371,6 +371,29 @@ def _patched_generation_batch_step(self):
 GenerationBatch._step = _patched_generation_batch_step
 
 
+# ---------------------------------------------------------------------------
+# Backport of mlx-lm e2f2fb2 (#1772): GenerationBatch.filter at our pin only
+# shrinks ``samplers`` / ``logits_processors`` when some row has an entry.
+# Rows without processors are the common case here ([] per row), so after
+# one finishes the lists keep the removed row. ``extend`` then appends the
+# next request's processors past the end, and that request reads a stale
+# row: its grammar mask, accept_token and penalties are skipped, and a
+# later request can pick up another request's processors.
+# ---------------------------------------------------------------------------
+_original_generation_batch_filter = GenerationBatch.filter
+
+
+def _patched_generation_batch_filter(self, keep):
+    samplers = list(self.samplers)
+    logits_processors = list(self.logits_processors)
+    _original_generation_batch_filter(self, keep)
+    self.samplers = [samplers[idx] for idx in keep]
+    self.logits_processors = [logits_processors[idx] for idx in keep]
+
+
+GenerationBatch.filter = _patched_generation_batch_filter
+
+
 # Monkey-patch TurboQuantKVCache.merge so _merge_caches() works
 try:
     from mlx_vlm.turboquant import TurboQuantKVCache as _TQCache
@@ -678,6 +701,41 @@ class SchedulerOutput:
     outputs: list[RequestOutput] = field(default_factory=list)
     # Whether any work was done
     has_work: bool = False
+
+
+def _freeze_state_containers(obj: Any) -> Any:
+    """Copy the list / tuple / dict structure of an extracted cache state.
+
+    MLX arrays are immutable, but cache objects update their state
+    containers in place (ArraysCache keeps its arrays in a list it writes
+    into), so an extracted state that shares those containers keeps
+    changing as prefill continues.
+    """
+    if isinstance(obj, list):
+        return [_freeze_state_containers(x) for x in obj]
+    if isinstance(obj, tuple):
+        return tuple(_freeze_state_containers(x) for x in obj)
+    if isinstance(obj, dict):
+        return {k: _freeze_state_containers(v) for k, v in obj.items()}
+    return obj
+
+
+class _PreExtractedSnapshot:
+    """A boundary snapshot already extracted (and frozen) at capture time.
+
+    Prefill hands _on_prefill_boundary_snapshot the LIVE prompt-cache
+    objects. The SSD store serializes them immediately, but the in-memory
+    fallback used to keep the objects themselves, and by the time the store
+    read them they held the state of a later boundary: the same
+    "state past the block" corruption 8986da14 fixes for the last block.
+    Scheduler._extract_cache_states passes this through unchanged.
+    """
+
+    __slots__ = ("extracted", "model_cache_config")
+
+    def __init__(self, extracted: list, model_cache_config: Any) -> None:
+        self.extracted = extracted
+        self.model_cache_config = model_cache_config
 
 
 class _BoundarySnapshotProvider:
@@ -1169,24 +1227,19 @@ class Scheduler:
         """Run store_cache + paged_cache cleanup off the inference thread.
 
         Pre-conditions enforced by the caller (_cleanup_finished):
-        - mx.async_eval() was called on the inference thread for all
-          KV cache arrays, dispatching materialization asynchronously
-          without blocking the inference thread. async_eval completes
-          Metal command enqueueing before returning, so all commands
-          are submitted by the time executor.submit() runs.
-        - This worker calls mx.synchronize(self._stream) via the
-          _safe_sync_stream helper to wait on the same stream where
-          mx.async_eval dispatched the arrays. A bare mx.synchronize()
-          with no args only blocks on the default stream (gpu:0) and
-          would leave the dispatched per-engine stream's work
-          unsynchronized, racing the buffer-protocol access below
-          (#1437). Stream objects are not thread-local in MLX (Metal
-          device is a global singleton), so mx.synchronize(stream) is
-          safe cross-thread; it just calls waitUntilCompleted on the
-          command buffer.
-        - bfloat16 view+eval inside _extract_tensor_bytes runs on this
-          worker's default mx stream, isolated from self._stream;
-          the underlying buffer is read-only at this point.
+        - mx.eval() (a FULL, blocking eval, not async_eval) was called on
+          the inference thread for all KV arrays in cache_to_store, and
+          in-memory boundary snapshots were evaluated at capture
+          (_eval_snapshot_cache). This is load-bearing: the engine stream
+          is thread-local (mx.new_thread_local_stream), so a source left
+          lazy on it cannot be materialized on this thread and the slice /
+          bf16 view below would abort the process.
+        - With concrete sources, this worker's own slice and view ops bind
+          to its default stream. The _safe_sync_stream call below is
+          belt-and-suspenders; correctness no longer depends on that
+          cross-thread synchronize, whose "no Stream" error it swallows.
+        - All mx-buffer access here is held under _mx_buffer_access_lock,
+          serializing it against inference-thread mx.clear_cache.
         - batch_generator.remove(uid) is deferred until this worker
           completes (handled by _drain_pending_async_removes).
 
@@ -1212,6 +1265,12 @@ class Scheduler:
                     extra_keys=extra_keys,
                     extra_key_token_start=extra_key_token_start,
                     extra_key_ranges=extra_key_ranges,
+                    # Intermediate snapshots are only passed when
+                    # _get_boundary_store_override merged the boundary
+                    # snapshot taken at len(token_sequence_to_store) into
+                    # cache_to_store. Without it the live state sits at the
+                    # end of prompt + output, past the last stored block.
+                    live_state_at_end=intermediate_snapshots is not None,
                 )
             if block_table is None and self.paged_cache_manager is not None:
                 block_table = self.paged_cache_manager.get_block_table(request_id)
@@ -1247,22 +1306,27 @@ class Scheduler:
                     logger.warning(
                         "Async store_cache for %s raised: %s", request_id, exc
                     )
-            # Run batch_generator.remove on the inference thread.
-            try:
-                _safe_sync_stream(self._stream)
-                self._remove_uid_from_active_batch(uid)
-                if hasattr(self.model, "unregister_rope_delta"):
-                    self.model.unregister_rope_delta(uid)
-            except Exception as e:
-                logger.warning(
-                    "Deferred batch_generator.remove(uid=%s) failed: %s",
-                    uid,
-                    e,
-                )
-            # Cleanup uid maps now that the slot is reclaimable.
-            if uid in self.uid_to_request_id:
+            # fail_all_requests / cache-error recovery drop the batch
+            # generator, and the next one reuses uids from 0. A remove
+            # deferred from before the reset would then evict and unmap the
+            # NEW request on that uid, which never finishes. Touch the uid
+            # only while this request still owns it (upstream 4f5c6ce7).
+            if self.uid_to_request_id.get(uid) == request_id:
+                # Run batch_generator.remove on the inference thread.
+                try:
+                    _safe_sync_stream(self._stream)
+                    self._remove_uid_from_active_batch(uid)
+                    if hasattr(self.model, "unregister_rope_delta"):
+                        self.model.unregister_rope_delta(uid)
+                except Exception as e:
+                    logger.warning(
+                        "Deferred batch_generator.remove(uid=%s) failed: %s",
+                        uid,
+                        e,
+                    )
+                # Cleanup uid maps now that the slot is reclaimable.
                 del self.uid_to_request_id[uid]
-            if request_id in self.request_id_to_uid:
+            if self.request_id_to_uid.get(request_id) == uid:
                 del self.request_id_to_uid[request_id]
             self._inflight_store_futures.pop(request_id, None)
             # Boundary snapshots were kept on disk for the worker; safe to
@@ -2766,13 +2830,23 @@ class Scheduler:
         During external prefill we have direct access to per-layer cache
         objects (not BatchKVCache). Extract non-sliceable layers for
         boundary snapshot storage.
+
+        Pass ``request_id`` directly. The request is mid-prefill and has
+        not been inserted into ``BatchGenerator`` yet, so
+        ``request_id_to_uid`` has no entry for it. The earlier shape
+        routed through ``self.request_id_to_uid.get(request_id, -1)`` →
+        ``uid_to_request_id.get(-1)`` → ``None`` → silent return,
+        dropping every snapshot. For ArraysCache / GDN / hybrid models
+        that made every non-last block store a placeholder, and the
+        next identical-prompt request rejected the cache and re-
+        prefilled from scratch.
         """
         snapshot_cache = [
             c if type(c).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES else None
             for c in prompt_cache
         ]
         self._on_prefill_boundary_snapshot(
-            self.request_id_to_uid.get(request.request_id, -1),
+            request.request_id,
             snapshot_cache,
             total_tokens,
         )
@@ -3198,22 +3272,55 @@ class Scheduler:
             for layer_cache in cache_list
         )
 
+    def _eval_snapshot_cache(self, snapshot_cache: list[Any]) -> None:
+        """Make an in-memory boundary snapshot's leaf tensors concrete.
+
+        Runs on the capturing (inference) thread. The store worker later
+        re-extracts and slices these through _BoundarySnapshotProvider; a
+        leaf still lazy on this thread's thread-local stream would abort the
+        worker (upstream 74d71687).
+        """
+        if not snapshot_cache:
+            return
+        extracted, _ = self._extract_cache_states(snapshot_cache)
+        leaves = self._collect_arrays_from_extracted_cache(extracted)
+        if leaves:
+            with mx.stream(self._stream):
+                mx.eval(*leaves)
+
+    def _freeze_prefill_snapshot(
+        self, snapshot_cache: list[Any]
+    ) -> "_PreExtractedSnapshot":
+        """Extract, freeze and evaluate a prefill snapshot for in-memory use.
+
+        The layers are the live prompt-cache objects that prefill keeps
+        updating, so keep a copy of their state at this boundary instead.
+        Evaluated here because the store worker reads it off-thread.
+        """
+        extracted, config = self._extract_cache_states(snapshot_cache)
+        frozen = _PreExtractedSnapshot(_freeze_state_containers(extracted), config)
+        self._eval_snapshot_cache(frozen)
+        return frozen
+
     def _on_prefill_boundary_snapshot(
         self,
-        uid: int,
+        request_id: str,
         snapshot_cache: list[Any],
         token_count: int,
     ) -> None:
-        """Record boundary snapshots captured during prefill processing."""
+        """Record boundary snapshots captured during prefill processing.
+
+        Called from ``_emit_prefill_boundary_snapshot`` at each block
+        boundary crossed during prefill. Keyed by ``request_id`` rather
+        than ``uid`` because the request has not been inserted into
+        ``BatchGenerator`` yet and the uid mapping does not exist —
+        routing through it dropped every snapshot silently (#TBD).
+        """
         if self.block_aware_cache is None:
             return
 
         block_size = self.config.paged_cache_block_size
         if block_size <= 0 or token_count <= 0 or token_count % block_size != 0:
-            return
-
-        request_id = self.uid_to_request_id.get(uid)
-        if request_id is None:
             return
 
         if not self._cache_list_needs_boundary_snapshot(snapshot_cache):
@@ -3239,9 +3346,13 @@ class Scheduler:
             if saved:
                 self._boundary_cache_snapshots[request_id][token_count] = None
             else:
-                self._boundary_cache_snapshots[request_id][token_count] = snapshot_cache
+                self._boundary_cache_snapshots[request_id][token_count] = (
+                    self._freeze_prefill_snapshot(snapshot_cache)
+                )
         else:
-            self._boundary_cache_snapshots[request_id][token_count] = snapshot_cache
+            self._boundary_cache_snapshots[request_id][token_count] = (
+                self._freeze_prefill_snapshot(snapshot_cache)
+            )
 
         self._boundary_snapshot_required = True
         logger.debug(
@@ -3363,10 +3474,13 @@ class Scheduler:
             if saved:
                 self._boundary_cache_snapshots[request.request_id][total_tokens] = None
             else:
+                # In-memory fallback; see _on_prefill_boundary_snapshot.
+                self._eval_snapshot_cache(snapshot_cache)
                 self._boundary_cache_snapshots[request.request_id][
                     total_tokens
                 ] = snapshot_cache
         else:
+            self._eval_snapshot_cache(snapshot_cache)
             self._boundary_cache_snapshots[request.request_id][
                 total_tokens
             ] = snapshot_cache
@@ -3697,6 +3811,8 @@ class Scheduler:
             - List of dicts with {state, meta_state, class_name, cache_type}
             - ModelCacheConfig with per-layer type information (or None)
         """
+        if isinstance(raw_cache, _PreExtractedSnapshot):
+            return raw_cache.extracted, raw_cache.model_cache_config
         if not raw_cache:
             return [], None
 
@@ -5835,10 +5951,9 @@ class Scheduler:
                             # Inference-thread store_cache prep, timed as
                             # three sub-phases (boundary / collect / dispatch)
                             # mirroring boundary_capture_* granularity.
-                            # async_eval dispatches KV array materialization
-                            # without blocking; the worker calls
-                            # mx.synchronize(self._stream) to wait before
-                            # extracting bytes.
+                            # The collect phase fully evaluates the KV
+                            # arrays on this thread before the worker
+                            # touches them (see the comment there).
                             with mx.stream(self._stream):
                                 with self._phase_timer("store_cache_main_boundary"):
                                     boundary_override = self._get_boundary_store_override(
@@ -5874,7 +5989,19 @@ class Scheduler:
                                         )
                                     )
                                     if pre_eval_arrays:
-                                        mx.async_eval(*pre_eval_arrays)
+                                        # FULL eval, not async_eval. These
+                                        # arrays live on self._stream, a
+                                        # thread-local stream of THIS thread.
+                                        # If they were still lazy when the
+                                        # store worker slices them or views
+                                        # bf16 as uint16, MLX would dispatch
+                                        # the pending op to a stream index
+                                        # the worker does not have -> "no
+                                        # Stream(gpu, N)" -> SIGABRT. Only
+                                        # the GPU completion fence moves
+                                        # here; the host memcpy and disk
+                                        # write stay on the worker.
+                                        mx.eval(*pre_eval_arrays)
 
                             if self._store_cache_executor is not None:
                                 # Gate acquire blocks if too many KV caches
