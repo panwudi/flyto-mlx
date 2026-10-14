@@ -371,6 +371,29 @@ def _patched_generation_batch_step(self):
 GenerationBatch._step = _patched_generation_batch_step
 
 
+# ---------------------------------------------------------------------------
+# Backport of mlx-lm e2f2fb2 (#1772): GenerationBatch.filter at our pin only
+# shrinks ``samplers`` / ``logits_processors`` when some row has an entry.
+# Rows without processors are the common case here ([] per row), so after
+# one finishes the lists keep the removed row. ``extend`` then appends the
+# next request's processors past the end, and that request reads a stale
+# row: its grammar mask, accept_token and penalties are skipped, and a
+# later request can pick up another request's processors.
+# ---------------------------------------------------------------------------
+_original_generation_batch_filter = GenerationBatch.filter
+
+
+def _patched_generation_batch_filter(self, keep):
+    samplers = list(self.samplers)
+    logits_processors = list(self.logits_processors)
+    _original_generation_batch_filter(self, keep)
+    self.samplers = [samplers[idx] for idx in keep]
+    self.logits_processors = [logits_processors[idx] for idx in keep]
+
+
+GenerationBatch.filter = _patched_generation_batch_filter
+
+
 # Monkey-patch TurboQuantKVCache.merge so _merge_caches() works
 try:
     from mlx_vlm.turboquant import TurboQuantKVCache as _TQCache
