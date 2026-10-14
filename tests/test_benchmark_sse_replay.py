@@ -8,7 +8,7 @@ implementation could not provide:
    still sees the entire history.
 2. **Multi-consumer**: two subscribers both see every event in order.
 3. **Terminal close**: the stream closes cleanly after a terminal
-   event (`done` / `upload_done` / `error`) without blocking on a
+   event (`done` / `error`) without blocking on a
    timeout for a subsequent event that will never come.
 
 The reader helper mirrors the loop the SSE endpoint uses in
@@ -93,13 +93,13 @@ class TestBenchmarkSSEReplay:
         run = _bench_run()
         await bench_send_event(run, {"type": "progress", "n": 1})
         await bench_send_event(run, {"type": "progress", "n": 2})
-        await bench_send_event(run, {"type": "upload_done", "data": {}})
+        await bench_send_event(run, {"type": "done", "data": {}})
         # Subscriber connects AFTER all events.
         events = await _drain(run)
         assert events == [
             {"type": "progress", "n": 1},
             {"type": "progress", "n": 2},
-            {"type": "upload_done", "data": {}},
+            {"type": "done", "data": {}},
         ]
 
     @pytest.mark.asyncio
@@ -114,13 +114,13 @@ class TestBenchmarkSSEReplay:
             await asyncio.sleep(0.01)
             await bench_send_event(run, {"type": "progress", "n": 1})
             await bench_send_event(run, {"type": "progress", "n": 2})
-            await bench_send_event(run, {"type": "upload_done", "data": {}})
+            await bench_send_event(run, {"type": "done", "data": {}})
 
         r1, r2, _ = await asyncio.gather(reader(), reader(), producer())
         expected = [
             {"type": "progress", "n": 1},
             {"type": "progress", "n": 2},
-            {"type": "upload_done", "data": {}},
+            {"type": "done", "data": {}},
         ]
         assert r1 == expected
         assert r2 == expected
@@ -129,7 +129,7 @@ class TestBenchmarkSSEReplay:
     async def test_terminal_event_closes_stream_without_extra_wait(self):
         run = _bench_run()
         await bench_send_event(run, {"type": "progress", "n": 1})
-        await bench_send_event(run, {"type": "upload_done", "data": {}})
+        await bench_send_event(run, {"type": "done", "data": {}})
 
         # Should return immediately — no timeout — because the run is
         # already terminal.
@@ -137,7 +137,7 @@ class TestBenchmarkSSEReplay:
         events = await _drain(run, timeout=5.0)
         elapsed = asyncio.get_event_loop().time() - start
 
-        assert events[-1]["type"] == "upload_done"
+        assert events[-1]["type"] == "done"
         assert elapsed < 0.5, "stream blocked after terminal event"
 
     @pytest.mark.asyncio
@@ -158,7 +158,7 @@ class TestBenchmarkSSEReplay:
             # Subscriber will be mid-replay when this fires.
             await asyncio.sleep(0.02)
             await bench_send_event(run, {"type": "progress", "n": 2})
-            await bench_send_event(run, {"type": "upload_done", "data": {}})
+            await bench_send_event(run, {"type": "done", "data": {}})
 
         async def subscriber():
             return await _drain(run)
@@ -168,7 +168,7 @@ class TestBenchmarkSSEReplay:
         assert events == [
             {"type": "progress", "n": 1},
             {"type": "progress", "n": 2},
-            {"type": "upload_done", "data": {}},
+            {"type": "done", "data": {}},
         ]
 
 
