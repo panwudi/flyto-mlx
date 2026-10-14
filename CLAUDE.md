@@ -13,15 +13,16 @@ quantization, grammar-constrained structured output (xgrammar), and an admin UI.
 - CLI main name `fmlx`; `omlx` kept as an alias for upstream-script compat.
 - Renamed from `panwudi/omlx` on 2026-05-16.
 
-### Upstream relationship — soft fork
+### Upstream relationship — independent since 2026-10-14
 
-Upstream is `jundot/omlx` (`upstream` git remote). We **soft-fork**: cherry-pick
-upstream bug fixes and new-model support; we do **not** PR our own features back.
-Sync workflow: `git fetch upstream && git log upstream/main..main`, cherry-pick
-selectively (`-x`), and record every import/skip decision in
-`docs/upstream-sync.md`. To check whether an upstream commit is already in,
-actually `git cherry-pick` it (a "nothing to commit" means it is) — `git cherry`
-and grep both mis-report.
+Flyto MLX split from `jundot/omlx` on 2026-10-14 (owner decision). It no longer
+tracks upstream: there are no scheduled syncs, and upstream's direction, UI and
+features are not a reference for ours. We still share the MLX / mlx-lm / mlx-vlm
+foundation, so upstream PRs and issues stay a useful source: when one fixes a bug
+or supports a model we need, port it by hand as a reviewed change of ours (cite
+the upstream commit/PR in the message), with our own tests. The `upstream` git
+remote is kept for reading. Past imports and skips are recorded in
+`docs/upstream-sync.md`; add an entry there when porting something.
 
 ## Repo layout
 
