@@ -56,7 +56,7 @@
         'reasoning_effort',
         'preserve_thinking',
     ]);
-    const DASHBOARD_MAIN_TABS = new Set(['status', 'settings', 'models', 'logs', 'bench', 'cluster']);
+    const DASHBOARD_MAIN_TABS = new Set(['status', 'settings', 'models', 'logs', 'bench']);
     const DASHBOARD_SETTINGS_TABS = new Set(['global', 'models']);
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
     const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy']);
@@ -70,6 +70,48 @@
 
             // Mobile menu
             mobileMenuOpen: false,
+            notice: { message: '', error: false },
+            _noticeTimer: null,
+            statsError: false,
+            statsLastUpdated: '',
+            recentGenerationTPS: null,
+            _throughputSamples: [],
+
+            notify(message, error = false) {
+                clearTimeout(this._noticeTimer);
+                this.notice = { message, error };
+                this._noticeTimer = setTimeout(() => { this.notice.message = ''; }, error ? 10000 : 5000);
+            },
+
+            async actionRequest(url, options) {
+                this.notify(window.t('shell.working'));
+                try {
+                    const response = await fetch(url, options);
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                    } else if (response.ok) {
+                        this.notify(window.t('shell.action_done'));
+                    } else {
+                        const data = await response.clone().json().catch(() => ({}));
+                        this.notify(typeof data.detail === 'string' ? data.detail : window.t('js.error.save_failed'), true);
+                    }
+                    return response;
+                } catch (error) {
+                    this.notify(window.t('js.error.save_failed'), true);
+                    throw error;
+                }
+            },
+
+            updateRecentThroughput(data) {
+                const sample = { time: data.uptime_seconds || 0, tokens: data.total_completion_tokens || 0, model: this.selectedStatsModel };
+                const last = this._throughputSamples.at(-1);
+                if (last && (sample.model !== last.model || sample.time < last.time || sample.tokens < last.tokens || sample.time - last.time > 60)) this._throughputSamples = [];
+                this._throughputSamples.push(sample);
+                while (this._throughputSamples.length > 2 && this._throughputSamples[1].time < sample.time - 60) this._throughputSamples.shift();
+                const first = this._throughputSamples[0];
+                const seconds = sample.time - first.time;
+                this.recentGenerationTPS = seconds > 0 ? Math.max(0, (sample.tokens - first.tokens) / seconds) : null;
+            },
 
             // Main tab state (Status, Settings, or Logs)
             mainTab: 'status',
@@ -162,10 +204,9 @@
             // Profile / template / preset state
             profiles: [],                // per-model profiles for selectedModel
             templates: [],               // global templates
-            presets: [],                 // curated presets (bundled + remote refresh)
+            presets: [],                 // curated presets (bundled, offline)
             profileFields: { universal: [], model_specific: [] },  // loaded from /api/profile-fields
             profileScope: 'model',       // 'preset' | 'global' | 'model'
-            refreshingPresets: false,
             activeProfileName: null,     // currently-active profile for the form
             profilesDrift: false,        // true if form values differ from active profile
             _applySeq: 0,               // monotonic counter for apply race guard
@@ -235,19 +276,6 @@
                 message: '',
             },
 
-            // Cluster-router management (Cluster tab). Talks to /admin/api/cluster/*.
-            cluster: {
-                config: null,        // masked config being edited (secrets are __SAVED__)
-                exists: false,
-                path: '',
-                status: null,        // {agent, listen, health, error}
-                loading: false,
-                saving: false,
-                saveError: '',
-                saveSuccess: false,
-                controlBusy: '',     // launchctl action currently in flight
-            },
-
             statsScope: 'session',
             selectedStatsModel: '',
             showClearStatsConfirm: false,
@@ -278,13 +306,6 @@
             showHfMirrorModal: false,
             hfMirrorEndpoint: '',
             hfMirrorSaving: false,
-
-            // Update check state
-            updateAvailable: false,
-            latestVersion: null,
-            releaseUrl: null,
-            versionHover: false,
-            _updateCheckTimer: null,
 
             // HF Downloader state
             hfRepoId: '',
@@ -420,10 +441,6 @@
             benchCopied: false,
             benchTip: null,
             benchDeviceInfo: null,
-            benchUploadResults: [],
-            benchUploadDone: null,
-            benchUploading: false,
-            benchUploadSkipped: null,  // { features: [...] } when upload was skipped due to experimental features
             // { bench_id, model_id } when the server reports a running bench
             // that is NOT the one this tab is displaying. Drives the "another
             // bench is running" banner + disables Start so the user doesn't
@@ -504,11 +521,9 @@
                     this.loadModels(),
                     this.loadServerInfo(),
                     this.loadProfileFields(),
-                    this.loadPresets(),
-                    this.checkForUpdate()
+                    this.loadPresets()
                 ]);
 
-                this.startUpdateCheckTimer();
 
                 await this.handleMainTabChange(this.mainTab);
 
@@ -654,10 +669,6 @@
                 if (!DASHBOARD_MAIN_TABS.has(tab)) return;
                 this.mainTab = tab;
                 this.syncTabStateToUrl();
-                if (tab === 'cluster') {
-                    this.loadClusterConfig();
-                    this.loadClusterStatus();
-                }
             },
 
             setSettingsTab(tab) {
@@ -678,134 +689,6 @@
                 if (tab === 'uploader') {
                     if (!this.uploadOqModelsLoaded) this.loadUploadOqModels();
                     this.loadUploadTasks();
-                }
-            },
-
-            // ---- Cluster router management ----
-            defaultClusterConfig() {
-                return {
-                    listen: '0.0.0.0:9000',
-                    router_api_key: '',
-                    poll_interval: 1.5,
-                    affinity_hysteresis: 1.0,
-                    mem_soft_floor: 0.05,
-                    mem_penalty: 10.0,
-                    backends: [],
-                };
-            },
-
-            async loadClusterConfig() {
-                try {
-                    const r = await fetch('/admin/api/cluster/config');
-                    if (r.status === 401) { window.location.href = '/admin'; return; }
-                    const d = await r.json();
-                    this.cluster.exists = !!d.exists;
-                    this.cluster.path = d.path || '';
-                    this.cluster.config = (d.config && Object.keys(d.config).length)
-                        ? d.config
-                        : this.defaultClusterConfig();
-                    if (!Array.isArray(this.cluster.config.backends)) {
-                        this.cluster.config.backends = [];
-                    }
-                } catch (e) {
-                    this.cluster.config = this.defaultClusterConfig();
-                }
-            },
-
-            addClusterBackend() {
-                if (!this.cluster.config) this.cluster.config = this.defaultClusterConfig();
-                this.cluster.config.backends.push({ name: '', base_url: 'http://', api_key: '', weight: 1.0 });
-            },
-
-            removeClusterBackend(i) {
-                if (this.cluster.config && this.cluster.config.backends) {
-                    this.cluster.config.backends.splice(i, 1);
-                }
-            },
-
-            async saveClusterConfig() {
-                this.cluster.saving = true;
-                this.cluster.saveError = '';
-                this.cluster.saveSuccess = false;
-                try {
-                    const r = await fetch('/admin/api/cluster/config', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ config: this.cluster.config }),
-                    });
-                    const d = await r.json().catch(() => ({}));
-                    if (r.ok) {
-                        this.cluster.saveSuccess = true;
-                        setTimeout(() => { this.cluster.saveSuccess = false; }, 3000);
-                        this.loadClusterStatus();
-                    } else {
-                        this.cluster.saveError = d.detail || window.t('cluster.save.failed');
-                    }
-                } catch (e) {
-                    this.cluster.saveError = window.t('cluster.save.failed');
-                } finally {
-                    this.cluster.saving = false;
-                }
-            },
-
-            async loadClusterStatus() {
-                this.cluster.loading = true;
-                try {
-                    const r = await fetch('/admin/api/cluster/status');
-                    if (r.ok) this.cluster.status = await r.json();
-                } catch (e) {
-                    this.cluster.status = null;
-                } finally {
-                    this.cluster.loading = false;
-                }
-            },
-
-            async controlCluster(action) {
-                this.cluster.controlBusy = action;
-                try {
-                    await fetch('/admin/api/cluster/control', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ action }),
-                    });
-                } catch (e) {
-                    // status refresh below reflects reality regardless
-                } finally {
-                    setTimeout(() => {
-                        this.cluster.controlBusy = '';
-                        this.loadClusterStatus();
-                    }, 1500);
-                }
-            },
-
-            clusterBackendRows() {
-                const s = this.cluster.status;
-                if (!s || !s.health || !s.health.backends) return [];
-                return Object.entries(s.health.backends).map(([name, v]) => ({ name, ...v }));
-            },
-
-            async checkForUpdate() {
-                try {
-                    const resp = await fetch('/admin/api/update-check');
-                    if (resp.ok) {
-                        const data = await resp.json();
-                        this.updateAvailable = data.update_available;
-                        this.latestVersion = data.latest_version;
-                        this.releaseUrl = data.release_url;
-                    }
-                } catch (e) {
-                    // Silently ignore - not critical
-                }
-            },
-
-            startUpdateCheckTimer() {
-                this._updateCheckTimer = setInterval(() => this.checkForUpdate(), 3600000);
-            },
-
-            stopUpdateCheckTimer() {
-                if (this._updateCheckTimer) {
-                    clearInterval(this._updateCheckTimer);
-                    this._updateCheckTimer = null;
                 }
             },
 
@@ -1038,7 +921,7 @@
             async deleteSubKey(key) {
                 if (!confirm(window.t('settings.auth.sub_keys_delete_confirm'))) return;
                 try {
-                    const response = await fetch('/admin/api/sub-keys', {
+                    const response = await this.actionRequest('/admin/api/sub-keys', {
                         method: 'DELETE',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ key }),
@@ -1073,19 +956,21 @@
             async reloadModels() {
                 if (this.reloading) return;
                 this.reloading = true;
+                this.notify(window.t('shell.working'));
                 try {
                     const response = await fetch('/admin/api/reload', { method: 'POST' });
                     if (response.ok) {
                         await Promise.all([this.loadModels(), this.loadHFModels()]);
+                        this.notify(window.t('shell.models_refreshed'));
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(data.detail || window.t('js.error.reload_failed'));
+                        this.notify(data.detail || window.t('js.error.reload_failed'), true);
                     }
                 } catch (err) {
                     console.error('Failed to reload models:', err);
-                    alert(window.t('js.error.reload_failed'));
+                    this.notify(window.t('js.error.reload_failed'), true);
                 } finally {
                     this.reloading = false;
                 }
@@ -1093,7 +978,7 @@
 
             async updateModelSetting(modelId, field, value) {
                 try {
-                    const response = await fetch(`/admin/api/models/${encodeURIComponent(modelId)}/settings`, {
+                    const response = await this.actionRequest(`/admin/api/models/${encodeURIComponent(modelId)}/settings`, {
                         method: 'PUT',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ [field]: value }),
@@ -1124,7 +1009,7 @@
                 const model = this.models.find(m => m.id === modelId);
                 if (model) model.is_loading = true;
                 try {
-                    const response = await fetch(`/admin/api/models/${encodeURIComponent(modelId)}/load`, {
+                    const response = await this.actionRequest(`/admin/api/models/${encodeURIComponent(modelId)}/load`, {
                         method: 'POST',
                     });
                     if (response.ok) {
@@ -1145,7 +1030,7 @@
 
             async unloadModel(modelId) {
                 try {
-                    const response = await fetch(`/admin/api/models/${encodeURIComponent(modelId)}/unload`, {
+                    const response = await this.actionRequest(`/admin/api/models/${encodeURIComponent(modelId)}/unload`, {
                         method: 'POST',
                     });
                     if (response.ok) {
@@ -1314,15 +1199,6 @@
             },
 
             async loadPresets() {
-                // Use localStorage cache if present, otherwise fall back to the bundled file.
-                const cached = localStorage.getItem('omlx_preset_cache');
-                if (cached) {
-                    try {
-                        const parsed = JSON.parse(cached);
-                        this.presets = parsed.presets || [];
-                        return;
-                    } catch (e) { /* corrupted, fall through */ }
-                }
                 try {
                     const r = await fetch('/admin/static/omlx_preset.json');
                     if (r.ok) {
@@ -1331,25 +1207,6 @@
                     }
                 } catch (e) {
                     console.error('Failed to load bundled presets:', e);
-                }
-            },
-
-            async refreshPresets() {
-                if (this.refreshingPresets) return;
-                this.refreshingPresets = true;
-                try {
-                    const r = await fetch('/admin/api/presets/refresh', { method: 'POST' });
-                    if (r.ok) {
-                        const data = await r.json();
-                        this.presets = data.presets || [];
-                        localStorage.setItem('omlx_preset_cache', JSON.stringify(data));
-                    } else if (r.status === 401) {
-                        window.location.href = '/admin';
-                    }
-                } catch (e) {
-                    console.error('Preset refresh failed:', e);
-                } finally {
-                    this.refreshingPresets = false;
                 }
             },
 
@@ -1498,7 +1355,7 @@
                     also_save_as_template: false,
                 };
                 try {
-                    const r = await fetch(
+                    const r = await this.actionRequest(
                         `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles`,
                         { method: 'POST', headers: {'Content-Type': 'application/json'},
                           body: JSON.stringify(body) }
@@ -1553,7 +1410,7 @@
                 // Persist active_profile_name to backend before updating UI state
                 const seq = ++this._applySeq;
                 try {
-                    const r = await fetch(
+                    const r = await this.actionRequest(
                         `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles/${encodeURIComponent(profile.name)}/apply`,
                         { method: 'POST' }
                     );
@@ -1564,11 +1421,14 @@
                         // Update the models list so the profile badge reflects the change
                         const m = this.models.find(m => m.id === this.selectedModel.id);
                         if (m) m.settings = { ...m.settings, active_profile_name: profile.name };
+                        this.profileError = '';
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
+                    } else {
+                        this.profileError = window.t('js.error.save_profile_failed');
                     }
                 } catch (e) {
-                    console.error('Failed to apply profile:', e);
+                    this.profileError = window.t('js.error.save_profile_failed');
                 }
             },
             async applyTemplateToForm(template) {
@@ -1587,9 +1447,9 @@
                         settings: template.settings,
                         source_template: template.name,
                     };
-                    
+
                     try {
-                        const r = await fetch(
+                        const r = await this.actionRequest(
                             `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles`,
                             { method: 'POST', headers: {'Content-Type': 'application/json'},
                               body: JSON.stringify(body) }
@@ -1611,7 +1471,7 @@
             async deleteProfile(name) {
                 if (!this.selectedModel) return;
                 try {
-                    const r = await fetch(
+                    const r = await this.actionRequest(
                         `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles/${encodeURIComponent(name)}`,
                         { method: 'DELETE' }
                     );
@@ -1632,7 +1492,7 @@
                 if (!this.selectedModel) return;
                 this.profileError = '';
                 try {
-                    const r = await fetch(
+                    const r = await this.actionRequest(
                         `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles/${encodeURIComponent(name)}`,
                         { method: 'PUT', headers: {'Content-Type':'application/json'},
                           body: JSON.stringify(patch) }
@@ -1673,7 +1533,7 @@
                     settings: this.formValuesForTemplate(),
                 };
                 try {
-                    const r = await fetch('/admin/api/profile-templates', {
+                    const r = await this.actionRequest('/admin/api/profile-templates', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify(body),
@@ -1695,7 +1555,7 @@
             async updateTemplate(name, patch) {
                 this.profileError = '';
                 try {
-                    const r = await fetch(
+                    const r = await this.actionRequest(
                         `/admin/api/profile-templates/${encodeURIComponent(name)}`,
                         { method: 'PUT', headers: {'Content-Type':'application/json'},
                           body: JSON.stringify(patch) }
@@ -1715,7 +1575,7 @@
             },
             async deleteTemplate(name) {
                 try {
-                    const r = await fetch(
+                    const r = await this.actionRequest(
                         `/admin/api/profile-templates/${encodeURIComponent(name)}`,
                         { method: 'DELETE' }
                     );
@@ -2031,6 +1891,7 @@
                         await this.loadModels();
                         const data = await response.json();
                         this.showModelSettingsModal = false;
+                        this.notify(window.t('js.success.settings_saved'));
                         if (data.requires_reload) {
                             if (data.auto_reloaded) {
                                 alert(window.t('js.info.model_settings_auto_reloaded'));
@@ -2324,6 +2185,7 @@
             },
 
             async saveClaudeCodeSettings() {
+                this.notify(window.t('shell.working'));
                 try {
                     const response = await fetch('/admin/api/global-settings', {
                         method: 'POST',
@@ -2337,19 +2199,19 @@
                             claude_code_haiku_model: this.globalSettings.claude_code.haiku_model,
                         }),
                     });
-                    if (!response.ok) {
-                        console.error('Failed to save Claude Code settings');
-                    }
+                    if (!response.ok) throw new Error(window.t('js.error.save_failed'));
+                    this.notify(window.t('js.success.settings_saved'));
                 } catch (err) {
-                    console.error('Failed to save Claude Code settings:', err);
+                    this.notify(window.t('js.error.save_failed'), true);
                 }
             },
 
             _launchCmd(tool) {
-                // cli_prefix is always "omlx" or an app-bundle path with no
-                // spaces, so skip shellQuote to avoid rendering `'omlx' launch ...`
+                // cli_prefix is the CLI name or an app-bundle path with no
+                // spaces, so preserve the command display without extra quoting.
                 // in the dashboard command display.
-                const cli = this.stats.cli_prefix || 'omlx';
+                const prefix = this.stats.cli_prefix || 'fmlx';
+                const cli = prefix === 'omlx' ? 'fmlx' : prefix;
                 return `${cli} launch ${tool}`;
             },
 
@@ -2379,6 +2241,7 @@
             },
 
             async saveIntegrationSettings() {
+                this.notify(window.t('shell.working'));
                 try {
                     const response = await fetch('/admin/api/global-settings', {
                         method: 'POST',
@@ -2392,15 +2255,15 @@
                             integrations_openclaw_tools_profile: this.globalSettings.integrations.openclaw_tools_profile,
                         }),
                     });
-                    if (!response.ok) {
-                        console.error('Failed to save integration settings');
-                    }
+                    if (!response.ok) throw new Error(window.t('js.error.save_failed'));
+                    this.notify(window.t('js.success.settings_saved'));
                 } catch (err) {
-                    console.error('Failed to save integration settings:', err);
+                    this.notify(window.t('js.error.save_failed'), true);
                 }
             },
 
             async saveLanguage(lang) {
+                this.notify(window.t('shell.working'));
                 try {
                     const response = await fetch('/admin/api/global-settings', {
                         method: 'POST',
@@ -2410,10 +2273,10 @@
                     if (response.ok) {
                         location.reload();
                     } else {
-                        console.error('Failed to save language');
+                        this.notify(window.t('js.error.save_failed'), true);
                     }
                 } catch (e) {
-                    console.error('Failed to save language:', e);
+                    this.notify(window.t('js.error.save_failed'), true);
                 }
             },
 
@@ -2428,8 +2291,14 @@
                     if (response.ok) {
                         const data = await response.json();
                         this.stats = { ...this.stats, ...data };
+                        this.updateRecentThroughput(data);
+                        this.statsError = false;
+                        this.statsLastUpdated = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
+                        return;
+                    } else {
+                        this.statsError = true;
                     }
 
                     // Load all-time stats
@@ -2444,53 +2313,59 @@
                         this.alltimeStats = { ...this.alltimeStats, ...alltimeData };
                     }
                 } catch (err) {
-                    console.error('Failed to load stats:', err);
+                    this.statsError = true;
                 }
             },
 
             async clearStats() {
+                this.notify(window.t('shell.working'));
                 try {
-                    await fetch('/admin/api/stats/clear', { method: 'POST' });
+                    const response = await fetch('/admin/api/stats/clear', { method: 'POST' });
+                    if (!response.ok) throw new Error(window.t('js.error.save_failed'));
                     this.showClearStatsConfirm = false;
                     await this.loadStats();
+                    this.notify(window.t('shell.cleared'));
                 } catch (err) {
-                    console.error('Failed to clear stats:', err);
-                    this.showClearStatsConfirm = false;
+                    this.notify(window.t('js.error.save_failed'), true);
                 }
             },
 
             async clearAlltimeStats() {
+                this.notify(window.t('shell.working'));
                 try {
-                    await fetch('/admin/api/stats/clear-alltime', { method: 'POST' });
+                    const response = await fetch('/admin/api/stats/clear-alltime', { method: 'POST' });
+                    if (!response.ok) throw new Error(window.t('js.error.save_failed'));
                     this.showClearAlltimeConfirm = false;
                     await this.loadStats();
+                    this.notify(window.t('shell.cleared'));
                 } catch (err) {
-                    console.error('Failed to clear all-time stats:', err);
-                    this.showClearAlltimeConfirm = false;
+                    this.notify(window.t('js.error.save_failed'), true);
                 }
             },
 
             async clearSsdCache() {
+                this.notify(window.t('shell.working'));
                 try {
-                    const resp = await fetch('/admin/api/ssd-cache/clear', { method: 'POST' });
-                    if (!resp.ok) console.error('SSD cache clear failed:', resp.status);
+                    const response = await fetch('/admin/api/ssd-cache/clear', { method: 'POST' });
+                    if (!response.ok) throw new Error(window.t('js.error.save_failed'));
                     this.showClearSsdCacheConfirm = false;
                     await this.loadStats();
+                    this.notify(window.t('shell.cleared'));
                 } catch (err) {
-                    console.error('Failed to clear SSD cache:', err);
-                    this.showClearSsdCacheConfirm = false;
+                    this.notify(window.t('js.error.save_failed'), true);
                 }
             },
 
             async clearHotCache() {
+                this.notify(window.t('shell.working'));
                 try {
-                    const resp = await fetch('/admin/api/hot-cache/clear', { method: 'POST' });
-                    if (!resp.ok) console.error('Hot cache clear failed:', resp.status);
+                    const response = await fetch('/admin/api/hot-cache/clear', { method: 'POST' });
+                    if (!response.ok) throw new Error(window.t('js.error.save_failed'));
                     this.showClearHotCacheConfirm = false;
                     await this.loadStats();
+                    this.notify(window.t('shell.cleared'));
                 } catch (err) {
-                    console.error('Failed to clear hot cache:', err);
-                    this.showClearHotCacheConfirm = false;
+                    this.notify(window.t('js.error.save_failed'), true);
                 }
             },
 
@@ -2623,14 +2498,20 @@
                 return Math.min(100, (am.model_memory_used / am.model_memory_max) * 100);
             },
 
-            copyToClipboard(text) {
+            async copyToClipboard(text) {
+                let copied = false;
                 if (navigator.clipboard && window.isSecureContext) {
-                    navigator.clipboard.writeText(text).catch(() => {
-                        this._copyFallback(text);
-                    });
+                    try {
+                        await navigator.clipboard.writeText(text);
+                        copied = true;
+                    } catch (error) {
+                        copied = this._copyFallback(text);
+                    }
                 } else {
-                    this._copyFallback(text);
+                    copied = this._copyFallback(text);
                 }
+                this.notify(window.t(copied ? 'login.setup.copied' : 'shell.copy_failed'), !copied);
+                return copied;
             },
 
             _copyFallback(text) {
@@ -2641,11 +2522,12 @@
                 document.body.appendChild(textarea);
                 textarea.select();
                 try {
-                    document.execCommand('copy');
-                } catch (err) {
-                    console.error('Failed to copy:', err);
+                    return document.execCommand('copy');
+                } catch (error) {
+                    return false;
+                } finally {
+                    document.body.removeChild(textarea);
                 }
-                document.body.removeChild(textarea);
             },
 
             async logout() {
@@ -2689,10 +2571,6 @@
                 this.benchBatchResults = [];
                 this.benchError = '';
                 this.benchBenchId = null;
-                this.benchUploadResults = [];
-                this.benchUploadDone = null;
-                this.benchUploading = false;
-                this.benchUploadSkipped = null;
 
                 try {
                     const response = await fetch('/admin/api/bench/start', {
@@ -2768,33 +2646,7 @@
                                 }
                             }
                         } else if (data.type === 'done') {
-                            // Benchmark tests done, uploading starts
-                            this.benchUploading = true;
-                            this.benchProgress = {
-                                phase: 'upload',
-                                message: window.t('js.bench.uploading_community'),
-                                current: 0,
-                                total: 0,
-                            };
-                            this.loadModels();
-                        } else if (data.type === 'upload') {
-                            // Dedupe on replay: upload entries are unique by context_length.
-                            const exists = this.benchUploadResults.some(
-                                r => r.context_length === data.data.context_length
-                            );
-                            if (!exists) {
-                                this.benchUploadResults = [...this.benchUploadResults, data.data];
-                            }
-                        } else if (data.type === 'upload_done') {
-                            this.benchUploadDone = data.data;
-                            this.benchUploading = false;
-                            this.benchRunning = false;
-                            this.benchProgress = null;
-                            es.close();
-                            this.benchEventSource = null;
-                        } else if (data.type === 'upload_skipped') {
-                            this.benchUploadSkipped = { features: data.features || [] };
-                            this.benchUploading = false;
+                            this.notify(window.t('shell.benchmark_done'));
                             this.benchRunning = false;
                             this.benchProgress = null;
                             es.close();
@@ -2828,9 +2680,11 @@
             async cancelBenchmark() {
                 if (!this.benchBenchId) return;
                 try {
-                    await fetch(`/admin/api/bench/${this.benchBenchId}/cancel`, { method: 'POST' });
+                    this.notify(window.t('shell.working'));
+                    const response = await fetch(`/admin/api/bench/${this.benchBenchId}/cancel`, { method: 'POST' });
+                    if (!response.ok) throw new Error(window.t('js.error.save_failed'));
                 } catch (err) {
-                    console.error('Failed to cancel benchmark:', err);
+                    this.notify(window.t('js.error.save_failed'), true);
                 }
                 // SSE handler will update state when error/done event arrives
             },
@@ -2860,7 +2714,7 @@
                 let lines = [];
 
                 lines.push('Flyto MLX - LLM inference, optimized for your Mac');
-                lines.push('https://github.com/jundot/omlx');
+                lines.push('https://github.com/panwudi/flyto-mlx');
                 lines.push(`Benchmark Model: ${this.benchModelId}`);
                 lines.push('='.repeat(80));
 
@@ -3030,9 +2884,6 @@
                 this.benchRunning = true;
                 this.benchSingleResults = [];
                 this.benchBatchResults = [];
-                this.benchUploadResults = [];
-                this.benchUploadDone = null;
-                this.benchUploadSkipped = null;
                 this.benchProgress = null;
                 this.benchError = '';
                 this.connectBenchSSE(other.bench_id);
@@ -3144,7 +2995,7 @@
 
             async removeFromAccQueue(idx) {
                 try {
-                    await fetch(`/admin/api/bench/accuracy/queue/${idx}`, { method: 'DELETE' });
+                    await this.actionRequest(`/admin/api/bench/accuracy/queue/${idx}`, { method: 'DELETE' });
                     await this.loadAccQueueStatus();
                 } catch (err) {
                     console.error('Failed to remove from queue:', err);
@@ -3257,7 +3108,7 @@
 
             async cancelAccuracyBenchmark() {
                 try {
-                    await fetch('/admin/api/bench/accuracy/cancel', { method: 'POST' });
+                    await this.actionRequest('/admin/api/bench/accuracy/cancel', { method: 'POST' });
                 } catch (err) {
                     console.error('Cancel error:', err);
                 }
@@ -3521,7 +3372,7 @@
             },
 
             // True when the kernel iogpu.wired_limit_mb (or Apple default
-            // working set) caps oMLX below its desired static ceiling.
+            // working set) caps Flyto MLX below its desired static ceiling.
             get memoryGuardShowWiredLimitWarning() {
                 const sys = this.globalSettings.system || {};
                 const kernelBytes = sys.iogpu_wired_limit_bytes || 0;
@@ -3814,6 +3665,7 @@
                     if (response.ok) {
                         this.globalSettings.huggingface.endpoint = this.hfMirrorEndpoint;
                         this.showHfMirrorModal = false;
+                        this.notify(window.t('js.success.settings_saved'));
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {
@@ -3821,7 +3673,7 @@
                         alert(Array.isArray(data.detail) ? data.detail.join(', ') : (data.detail || window.t('js.error.save_failed')));
                     }
                 } catch (err) {
-                    console.error('Failed to save HF mirror endpoint:', err);
+                    this.notify(window.t('js.error.save_failed'), true);
                 } finally {
                     this.hfMirrorSaving = false;
                 }
@@ -3921,7 +3773,7 @@
 
             async cancelHFDownload(taskId) {
                 try {
-                    const response = await fetch(`/admin/api/hf/cancel/${taskId}`, {
+                    const response = await this.actionRequest(`/admin/api/hf/cancel/${taskId}`, {
                         method: 'POST',
                     });
                     if (response.ok) {
@@ -3934,7 +3786,7 @@
 
             async retryHFDownload(taskId) {
                 try {
-                    const response = await fetch(`/admin/api/hf/retry/${taskId}`, {
+                    const response = await this.actionRequest(`/admin/api/hf/retry/${taskId}`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ hf_token: this.hfToken || '' }),
@@ -3954,7 +3806,7 @@
 
             async removeHFTask(taskId) {
                 try {
-                    const response = await fetch(`/admin/api/hf/task/${taskId}`, {
+                    const response = await this.actionRequest(`/admin/api/hf/task/${taskId}`, {
                         method: 'DELETE',
                     });
                     if (response.ok) {
@@ -3968,7 +3820,7 @@
             async deleteHFModel(modelName) {
                 this.hfDeleteConfirm = null;
                 try {
-                    const response = await fetch(`/admin/api/hf/models/${encodeURIComponent(modelName)}`, {
+                    const response = await this.actionRequest(`/admin/api/hf/models/${encodeURIComponent(modelName)}`, {
                         method: 'DELETE',
                     });
                     if (response.ok) {
@@ -4086,7 +3938,7 @@
 
             async cancelOQTask(taskId) {
                 try {
-                    await fetch(`/admin/api/oq/cancel/${taskId}`, { method: 'POST' });
+                    await this.actionRequest(`/admin/api/oq/cancel/${taskId}`, { method: 'POST' });
                     await this.loadOQTasks();
                 } catch (err) {
                     console.error('Failed to cancel oQ task:', err);
@@ -4095,7 +3947,7 @@
 
             async removeOQTask(taskId) {
                 try {
-                    await fetch(`/admin/api/oq/task/${taskId}`, { method: 'DELETE' });
+                    await this.actionRequest(`/admin/api/oq/task/${taskId}`, { method: 'DELETE' });
                     await this.loadOQTasks();
                 } catch (err) {
                     console.error('Failed to remove oQ task:', err);
@@ -4319,7 +4171,7 @@
 
             async cancelUploadTask(taskId) {
                 try {
-                    await fetch(`/admin/api/upload/cancel/${taskId}`, { method: 'POST' });
+                    await this.actionRequest(`/admin/api/upload/cancel/${taskId}`, { method: 'POST' });
                     await this.loadUploadTasks();
                 } catch (err) {
                     console.error('Failed to cancel upload task:', err);
@@ -4328,7 +4180,7 @@
 
             async removeUploadTask(taskId) {
                 try {
-                    await fetch(`/admin/api/upload/task/${taskId}`, { method: 'DELETE' });
+                    await this.actionRequest(`/admin/api/upload/task/${taskId}`, { method: 'DELETE' });
                     await this.loadUploadTasks();
                 } catch (err) {
                     console.error('Failed to remove upload task:', err);
@@ -4668,7 +4520,7 @@
 
             async cancelMSDownload(taskId) {
                 try {
-                    const response = await fetch(`/admin/api/ms/cancel/${taskId}`, {
+                    const response = await this.actionRequest(`/admin/api/ms/cancel/${taskId}`, {
                         method: 'POST',
                     });
                     if (response.ok) {
@@ -4681,7 +4533,7 @@
 
             async retryMSDownload(taskId) {
                 try {
-                    const response = await fetch(`/admin/api/ms/retry/${taskId}`, {
+                    const response = await this.actionRequest(`/admin/api/ms/retry/${taskId}`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ ms_token: this.msToken || null }),
@@ -4701,7 +4553,7 @@
 
             async removeMSTask(taskId) {
                 try {
-                    const response = await fetch(`/admin/api/ms/task/${taskId}`, {
+                    const response = await this.actionRequest(`/admin/api/ms/task/${taskId}`, {
                         method: 'DELETE',
                     });
                     if (response.ok) {

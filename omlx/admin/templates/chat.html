@@ -23,43 +23,6 @@
 <script defer src="/admin/static/js/katex-auto-render.min.js"></script>
 
 <style>
-    /* CSS Variables for theming */
-    :root {
-        --bg-primary: #ffffff;
-        --bg-secondary: #f8fafc;
-        --bg-tertiary: #f1f5f9;
-        --text-primary: #0f172a;
-        --text-secondary: #475569;
-        --text-tertiary: #64748b;
-        --text-muted: #94a3b8;
-        --border-faint: #e2e8f0;
-        --border-normal: #cbd5e1;
-        --code-bg: #f3f4f6;
-        --btn-primary: #171717;
-        --btn-primary-hover: #27272a;
-        --btn-primary-text: #ffffff;
-        --text-danger: #ef4444;
-        --bg-danger-hover: rgba(239, 68, 68, 0.1);
-    }
-
-    [data-theme="dark"] {
-        --bg-primary: #1d1d20;
-        --bg-secondary: #252529;
-        --bg-tertiary: #2d2d32;
-        --text-primary: #efefef;
-        --text-secondary: #a1a1aa;
-        --text-tertiary: #71717a;
-        --text-muted: #52525b;
-        --border-faint: #3f3f46;
-        --border-normal: #52525b;
-        --code-bg: #27272a;
-        --btn-primary: #e5e5e5;
-        --btn-primary-hover: #d4d4d4;
-        --btn-primary-text: #18181b;
-        --text-danger: #f87171;
-        --bg-danger-hover: rgba(239, 68, 68, 0.2);
-    }
-
     body {
         background-color: var(--bg-primary) !important;
         color: var(--text-primary) !important;
@@ -88,18 +51,6 @@
     .custom-scrollbar::-webkit-scrollbar-thumb {
         background: var(--border-normal);
         border-radius: 3px;
-    }
-
-    /* Sidebar */
-    .sidebar-width {
-        width: 260px;
-        min-width: 260px;
-    }
-
-    .sidebar-hidden {
-        width: 0 !important;
-        min-width: 0 !important;
-        overflow: hidden;
     }
 
     .sidebar-transition {
@@ -565,7 +516,7 @@
     }
 
     /* Mobile responsive */
-    @media (max-width: 768px) {
+    @media (max-width: 767px) {
         .sidebar-width {
             position: fixed;
             z-index: 50;
@@ -669,11 +620,12 @@
 <script>
     // Apply theme immediately before render to prevent flash
     (function () {
-        const theme = localStorage.getItem('omlx-chat-theme') || 'light';
+        const saved = localStorage.getItem('omlx-chat-theme') || 'light';
+        const theme = saved === 'auto' ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light') : saved;
         document.documentElement.setAttribute('data-theme', theme);
     })();
 </script>
-<div class="chat-shell flex overflow-hidden" x-data="chatApp()" x-init="init()">
+<div class="flyto-chat chat-shell flex overflow-hidden" x-data="chatApp()">
     <!-- API Key Modal -->
     <div class="api-key-modal fixed inset-0 bg-black/50 flex items-center justify-center z-[1000]"
         :class="{ 'hidden': apiKeySet }" x-cloak>
@@ -696,7 +648,7 @@
     <div class="sidebar-overlay" :class="{ 'hidden': !sidebarOpen }" @click="sidebarOpen = false" x-cloak></div>
 
     <!-- Sidebar -->
-    <div class="sidebar-width h-full bg-surface border-r border-line flex flex-col sidebar-transition"
+    <div class="flyto-chat-sidebar sidebar-width h-full bg-surface border-r border-line flex flex-col sidebar-transition"
         :class="{ 'sidebar-hidden': !sidebarOpen }">
         <!-- Sidebar Header -->
         <div class="p-4 border-b border-line flex-shrink-0">
@@ -826,7 +778,7 @@
                     <i data-lucide="chevron-down" class="w-4 h-4"></i>
                 </button>
                 <div x-show="open" @click.away="open = false" x-cloak
-                    class="absolute top-full mt-1 left-1/2 -translate-x-1/2 border border-line rounded-lg shadow-lg py-1 min-w-[360px] max-w-[500px] max-h-60 overflow-y-auto z-50"
+                    class="absolute top-full mt-1 left-1/2 -translate-x-1/2 border border-line rounded-lg shadow-lg py-1 w-[min(360px,calc(100vw-2rem))] max-w-[500px] max-h-60 overflow-y-auto z-50"
                     style="background: var(--bg-primary); border-color: var(--border-faint);">
                     <template x-for="model in availableModels" :key="model.id">
                         <button @click="selectModel(model.id); open = false"

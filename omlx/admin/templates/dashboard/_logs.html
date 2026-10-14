@@ -1,18 +1,18 @@
             <div x-show="mainTab === 'logs'" x-cloak>
-                <div class="animate-fade-in-up">
+                <div>
                     <!-- Header -->
                     <div class="mb-8">
-                        <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('logs.section_label') }}</h2>
-                        <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('logs.heading') }}</h3>
-                        <p class="text-sm text-neutral-500 mt-2">{{ t('logs.description') }}</p>
+                        <h2 class="text-xs font-bold text-fg-tertiary mb-2">{{ t('logs.section_label') }}</h2>
+                        <h1 class="text-2xl font-bold tracking-tight text-fg">{{ t('logs.heading') }}</h1>
+                        <p class="text-sm text-fg-tertiary mt-2">{{ t('logs.description') }}</p>
                     </div>
 
                     <!-- Controls -->
-                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-4">
-                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                    <div class="bg-surface rounded-2xl border border-line overflow-hidden mb-4">
+                        <div class="flex items-center justify-between px-6 py-4 bg-surface-muted border-b border-line">
                             <div class="flex items-center gap-3">
-                                <i data-lucide="terminal" class="w-4 h-4 text-neutral-500"></i>
-                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('logs.viewer_label') }}</span>
+                                <i data-lucide="terminal" class="w-4 h-4 text-fg-tertiary"></i>
+                                <span class="text-xs font-bold text-fg-secondary">{{ t('logs.viewer_label') }}</span>
                             </div>
 
                             <!-- Auto-refresh indicator -->
@@ -25,25 +25,25 @@
                         <div class="flex flex-wrap items-center gap-4 px-4 sm:px-6 py-4">
                             <!-- Lines input -->
                             <div class="flex items-center gap-2">
-                                <label class="text-sm text-neutral-600">{{ t('logs.lines_label') }}</label>
+                                <label class="text-sm text-fg-secondary">{{ t('logs.lines_label') }}</label>
                                 <input type="number" x-model.number="logLines" min="10" max="10000" step="100"
-                                       class="w-24 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
+                                       class="w-24 px-3 py-2 text-sm border border-line rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
                             </div>
 
                             <!-- Refresh interval input -->
                             <div class="flex items-center gap-2">
-                                <label class="text-sm text-neutral-600">{{ t('logs.refresh_label') }}</label>
+                                <label class="text-sm text-fg-secondary">{{ t('logs.refresh_label') }}</label>
                                 <input type="number" x-model.number="logRefreshInterval" min="0" max="300" step="1"
                                        @change="restartLogRefresh()"
-                                       class="w-20 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
-                                <span class="text-sm text-neutral-400">{{ t('logs.refresh_unit') }}</span>
+                                       class="w-20 px-3 py-2 text-sm border border-line rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
+                                <span class="text-sm text-fg-tertiary">{{ t('logs.refresh_unit') }}</span>
                             </div>
 
                             <!-- Log file selector -->
                             <div class="flex items-center gap-2">
-                                <label class="text-sm text-neutral-600">{{ t('logs.file_label') }}</label>
+                                <label class="text-sm text-fg-secondary">{{ t('logs.file_label') }}</label>
                                 <select x-model="logFile" @change="loadLogs()"
-                                        class="px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white">
+                                        class="px-3 py-2 text-sm border border-line rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-surface">
                                     <template x-for="f in logAvailableFiles" :key="f">
                                         <option :value="f" x-text="f"></option>
                                     </template>
@@ -61,21 +61,21 @@
                             <!-- Auto-scroll toggle -->
                             <div class="flex items-center gap-2">
                                 <button type="button" @click="logAutoScroll = !logAutoScroll"
-                                        :class="logAutoScroll ? 'bg-black' : 'bg-neutral-200'"
+                                        :class="logAutoScroll ? 'bg-black' : 'bg-surface-muted'"
                                         class="relative w-9 h-5 rounded-full transition-colors duration-300 focus:outline-none">
                                     <span :class="logAutoScroll ? 'translate-x-4' : 'translate-x-0'"
-                                          class="block w-4 h-4 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                          class="block w-4 h-4 bg-surface rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                 </button>
-                                <label class="text-sm text-neutral-600">{{ t('logs.auto_scroll') }}</label>
+                                <label class="text-sm text-fg-secondary">{{ t('logs.auto_scroll') }}</label>
                             </div>
                         </div>
                     </div>
 
                     <!-- Log Content -->
-                    <div class="bg-neutral-900 rounded-2xl overflow-hidden">
+                    <div class="flyto-terminal bg-neutral-900 rounded-2xl overflow-hidden">
                         <div class="flex items-center justify-between px-4 py-2 bg-neutral-800 border-b border-neutral-700">
-                            <span class="text-xs text-neutral-400" x-text="window.t('logs.showing_lines').replace('{lines}', logLines).replace('{total}', logTotalLines)"></span>
-                            <span class="text-xs text-neutral-500" x-text="logFile"></span>
+                            <span class="text-xs text-fg-tertiary" x-text="window.t('logs.showing_lines').replace('{lines}', logLines).replace('{total}', logTotalLines)"></span>
+                            <span class="text-xs text-fg-tertiary" x-text="logFile"></span>
                         </div>
                         <textarea
                             x-ref="logTextarea"
@@ -87,7 +87,7 @@
                     </div>
 
                     <!-- Stats -->
-                    <div class="mt-4 flex items-center justify-between text-sm text-neutral-500">
+                    <div class="mt-4 flex items-center justify-between text-sm text-fg-tertiary">
                         <span x-show="logLastUpdated" x-text="window.t('logs.last_updated') + logLastUpdated"></span>
                         <span x-show="logError" class="text-red-500" x-text="logError"></span>
                     </div>

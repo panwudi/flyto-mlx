@@ -9,39 +9,14 @@
     [data-theme="dark"] .omlx-logo-dark { display: inline !important; }
     :root:not([data-theme="dark"]) .omlx-logo-dark { display: none !important; }
 
-    /* Login page dark mode */
-    [data-theme="dark"] body { background-color: #1d1d20 !important; color: #efefef !important; }
-    [data-theme="dark"] .bg-white { background-color: #1d1d20 !important; }
-    [data-theme="dark"] .bg-neutral-100 { background-color: #2d2d32 !important; }
-    [data-theme="dark"] .bg-neutral-50 { background-color: #252529 !important; }
-    [data-theme="dark"] .from-neutral-100 { --tw-gradient-from: #252529 !important; }
-    [data-theme="dark"] .border-neutral-200 { border-color: #3f3f46 !important; }
-    [data-theme="dark"] .text-neutral-500 { color: #71717a !important; }
-    [data-theme="dark"] .text-neutral-400 { color: #52525b !important; }
-    [data-theme="dark"] .text-neutral-700 { color: #a1a1aa !important; }
-    [data-theme="dark"] .placeholder-neutral-400::placeholder { color: #52525b !important; }
-    [data-theme="dark"] input { background-color: #252529 !important; color: #efefef !important; border-color: #3f3f46 !important; }
-    [data-theme="dark"] input:focus { box-shadow: 0 0 0 2px rgba(255,255,255,0.1) !important; }
-    [data-theme="dark"] button.bg-neutral-900 { background-color: #e5e5e5 !important; color: #18181b !important; }
-    [data-theme="dark"] button.hover\:bg-neutral-800:hover { background-color: #d4d4d8 !important; }
-    [data-theme="dark"] button.bg-neutral-900 span { color: #18181b !important; }
-    [data-theme="dark"] button.bg-neutral-900 svg { color: #18181b !important; }
-    [data-theme="dark"] .shadow-xl { box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.4) !important; }
-    [data-theme="dark"] ::selection { background-color: #3f3f46; color: #efefef; }
-    [data-theme="dark"] input[type="checkbox"] { background-color: #252529 !important; border-color: #3f3f46 !important; }
-    [data-theme="dark"] input[type="checkbox"]:checked { background-color: #e5e5e5 !important; border-color: #e5e5e5 !important; }
 </style>
 {% endblock %}
 
 {% block content %}
-<div class="min-h-screen flex items-center justify-center bg-white relative overflow-hidden px-4" x-data="loginForm({{ 'true' if api_key_configured else 'false' }})">
-    <!-- Background Effects -->
-    <div class="absolute inset-0 bg-grain pointer-events-none z-0"></div>
-    <div class="absolute top-1/4 left-1/2 -translate-x-1/2 w-[600px] h-[300px] bg-gradient-to-b from-neutral-100 to-transparent rounded-full blur-3xl -z-10 opacity-50"></div>
-
-    <div class="w-full max-w-sm relative z-10">
+<div class="flyto-login min-h-screen flex items-center justify-center relative px-4" x-data="loginForm({{ 'true' if api_key_configured else 'false' }})">
+    <div class="w-full max-w-md relative z-10">
         <!-- Logo and Title -->
-        <div class="text-center mb-10 animate-fade-in-up">
+        <div class="text-center mb-8 ">
             <div class="flex flex-col items-center justify-center mb-3">
                 <img src="/admin/static/logo-light.svg" alt="Flyto MLX" class="w-16 h-16 omlx-logo-light mb-3">
                 <img src="/admin/static/logo-dark.svg" alt="Flyto MLX" class="w-16 h-16 omlx-logo-dark mb-3" style="display:none;">
@@ -51,10 +26,10 @@
 
         <!-- Setup Card (when no API key configured) -->
         <template x-if="!apiKeyConfigured">
-            <div class="bg-white rounded-3xl shadow-xl border border-neutral-200 p-8 card-hover animate-fade-in-up" style="animation-delay: 0.1s;">
+            <div class="flyto-login-card bg-surface border border-line p-8  " style="animation-delay: 0.1s;">
                 <div class="mb-6 text-center">
-                    <h2 class="text-lg font-bold text-neutral-900 mb-1">{{ t('login.setup.heading') }}</h2>
-                    <p class="text-xs text-neutral-500">{{ t('login.setup.description') }}</p>
+                    <h2 class="text-lg font-bold text-fg mb-1">{{ t('login.setup.heading') }}</h2>
+                    <p class="text-xs text-fg-tertiary">{{ t('login.setup.description') }}</p>
                 </div>
 
                 <form @submit.prevent="setup">
@@ -62,13 +37,13 @@
                     <div x-show="error" x-cloak
                          x-transition:enter="transition ease-out duration-200"
                          x-transition:leave="transition ease-in duration-150"
-                         class="mb-6 p-4 bg-neutral-50 border border-neutral-200 rounded-xl">
-                        <p class="text-sm text-neutral-700" x-text="error"></p>
+                         class="mb-6 p-4 bg-surface-alt border border-line rounded-xl">
+                        <p class="text-sm text-fg-secondary" x-text="error"></p>
                     </div>
 
                     <!-- API Key Input -->
                     <div class="mb-4">
-                        <label for="setup_api_key" class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-3">
+                        <label for="setup_api_key" class="block text-xs font-bold  text-fg-tertiary mb-3">
                             {{ t('login.setup.label_api_key') }}
                         </label>
                         <div class="flex gap-1.5">
@@ -77,16 +52,16 @@
                                 id="setup_api_key"
                                 x-model="apiKey"
                                 placeholder="{{ t('login.setup.placeholder_new') }}"
-                                class="flex-1 px-4 py-3 border border-neutral-200 rounded-xl text-sm
-                                       placeholder-neutral-400 focus:ring-2 focus:ring-neutral-900
+                                class="flex-1 px-4 py-3 border border-line rounded-xl text-sm
+                                       placeholder-fg-tertiary focus:ring-2 focus:ring-neutral-900
                                        focus:border-transparent transition-all duration-200"
                                 :disabled="loading"
                                 required
                             >
                             <button type="button" @click="showSetupKey = !showSetupKey"
-                                    class="px-2.5 py-3 text-neutral-400 bg-neutral-50
-                                           border border-neutral-200 rounded-xl hover:bg-neutral-100
-                                           hover:text-neutral-600 transition-colors"
+                                    class="px-2.5 py-3 text-fg-tertiary bg-surface-alt
+                                           border border-line rounded-xl hover:bg-surface-muted
+                                           hover:text-fg-secondary transition-colors"
                                     :disabled="loading"
                                     title="{{ t('settings.auth.toggle_visibility_tooltip') }}">
                                 <template x-if="!showSetupKey">
@@ -97,9 +72,9 @@
                                 </template>
                             </button>
                             <button type="button" @click="generateRandomKey()"
-                                    class="px-2.5 py-3 text-neutral-400 bg-neutral-50
-                                           border border-neutral-200 rounded-xl hover:bg-neutral-100
-                                           hover:text-neutral-600 transition-colors"
+                                    class="px-2.5 py-3 text-fg-tertiary bg-surface-alt
+                                           border border-line rounded-xl hover:bg-surface-muted
+                                           hover:text-fg-secondary transition-colors"
                                     :disabled="loading"
                                     title="{{ t('login.setup.generate_tooltip') }}">
                                 <svg class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.64 3.64-1.28-1.28a1.21 1.21 0 0 0-1.72 0L2.36 18.64a1.21 1.21 0 0 0 0 1.72l1.28 1.28a1.2 1.2 0 0 0 1.72 0L21.64 5.36a1.2 1.2 0 0 0 0-1.72"/><path d="m14 7 3 3"/><path d="M5 6v4"/><path d="M19 14v4"/><path d="M10 2v2"/><path d="M7 8H3"/><path d="M21 16h-4"/><path d="M11 3H9"/></svg>
@@ -109,7 +84,7 @@
 
                     <!-- Confirm API Key Input -->
                     <div class="mb-2">
-                        <label for="setup_api_key_confirm" class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-3">
+                        <label for="setup_api_key_confirm" class="block text-xs font-bold  text-fg-tertiary mb-3">
                             {{ t('login.setup.label_confirm') }}
                         </label>
                         <input
@@ -117,8 +92,8 @@
                             id="setup_api_key_confirm"
                             x-model="apiKeyConfirm"
                             placeholder="{{ t('login.setup.placeholder_confirm') }}"
-                            class="w-full px-4 py-3 border border-neutral-200 rounded-xl text-sm
-                                   placeholder-neutral-400 focus:ring-2 focus:ring-neutral-900
+                            class="w-full px-4 py-3 border border-line rounded-xl text-sm
+                                   placeholder-fg-tertiary focus:ring-2 focus:ring-neutral-900
                                    focus:border-transparent transition-all duration-200"
                             :disabled="loading"
                             required
@@ -126,7 +101,7 @@
                     </div>
 
                     <!-- Validation Hints -->
-                    <p class="text-[11px] text-neutral-400 mb-6">{{ t('login.setup.validation_hint') }}</p>
+                    <p class="text-[11px] text-fg-tertiary mb-6">{{ t('login.setup.validation_hint') }}</p>
 
                     <!-- Submit Button -->
                     <button
@@ -134,7 +109,7 @@
                         class="w-full py-3.5 px-6 bg-neutral-900 text-white text-sm font-semibold
                                rounded-xl hover:bg-neutral-800 focus:outline-none focus:ring-2
                                focus:ring-neutral-900 focus:ring-offset-2 transition-all duration-200
-                               transform hover:scale-[1.02] active:scale-[0.98]
+
                                disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none"
                         :disabled="loading"
                     >
@@ -153,19 +128,19 @@
 
         <!-- Login Card (when API key is configured) -->
         <template x-if="apiKeyConfigured">
-            <div class="bg-white rounded-3xl shadow-xl border border-neutral-200 p-8 card-hover animate-fade-in-up" style="animation-delay: 0.1s;">
+            <div class="flyto-login-card bg-surface border border-line p-8  " style="animation-delay: 0.1s;">
                 <form @submit.prevent="login">
                     <!-- Error Message -->
                     <div x-show="error" x-cloak
                          x-transition:enter="transition ease-out duration-200"
                          x-transition:leave="transition ease-in duration-150"
-                         class="mb-6 p-4 bg-neutral-50 border border-neutral-200 rounded-xl">
-                        <p class="text-sm text-neutral-700" x-text="error"></p>
+                         class="mb-6 p-4 bg-surface-alt border border-line rounded-xl">
+                        <p class="text-sm text-fg-secondary" x-text="error"></p>
                     </div>
 
                     <!-- API Key Input -->
                     <div class="mb-6">
-                        <label for="api_key" class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-3">
+                        <label for="api_key" class="block text-xs font-bold  text-fg-tertiary mb-3">
                             {{ t('login.login.label_api_key') }}
                         </label>
                         <input
@@ -173,8 +148,8 @@
                             id="api_key"
                             x-model="apiKey"
                             placeholder="{{ t('login.login.placeholder') }}"
-                            class="w-full px-4 py-3 border border-neutral-200 rounded-xl text-sm
-                                   placeholder-neutral-400 focus:ring-2 focus:ring-neutral-900
+                            class="w-full px-4 py-3 border border-line rounded-xl text-sm
+                                   placeholder-fg-tertiary focus:ring-2 focus:ring-neutral-900
                                    focus:border-transparent transition-all duration-200"
                             :disabled="loading"
                             required
@@ -187,11 +162,11 @@
                             type="checkbox"
                             id="remember"
                             x-model="remember"
-                            class="h-4 w-4 rounded border-neutral-300 text-neutral-900
+                            class="h-4 w-4 rounded border-line-strong text-fg
                                    focus:ring-neutral-900 focus:ring-offset-0 cursor-pointer"
                             :disabled="loading"
                         >
-                        <label for="remember" class="text-xs text-neutral-500 cursor-pointer select-none">
+                        <label for="remember" class="text-xs text-fg-tertiary cursor-pointer select-none">
                             {{ t('login.login.remember') }}
                         </label>
                     </div>
@@ -202,7 +177,7 @@
                         class="w-full py-3.5 px-6 bg-neutral-900 text-white text-sm font-semibold
                                rounded-xl hover:bg-neutral-800 focus:outline-none focus:ring-2
                                focus:ring-neutral-900 focus:ring-offset-2 transition-all duration-200
-                               transform hover:scale-[1.02] active:scale-[0.98]
+
                                disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none"
                         :disabled="loading"
                     >
@@ -220,7 +195,7 @@
         </template>
 
         <!-- Footer -->
-        <p class="mt-8 text-center text-xs text-neutral-400 animate-fade-in-up" style="animation-delay: 0.2s;">
+        <p class="mt-8 text-center text-xs text-fg-tertiary " style="animation-delay: 0.2s;">
             {{ t('app.tagline') }}
         </p>
     </div>
