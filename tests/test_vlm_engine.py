@@ -1100,6 +1100,101 @@ class TestPrepareVisionInputs:
         with pytest.raises(ValueError, match="does not support multi-image"):
             engine._prepare_vision_inputs(messages, images)
 
+    # --- per-image vision feature cache -------------------------------
+
+    def _vision_cache_engine(self, images, entries_by_index):
+        """Engine whose vision cache already holds the given per-image
+        features, keyed by each image's real per-image hash."""
+        from omlx.utils.image import compute_per_image_hashes
+
+        engine = self._setup_engine_for_vision(model_type="gemma4")
+        hashes = compute_per_image_hashes(images)
+        entries = {hashes[i]: f for i, f in entries_by_index.items()}
+
+        cache = MagicMock()
+        cache.get.side_effect = lambda h, _model: entries.get(h)
+        engine._vision_cache = cache
+        engine._vision_cache_enabled = True
+
+        # Keep the embedding step inert but mx.eval-able.
+        embed = MagicMock()
+        embed.inputs_embeds = mx.zeros((1, 3, 8))
+        embed.to_dict.return_value = {"inputs_embeds": embed.inputs_embeds}
+        engine._vlm_model.get_input_embeddings.return_value = embed
+
+        # The token-count cross-check is a separate guard; neutralise it so
+        # these tests isolate the shape agreement.
+        engine._image_token_count = MagicMock(return_value=None)
+        return engine, cache
+
+    @staticmethod
+    def _two_images():
+        from PIL import Image
+
+        return [Image.new("RGB", (8, 8), "red"), Image.new("RGB", (12, 5), "blue")]
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    @patch("mlx_vlm.prompt_utils.apply_chat_template")
+    def test_per_image_cache_used_when_shapes_agree(self, mock_act, mock_prepare):
+        """Two entries of equal shape still combine and serve from cache."""
+        images = self._two_images()
+        engine, _ = self._vision_cache_engine(
+            images, {0: mx.zeros((1, 4, 8)), 1: mx.ones((1, 4, 8))}
+        )
+        mock_act.return_value = [{"role": "user", "content": "formatted"}]
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": mx.zeros((2, 3, 8, 8)),
+        }
+        engine._compute_vision_features = MagicMock(return_value=None)
+
+        engine._prepare_vision_inputs([{"role": "user", "content": "Describe"}], images)
+
+        used = engine._vlm_model.get_input_embeddings.call_args[1][
+            "cached_image_features"
+        ]
+        assert used.shape == (2, 4, 8)
+        engine._compute_vision_features.assert_not_called()
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    @patch("mlx_vlm.prompt_utils.apply_chat_template")
+    def test_mismatched_per_image_shapes_fall_through(self, mock_act, mock_prepare):
+        """Entries cached under different resize regimes must not be
+        concatenated. Gemma 4 encodes an image to a token count that depends
+        on the other images in the request, so two entries cached from
+        separate single-image requests can disagree; mx.concatenate raised a
+        500 before this fell through."""
+        images = self._two_images()
+        recomputed = mx.zeros((2, 6, 8))
+        engine, cache = self._vision_cache_engine(
+            images, {0: mx.zeros((1, 4, 8)), 1: mx.ones((1, 6, 8))}
+        )
+        mock_act.return_value = [{"role": "user", "content": "formatted"}]
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": mx.zeros((2, 3, 8, 8)),
+        }
+        engine._compute_vision_features = MagicMock(return_value=recomputed)
+
+        engine._prepare_vision_inputs([{"role": "user", "content": "Describe"}], images)
+
+        # Fell through to a recompute rather than raising...
+        engine._compute_vision_features.assert_called_once()
+        used = engine._vlm_model.get_input_embeddings.call_args[1][
+            "cached_image_features"
+        ]
+        assert used is recomputed
+        # ...and consulted the whole-request entry on the way, which is only
+        # fetched when the per-image path is unusable.
+        from omlx.utils.image import compute_image_hash
+
+        assert any(
+            call.args and call.args[0] == compute_image_hash(images)
+            for call in cache.get.call_args_list
+        )
+
 
 class TestFormatMessagesForVLMTemplate:
     """Tests for VLMBatchedEngine._format_messages_for_vlm_template()."""
@@ -1609,3 +1704,84 @@ class TestFilterVLMLoadWeights:
         items = [("language_model.model.visual.patch_embed.weight", 7)]
         out = _filter_vlm_load_weights(self._model_with_predicate(), items)
         assert out == [("vision_tower.patch_embed.weight", 7)]
+
+
+class TestVLMEngineFrequencyPenalty:
+    """VLM SamplingParams must carry frequency_penalty (mirrors BatchedEngine).
+
+    Both VLM SamplingParams constructions previously omitted
+    frequency_penalty entirely, so it landed in **kwargs and was silently
+    dropped instead of reaching the scheduler.
+    """
+
+    @staticmethod
+    def _fake_output():
+        return SimpleNamespace(
+            output_text="hi",
+            prompt_tokens=5,
+            completion_tokens=2,
+            finish_reason="stop",
+            tool_calls=None,
+            cached_tokens=0,
+            first_token_at=None,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_generate_forwards_frequency_penalty(self):
+        engine = _make_loaded_engine(model_type="test-vlm")
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output())
+        )
+
+        await engine.generate("a prompt", frequency_penalty=0.7)
+
+        call_kwargs = engine._engine.generate.call_args.kwargs
+        assert call_kwargs["sampling_params"].frequency_penalty == 0.7
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_generate_defaults_frequency_penalty_to_zero(self):
+        engine = _make_loaded_engine(model_type="test-vlm")
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output())
+        )
+
+        await engine.generate("a prompt")
+
+        call_kwargs = engine._engine.generate.call_args.kwargs
+        assert call_kwargs["sampling_params"].frequency_penalty == 0.0
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_stream_generate_forwards_frequency_penalty(self):
+        engine = _make_loaded_engine(model_type="test-vlm")
+        engine._engine = MagicMock()
+        engine._engine.add_request = AsyncMock(return_value="req-1")
+        engine._engine.abort_request = AsyncMock(return_value=True)
+
+        async def _one_output_stream(_request_id):
+            yield SimpleNamespace(
+                output_text="ok",
+                new_text="ok",
+                prompt_tokens=1,
+                completion_tokens=1,
+                finished=True,
+                finish_reason="stop",
+                tool_calls=None,
+                cached_tokens=0,
+            )
+
+        engine._engine.stream_outputs = _one_output_stream
+
+        async for _ in engine.stream_generate("hello", frequency_penalty=0.9):
+            pass
+
+        call_kwargs = engine._engine.add_request.call_args.kwargs
+        assert call_kwargs["sampling_params"].frequency_penalty == 0.9

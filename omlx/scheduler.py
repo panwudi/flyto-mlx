@@ -45,7 +45,7 @@ from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .speculative.vlm_mtp import VLMMTPDrafter, run_vlm_mtp_decode
-from .utils.proc_memory import get_phys_footprint
+from .utils.proc_memory import get_phys_footprint, resident_usage_bytes
 from .utils.sampling import make_sampler as omlx_make_sampler
 
 # Module-level alias so Scheduler.__init__ can fall back to mlx-lm's default
@@ -131,6 +131,24 @@ def _sync_and_clear_cache(stream=None):
         mx.clear_cache()
 
 
+def clear_thread_streams() -> None:
+    """Release every MLX stream owned by the calling worker thread.
+
+    MLX >= 0.32 keeps a per-thread stream registry that synchronizing and
+    clearing the buffer cache does not empty, so a worker thread that touched
+    MLX calls this right before it exits (upstream oMLX 8b2ade32). No-op on
+    MLX builds without ``mx.clear_streams``.
+    """
+    try:
+        mx.synchronize()
+    except RuntimeError:
+        # Lazily started worker with no default stream yet: nothing to drain.
+        pass
+    clear_streams = getattr(mx, "clear_streams", None)
+    if clear_streams is not None:
+        clear_streams()
+
+
 def _safe_sync_stream(stream=None):
     """mx.synchronize(stream) that tolerates cross-thread calls.
 
@@ -145,6 +163,19 @@ def _safe_sync_stream(stream=None):
     except RuntimeError as e:
         if "no Stream" not in str(e):
             raise
+
+
+def apply_model_concurrency_override(config, model_settings) -> None:
+    """Apply ModelSettings.max_concurrent_requests to an engine's own copy of
+    SchedulerConfig (positive ints only; anything else keeps the global cap)."""
+    value = getattr(model_settings, "max_concurrent_requests", None)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return
+    config.max_num_seqs = value
+    config.completion_batch_size = min(
+        getattr(config, "completion_batch_size", value) or value, value
+    )
+    logger.info("Per-model max concurrent requests: %d", value)
 
 
 class _StoreCacheGate:
@@ -338,6 +369,29 @@ def _patched_generation_batch_step(self):
 
 
 GenerationBatch._step = _patched_generation_batch_step
+
+
+# ---------------------------------------------------------------------------
+# Backport of mlx-lm e2f2fb2 (#1772): GenerationBatch.filter at our pin only
+# shrinks ``samplers`` / ``logits_processors`` when some row has an entry.
+# Rows without processors are the common case here ([] per row), so after
+# one finishes the lists keep the removed row. ``extend`` then appends the
+# next request's processors past the end, and that request reads a stale
+# row: its grammar mask, accept_token and penalties are skipped, and a
+# later request can pick up another request's processors.
+# ---------------------------------------------------------------------------
+_original_generation_batch_filter = GenerationBatch.filter
+
+
+def _patched_generation_batch_filter(self, keep):
+    samplers = list(self.samplers)
+    logits_processors = list(self.logits_processors)
+    _original_generation_batch_filter(self, keep)
+    self.samplers = [samplers[idx] for idx in keep]
+    self.logits_processors = [logits_processors[idx] for idx in keep]
+
+
+GenerationBatch.filter = _patched_generation_batch_filter
 
 
 # Monkey-patch TurboQuantKVCache.merge so _merge_caches() works
@@ -647,6 +701,41 @@ class SchedulerOutput:
     outputs: list[RequestOutput] = field(default_factory=list)
     # Whether any work was done
     has_work: bool = False
+
+
+def _freeze_state_containers(obj: Any) -> Any:
+    """Copy the list / tuple / dict structure of an extracted cache state.
+
+    MLX arrays are immutable, but cache objects update their state
+    containers in place (ArraysCache keeps its arrays in a list it writes
+    into), so an extracted state that shares those containers keeps
+    changing as prefill continues.
+    """
+    if isinstance(obj, list):
+        return [_freeze_state_containers(x) for x in obj]
+    if isinstance(obj, tuple):
+        return tuple(_freeze_state_containers(x) for x in obj)
+    if isinstance(obj, dict):
+        return {k: _freeze_state_containers(v) for k, v in obj.items()}
+    return obj
+
+
+class _PreExtractedSnapshot:
+    """A boundary snapshot already extracted (and frozen) at capture time.
+
+    Prefill hands _on_prefill_boundary_snapshot the LIVE prompt-cache
+    objects. The SSD store serializes them immediately, but the in-memory
+    fallback used to keep the objects themselves, and by the time the store
+    read them they held the state of a later boundary: the same
+    "state past the block" corruption 8986da14 fixes for the last block.
+    Scheduler._extract_cache_states passes this through unchanged.
+    """
+
+    __slots__ = ("extracted", "model_cache_config")
+
+    def __init__(self, extracted: list, model_cache_config: Any) -> None:
+        self.extracted = extracted
+        self.model_cache_config = model_cache_config
 
 
 class _BoundarySnapshotProvider:
@@ -1138,24 +1227,19 @@ class Scheduler:
         """Run store_cache + paged_cache cleanup off the inference thread.
 
         Pre-conditions enforced by the caller (_cleanup_finished):
-        - mx.async_eval() was called on the inference thread for all
-          KV cache arrays, dispatching materialization asynchronously
-          without blocking the inference thread. async_eval completes
-          Metal command enqueueing before returning, so all commands
-          are submitted by the time executor.submit() runs.
-        - This worker calls mx.synchronize(self._stream) via the
-          _safe_sync_stream helper to wait on the same stream where
-          mx.async_eval dispatched the arrays. A bare mx.synchronize()
-          with no args only blocks on the default stream (gpu:0) and
-          would leave the dispatched per-engine stream's work
-          unsynchronized, racing the buffer-protocol access below
-          (#1437). Stream objects are not thread-local in MLX (Metal
-          device is a global singleton), so mx.synchronize(stream) is
-          safe cross-thread; it just calls waitUntilCompleted on the
-          command buffer.
-        - bfloat16 view+eval inside _extract_tensor_bytes runs on this
-          worker's default mx stream, isolated from self._stream;
-          the underlying buffer is read-only at this point.
+        - mx.eval() (a FULL, blocking eval, not async_eval) was called on
+          the inference thread for all KV arrays in cache_to_store, and
+          in-memory boundary snapshots were evaluated at capture
+          (_eval_snapshot_cache). This is load-bearing: the engine stream
+          is thread-local (mx.new_thread_local_stream), so a source left
+          lazy on it cannot be materialized on this thread and the slice /
+          bf16 view below would abort the process.
+        - With concrete sources, this worker's own slice and view ops bind
+          to its default stream. The _safe_sync_stream call below is
+          belt-and-suspenders; correctness no longer depends on that
+          cross-thread synchronize, whose "no Stream" error it swallows.
+        - All mx-buffer access here is held under _mx_buffer_access_lock,
+          serializing it against inference-thread mx.clear_cache.
         - batch_generator.remove(uid) is deferred until this worker
           completes (handled by _drain_pending_async_removes).
 
@@ -1181,6 +1265,12 @@ class Scheduler:
                     extra_keys=extra_keys,
                     extra_key_token_start=extra_key_token_start,
                     extra_key_ranges=extra_key_ranges,
+                    # Intermediate snapshots are only passed when
+                    # _get_boundary_store_override merged the boundary
+                    # snapshot taken at len(token_sequence_to_store) into
+                    # cache_to_store. Without it the live state sits at the
+                    # end of prompt + output, past the last stored block.
+                    live_state_at_end=intermediate_snapshots is not None,
                 )
             if block_table is None and self.paged_cache_manager is not None:
                 block_table = self.paged_cache_manager.get_block_table(request_id)
@@ -1216,22 +1306,27 @@ class Scheduler:
                     logger.warning(
                         "Async store_cache for %s raised: %s", request_id, exc
                     )
-            # Run batch_generator.remove on the inference thread.
-            try:
-                _safe_sync_stream(self._stream)
-                self._remove_uid_from_active_batch(uid)
-                if hasattr(self.model, "unregister_rope_delta"):
-                    self.model.unregister_rope_delta(uid)
-            except Exception as e:
-                logger.warning(
-                    "Deferred batch_generator.remove(uid=%s) failed: %s",
-                    uid,
-                    e,
-                )
-            # Cleanup uid maps now that the slot is reclaimable.
-            if uid in self.uid_to_request_id:
+            # fail_all_requests / cache-error recovery drop the batch
+            # generator, and the next one reuses uids from 0. A remove
+            # deferred from before the reset would then evict and unmap the
+            # NEW request on that uid, which never finishes. Touch the uid
+            # only while this request still owns it (upstream 4f5c6ce7).
+            if self.uid_to_request_id.get(uid) == request_id:
+                # Run batch_generator.remove on the inference thread.
+                try:
+                    _safe_sync_stream(self._stream)
+                    self._remove_uid_from_active_batch(uid)
+                    if hasattr(self.model, "unregister_rope_delta"):
+                        self.model.unregister_rope_delta(uid)
+                except Exception as e:
+                    logger.warning(
+                        "Deferred batch_generator.remove(uid=%s) failed: %s",
+                        uid,
+                        e,
+                    )
+                # Cleanup uid maps now that the slot is reclaimable.
                 del self.uid_to_request_id[uid]
-            if request_id in self.request_id_to_uid:
+            if self.request_id_to_uid.get(request_id) == uid:
                 del self.request_id_to_uid[request_id]
             self._inflight_store_futures.pop(request_id, None)
             # Boundary snapshots were kept on disk for the worker; safe to
@@ -1565,9 +1660,17 @@ class Scheduler:
             return None
 
         if request_id not in self._output_parser_sessions:
-            self._output_parser_sessions[request_id] = (
-                self._output_parser_factory.create_session(self.tokenizer)
-            )
+            parser_session = self._output_parser_factory.create_session(self.tokenizer)
+            # Gemma 4's template opens the thought channel in the prompt when
+            # generation resumes after a tool response, so the model emits the
+            # thought body without an opening marker. Seed the session as
+            # already-in-thought or the reasoning leaks into visible content.
+            request = self.requests.get(request_id)
+            if request is not None and getattr(request, "needs_think_prefix", False):
+                notify = getattr(parser_session, "notify_prefilled_thought", None)
+                if callable(notify):
+                    notify()
+            self._output_parser_sessions[request_id] = parser_session
         return self._output_parser_sessions[request_id]
 
     def _cleanup_output_parser_session(self, request_id: str):
@@ -1623,6 +1726,10 @@ class Scheduler:
         if sampling_params.stop_token_ids:
             stop_tokens_set.update(sampling_params.stop_token_ids)
         stop_tokens_seq = [[t] for t in stop_tokens_set] if stop_tokens_set else None
+
+        from .patches.batch_decode_mask import apply_batch_decode_mask_patch
+
+        apply_batch_decode_mask_patch()
 
         bg = BatchGenerator(
             model=self.model,
@@ -1826,6 +1933,33 @@ class Scheduler:
         predicted_peak = current + predicted_transient
 
         if predicted_peak > self._memory_hard_limit_bytes:
+            # The high-water reading above counts buffers MLX has freed but
+            # kept in its pool (cache limit = whole machine, see cli.py) and
+            # spikes from the last few ticks that are already gone. Before
+            # refusing, drain the GPU and return the pool, then decide on what
+            # is actually resident -- the same test the HTTP admission gate
+            # applies, so the two cannot disagree.
+            _sync_and_clear_cache(self._stream)
+            resident, active, phys, cache = resident_usage_bytes()
+            if resident + predicted_transient <= self._memory_hard_limit_bytes:
+                logger.info(
+                    "[memgate:%s] rid=%s high-water %.3fGB tripped the gate; "
+                    "after reclaim resident %.3fGB (active %.3fGB, phys %.3fGB, "
+                    "mlx free pool %.3fGB) + transient %.3fGB fits cap %.3fGB, "
+                    "proceeding",
+                    loop_label,
+                    request_id,
+                    current / 1024**3,
+                    resident / 1024**3,
+                    active / 1024**3,
+                    phys / 1024**3,
+                    cache / 1024**3,
+                    predicted_transient / 1024**3,
+                    self._memory_hard_limit_bytes / 1024**3,
+                )
+                return
+            current = resident
+            predicted_peak = current + predicted_transient
             logger.warning(
                 "[memgate:%s] rid=%s refusing prefill chunk (n=%d) BEFORE "
                 "forward: predicted peak %.3fGB = current %.3fGB + transient "
@@ -2696,13 +2830,23 @@ class Scheduler:
         During external prefill we have direct access to per-layer cache
         objects (not BatchKVCache). Extract non-sliceable layers for
         boundary snapshot storage.
+
+        Pass ``request_id`` directly. The request is mid-prefill and has
+        not been inserted into ``BatchGenerator`` yet, so
+        ``request_id_to_uid`` has no entry for it. The earlier shape
+        routed through ``self.request_id_to_uid.get(request_id, -1)`` →
+        ``uid_to_request_id.get(-1)`` → ``None`` → silent return,
+        dropping every snapshot. For ArraysCache / GDN / hybrid models
+        that made every non-last block store a placeholder, and the
+        next identical-prompt request rejected the cache and re-
+        prefilled from scratch.
         """
         snapshot_cache = [
             c if type(c).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES else None
             for c in prompt_cache
         ]
         self._on_prefill_boundary_snapshot(
-            self.request_id_to_uid.get(request.request_id, -1),
+            request.request_id,
             snapshot_cache,
             total_tokens,
         )
@@ -2947,35 +3091,114 @@ class Scheduler:
 
         return None
 
+    def _get_output_parser_thinking_start_text(self) -> Optional[str]:
+        """Return parser-provided thinking open text, if the parser has one."""
+        factory = getattr(self, "_output_parser_factory", None)
+        if factory is None:
+            return None
+        return getattr(factory, "thinking_start_text", None)
+
+    def _get_output_parser_thinking_end_text(self) -> Optional[str]:
+        """Return parser-provided thinking close text, if the parser has one."""
+        factory = getattr(self, "_output_parser_factory", None)
+        if factory is None:
+            return None
+        return getattr(factory, "thinking_end_text", None)
+
+    def _resolve_prompt_think_end_token_ids(self) -> list[int] | None:
+        """Close-marker IDs as they appear in a PROMPT, parser first.
+
+        Distinct from _resolve_think_end_token_ids, which answers "what should
+        the thinking-budget processor force the model to emit" and only knows
+        the </think> family. Protocol parsers carry their own close marker
+        (Gemma 4's ``<channel|>``), and that is what their chat template writes.
+        Asking the </think> resolver instead yields the tokenisation of the
+        literal string "</think>" -- a sequence no Gemma 4 prompt contains --
+        so an opened-then-closed channel reads as still open.
+        """
+        end_text = self._get_output_parser_thinking_end_text()
+        if end_text:
+            ids = self._encode_thinking_marker(end_text)
+            if ids:
+                return ids
+        return self._resolve_think_end_token_ids()
+
+    def _get_output_parser_thinking_start_output_text(self) -> Optional[str]:
+        """Return normalized text to prepend when parser thinking starts in prompt."""
+        factory = getattr(self, "_output_parser_factory", None)
+        if factory is None:
+            return None
+        return getattr(factory, "thinking_start_output_text", None)
+
+    def _encode_thinking_marker(self, text: str) -> Optional[list[int]]:
+        """Encode a parser/tokenizer thinking marker into token IDs."""
+        try:
+            ids = self.tokenizer.encode(text, add_special_tokens=False)
+        except TypeError:
+            try:
+                ids = self.tokenizer.encode(text)
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+        if ids:
+            return list(ids)
+        return None
+
     def _detect_needs_think_prefix(self, request: "Request") -> bool:
-        """Detect if prompt ends with an open <think> tag (thinking enabled).
+        """Detect if the prompt ends with an open thinking marker.
 
         Returns False for disabled-thinking patterns like <think></think>
-        where </think> immediately follows <think> in the prompt tail.
+        where the close marker immediately follows the open one.
+
+        The marker is not always a single token. Protocol parsers carry their
+        own opener (Gemma 4's ``<|channel>thought``) which tokenizes to several
+        IDs, so the tail is matched as a subsequence rather than by membership.
         """
+        think_start_ids = None
         think_start_id = self._get_think_token_id("think_start_id")
-        if think_start_id is None:
+        if think_start_id is not None:
+            think_start_ids = [think_start_id]
+        else:
+            think_start_text = (
+                self._get_output_parser_thinking_start_text() or "<think>"
+            )
             try:
-                think_start_id = self.tokenizer.convert_tokens_to_ids("<think>")
-                if think_start_id == getattr(self.tokenizer, "unk_token_id", None):
-                    return False
+                token_id = self.tokenizer.convert_tokens_to_ids(think_start_text)
+                if isinstance(token_id, int) and token_id != getattr(
+                    self.tokenizer, "unk_token_id", None
+                ):
+                    think_start_ids = [token_id]
             except (AttributeError, KeyError, TypeError):
-                return False
+                think_start_ids = None
 
-        if not think_start_id or not request.prompt_token_ids:
+            if think_start_ids is None:
+                think_start_ids = self._encode_thinking_marker(think_start_text)
+
+        if not think_start_ids or not request.prompt_token_ids:
             return False
 
-        last_tokens = list(request.prompt_token_ids[-3:])
-        if think_start_id not in last_tokens:
+        lookback = max(3, len(think_start_ids) + 2)
+        last_tokens = list(request.prompt_token_ids[-lookback:])
+        last_idx = None
+        for idx in range(len(last_tokens) - len(think_start_ids), -1, -1):
+            if last_tokens[idx : idx + len(think_start_ids)] == think_start_ids:
+                last_idx = idx
+                break
+        if last_idx is None:
             return False
 
-        # <think> found. Check if </think> follows it (disabled thinking pattern).
-        last_idx = len(last_tokens) - 1 - last_tokens[::-1].index(think_start_id)
-        after_start = last_tokens[last_idx + 1 :]
+        # Open marker found. Check if the close marker follows it.
+        after_start = last_tokens[last_idx + len(think_start_ids) :]
 
         if after_start:
-            think_end_ids = self._resolve_think_end_token_ids()
-            if think_end_ids and think_end_ids[0] in after_start:
+            think_end_ids = self._resolve_prompt_think_end_token_ids()
+            if think_end_ids and len(after_start) >= len(think_end_ids):
+                for idx in range(len(after_start) - len(think_end_ids) + 1):
+                    if after_start[idx : idx + len(think_end_ids)] == think_end_ids:
+                        return False
+            elif think_end_ids and think_end_ids[0] in after_start:
                 return False
 
         return True
@@ -3049,22 +3272,55 @@ class Scheduler:
             for layer_cache in cache_list
         )
 
+    def _eval_snapshot_cache(self, snapshot_cache: list[Any]) -> None:
+        """Make an in-memory boundary snapshot's leaf tensors concrete.
+
+        Runs on the capturing (inference) thread. The store worker later
+        re-extracts and slices these through _BoundarySnapshotProvider; a
+        leaf still lazy on this thread's thread-local stream would abort the
+        worker (upstream 74d71687).
+        """
+        if not snapshot_cache:
+            return
+        extracted, _ = self._extract_cache_states(snapshot_cache)
+        leaves = self._collect_arrays_from_extracted_cache(extracted)
+        if leaves:
+            with mx.stream(self._stream):
+                mx.eval(*leaves)
+
+    def _freeze_prefill_snapshot(
+        self, snapshot_cache: list[Any]
+    ) -> "_PreExtractedSnapshot":
+        """Extract, freeze and evaluate a prefill snapshot for in-memory use.
+
+        The layers are the live prompt-cache objects that prefill keeps
+        updating, so keep a copy of their state at this boundary instead.
+        Evaluated here because the store worker reads it off-thread.
+        """
+        extracted, config = self._extract_cache_states(snapshot_cache)
+        frozen = _PreExtractedSnapshot(_freeze_state_containers(extracted), config)
+        self._eval_snapshot_cache(frozen)
+        return frozen
+
     def _on_prefill_boundary_snapshot(
         self,
-        uid: int,
+        request_id: str,
         snapshot_cache: list[Any],
         token_count: int,
     ) -> None:
-        """Record boundary snapshots captured during prefill processing."""
+        """Record boundary snapshots captured during prefill processing.
+
+        Called from ``_emit_prefill_boundary_snapshot`` at each block
+        boundary crossed during prefill. Keyed by ``request_id`` rather
+        than ``uid`` because the request has not been inserted into
+        ``BatchGenerator`` yet and the uid mapping does not exist —
+        routing through it dropped every snapshot silently (#TBD).
+        """
         if self.block_aware_cache is None:
             return
 
         block_size = self.config.paged_cache_block_size
         if block_size <= 0 or token_count <= 0 or token_count % block_size != 0:
-            return
-
-        request_id = self.uid_to_request_id.get(uid)
-        if request_id is None:
             return
 
         if not self._cache_list_needs_boundary_snapshot(snapshot_cache):
@@ -3090,9 +3346,13 @@ class Scheduler:
             if saved:
                 self._boundary_cache_snapshots[request_id][token_count] = None
             else:
-                self._boundary_cache_snapshots[request_id][token_count] = snapshot_cache
+                self._boundary_cache_snapshots[request_id][token_count] = (
+                    self._freeze_prefill_snapshot(snapshot_cache)
+                )
         else:
-            self._boundary_cache_snapshots[request_id][token_count] = snapshot_cache
+            self._boundary_cache_snapshots[request_id][token_count] = (
+                self._freeze_prefill_snapshot(snapshot_cache)
+            )
 
         self._boundary_snapshot_required = True
         logger.debug(
@@ -3214,10 +3474,13 @@ class Scheduler:
             if saved:
                 self._boundary_cache_snapshots[request.request_id][total_tokens] = None
             else:
+                # In-memory fallback; see _on_prefill_boundary_snapshot.
+                self._eval_snapshot_cache(snapshot_cache)
                 self._boundary_cache_snapshots[request.request_id][
                     total_tokens
                 ] = snapshot_cache
         else:
+            self._eval_snapshot_cache(snapshot_cache)
             self._boundary_cache_snapshots[request.request_id][
                 total_tokens
             ] = snapshot_cache
@@ -3548,6 +3811,8 @@ class Scheduler:
             - List of dicts with {state, meta_state, class_name, cache_type}
             - ModelCacheConfig with per-layer type information (or None)
         """
+        if isinstance(raw_cache, _PreExtractedSnapshot):
+            return raw_cache.extracted, raw_cache.model_cache_config
         if not raw_cache:
             return [], None
 
@@ -5487,12 +5752,25 @@ class Scheduler:
                             new_text = ""
                         break
 
-            # Prepend <think> tag for first chunk if this is a reasoning model
-            # (skip when a protocol parser already manages reasoning formatting)
-            if parser_session is None and getattr(request, "needs_think_prefix", False):
+            # Prepend <think> tag for first chunk if this is a reasoning model.
+            # Protocol parsers expose their own normalized prefix: their prompt
+            # opens the thinking channel with a model-specific marker (Gemma 4's
+            # <|channel>thought), so the generated stream carries only the body
+            # and the close marker. Without this the reply would ship a lone
+            # </think> with no opener.
+            if getattr(request, "needs_think_prefix", False):
                 if not getattr(request, "think_prefix_sent", False):
-                    think_tag = getattr(self.tokenizer, "think_start", "<think>")
-                    new_text = think_tag + "\n" + new_text
+                    if parser_session is None:
+                        think_tag = getattr(self.tokenizer, "think_start", "<think>")
+                        prefix_text = think_tag + "\n"
+                    else:
+                        prefix_text = (
+                            self._get_output_parser_thinking_start_output_text() or ""
+                        )
+                    if prefix_text:
+                        new_text = prefix_text + new_text
+                        if parser_session is not None:
+                            request.output_text = prefix_text + request.output_text
                     request.think_prefix_sent = True
 
             # Immediately discard logprobs if not requested to free memory (~800KB per response)
@@ -5673,10 +5951,9 @@ class Scheduler:
                             # Inference-thread store_cache prep, timed as
                             # three sub-phases (boundary / collect / dispatch)
                             # mirroring boundary_capture_* granularity.
-                            # async_eval dispatches KV array materialization
-                            # without blocking; the worker calls
-                            # mx.synchronize(self._stream) to wait before
-                            # extracting bytes.
+                            # The collect phase fully evaluates the KV
+                            # arrays on this thread before the worker
+                            # touches them (see the comment there).
                             with mx.stream(self._stream):
                                 with self._phase_timer("store_cache_main_boundary"):
                                     boundary_override = self._get_boundary_store_override(
@@ -5712,7 +5989,19 @@ class Scheduler:
                                         )
                                     )
                                     if pre_eval_arrays:
-                                        mx.async_eval(*pre_eval_arrays)
+                                        # FULL eval, not async_eval. These
+                                        # arrays live on self._stream, a
+                                        # thread-local stream of THIS thread.
+                                        # If they were still lazy when the
+                                        # store worker slices them or views
+                                        # bf16 as uint16, MLX would dispatch
+                                        # the pending op to a stream index
+                                        # the worker does not have -> "no
+                                        # Stream(gpu, N)" -> SIGABRT. Only
+                                        # the GPU completion fence moves
+                                        # here; the host memcpy and disk
+                                        # write stay on the worker.
+                                        mx.eval(*pre_eval_arrays)
 
                             if self._store_cache_executor is not None:
                                 # Gate acquire blocks if too many KV caches
@@ -6074,7 +6363,10 @@ class Scheduler:
 
                 if responses:
                     outputs, finished_ids = self._process_batch_responses(responses)
-                    output.outputs = outputs
+                    # extend, not assign: outputs may already hold this
+                    # step's rejections (refused prefills), whose error
+                    # output is the only thing that ends their streams.
+                    output.outputs.extend(outputs)
                     output.finished_request_ids = finished_ids
                     self._cleanup_finished(finished_ids)
 
@@ -6335,6 +6627,9 @@ class Scheduler:
                     )
                     concurrent.futures.wait(inflight, timeout=30.0)
                 self._drain_pending_async_removes()
+                self._store_cache_executor.submit(clear_thread_streams).result(
+                    timeout=30.0
+                )
                 self._store_cache_executor.shutdown(wait=True)
             except Exception as e:
                 logger.warning(f"Async store_cache shutdown error: {e}")

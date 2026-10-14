@@ -70,6 +70,8 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "aligner_max_audio_seconds",
     "default_aligner_overflow",
     "default_diarize_quality",
+    "default_long_audio",
+    "long_audio_chunk_minutes",
     # Video generation defaults (video models only)
     "video_default_steps",
     "video_default_fps",
@@ -91,6 +93,8 @@ EXCLUDED_FROM_PROFILES = frozenset({
     "model_type_override",
     "active_profile_name",
     "ttl_seconds",
+    # Per-model scheduling cap, set deliberately per model (MTP models).
+    "max_concurrent_requests",
     # Security flag must be explicit per model — never propagated via profiles.
     "trust_remote_code",
 })

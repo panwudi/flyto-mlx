@@ -318,8 +318,16 @@ class TestExtractBlockTensorSliceLastBlock:
         ]
         config = ModelCacheConfig.from_type_list(["KVCache", "RotatingKVCache"])
 
+        # is_last_block alone is not enough: the live window may have
+        # moved past this block (upstream 8986da14).
         result = prefix_cache._extract_block_tensor_slice(
             cache_data, 0, 4, model_cache_config=config, is_last_block=True
+        )
+        assert result[1][0].shape == (1,)
+
+        result = prefix_cache._extract_block_tensor_slice(
+            cache_data, 0, 4, model_cache_config=config, is_last_block=True,
+            live_state_at_true_end=True,
         )
 
         assert result is not None
@@ -361,7 +369,8 @@ class TestExtractBlockTensorSliceLastBlock:
 
         # Block 3 (last): KVCache sliced, RotatingKVCache full state
         block3 = prefix_cache._extract_block_tensor_slice(
-            cache_data, 12, 16, model_cache_config=config, is_last_block=True
+            cache_data, 12, 16, model_cache_config=config, is_last_block=True,
+            live_state_at_true_end=True,
         )
         assert block3 is not None
         assert block3[0][0].shape == (1, 8, 4, 64)

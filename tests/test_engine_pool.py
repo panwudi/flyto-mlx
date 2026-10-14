@@ -770,6 +770,198 @@ class TestEnginePoolEviction:
                 await pool.get_engine("model-b")
 
 
+class TestWorkingHeadroomAdmission:
+    """Load-time working-set headroom admission (co-residency prevention)."""
+
+    @pytest.fixture
+    def headroom_pool(self, small_mock_model_dir, monkeypatch):
+        """Pool with deterministic byte sizes and a proxied phys footprint.
+
+        model-a / model-b both get estimated_size=1000; ceiling=3000. Phys is
+        proxied to the pool's tracked weight sum and active memory to 0 so the
+        headroom math is fully deterministic.
+        """
+        pool = _make_pool(ceiling=3000)
+        pool.discover_models(str(small_mock_model_dir))
+        pool._entries["model-a"].estimated_size = 1000
+        pool._entries["model-b"].estimated_size = 1000
+        monkeypatch.setattr(
+            "omlx.engine_pool.get_phys_footprint",
+            lambda: pool._current_model_memory,
+        )
+        monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: 0)
+        return pool
+
+    @staticmethod
+    def _engine_factory(mock_a, mock_b):
+        def create_engine(*args, **kwargs):
+            name = str(kwargs.get("model_name", args[0] if args else ""))
+            return mock_a if "model-a" in name else mock_b
+        return create_engine
+
+    def test_working_headroom_for_only_generation_types(self):
+        pool = _make_pool(ceiling=3000)
+        pool._get_working_headroom = lambda: 1500
+        gen = EngineEntry(
+            model_id="g", model_path="/x", model_type="llm",
+            engine_type="batched", estimated_size=1000,
+        )
+        emb = EngineEntry(
+            model_id="e", model_path="/x", model_type="embedding",
+            engine_type="embedding", estimated_size=1000,
+        )
+        assert pool._working_headroom_for(gen) == 1500
+        assert pool._working_headroom_for(emb) == 0
+        # Callback not wired -> 0 (degrade to weight-only admission)
+        pool._get_working_headroom = None
+        assert pool._working_headroom_for(gen) == 0
+
+    @pytest.mark.asyncio
+    async def test_headroom_triggers_eviction_of_idle_model(self, headroom_pool):
+        """Two models fit by weight (1000+1000<3000) but headroom (1500) pushes
+        the co-resident set over -> the idle first model is evicted."""
+        pool = headroom_pool
+        pool._get_working_headroom = lambda: 1500
+
+        mock_a = MagicMock()
+        mock_a.start = AsyncMock()
+        mock_a.stop = AsyncMock()
+        mock_a.has_active_requests.return_value = False
+        mock_b = MagicMock()
+        mock_b.start = AsyncMock()
+        mock_b.has_active_requests.return_value = False
+
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=self._engine_factory(mock_a, mock_b),
+        ):
+            await pool.get_engine("model-a")
+            assert pool.loaded_model_count == 1
+            await pool.get_engine("model-b")
+
+        mock_a.stop.assert_called_once()
+        assert pool._entries["model-a"].engine is None
+        assert pool._entries["model-b"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_headroom_rejects_transiently_when_other_model_busy(
+        self, headroom_pool
+    ):
+        """When the only other resident model is busy (unevictable), admitting a
+        second generation model would over-commit -> transient
+        InsufficientMemoryError (maps to 503)."""
+        pool = headroom_pool
+        pool._get_working_headroom = lambda: 1500
+
+        mock_a = MagicMock()
+        mock_a.start = AsyncMock()
+        mock_a.stop = AsyncMock()
+        mock_a.has_active_requests.return_value = True  # busy -> unevictable
+        mock_b = MagicMock()
+        mock_b.start = AsyncMock()
+        mock_b.has_active_requests.return_value = False
+
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=self._engine_factory(mock_a, mock_b),
+        ):
+            await pool.get_engine("model-a")  # alone: 0+1000+1500=2500<=3000
+            with pytest.raises(InsufficientMemoryError):
+                await pool.get_engine("model-b")
+
+        assert pool._entries["model-a"].engine is not None
+        assert pool._entries["model-b"].engine is None
+        mock_a.stop.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_single_model_alone_loads_despite_thin_headroom(
+        self, headroom_pool
+    ):
+        """A model that is the ONLY resident must load whenever its weights fit,
+        even if weights + headroom exceeds the ceiling (single-model serving is
+        never blocked by headroom)."""
+        pool = headroom_pool
+        pool._entries["model-a"].estimated_size = 2500  # <= 3000 ceiling
+        pool._get_working_headroom = lambda: 1000  # 2500+1000=3500 > 3000
+
+        mock_a = MagicMock()
+        mock_a.start = AsyncMock()
+        mock_a.has_active_requests.return_value = False
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_a):
+            await pool.get_engine("model-a")  # must not raise
+
+        assert pool._entries["model-a"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_single_model_too_large_still_raises(self, headroom_pool):
+        """Weights alone exceeding the ceiling stays a permanent
+        ModelTooLargeError (HTTP 507), regardless of headroom."""
+        pool = headroom_pool
+        pool._entries["model-a"].estimated_size = 4000  # > 3000 ceiling
+        pool._get_working_headroom = lambda: 1000
+
+        mock_a = MagicMock()
+        mock_a.start = AsyncMock()
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_a):
+            with pytest.raises(ModelTooLargeError):
+                await pool.get_engine("model-a")
+
+    @pytest.mark.asyncio
+    async def test_single_model_rejected_when_weights_exceed_current_room(
+        self, headroom_pool, monkeypatch
+    ):
+        """Alone but current (non-model) usage already leaves no room even for
+        the weights -> transient InsufficientMemoryError, NOT a thin-headroom
+        admit. Only the headroom reserve is waived for a lone model, never the
+        base weight fit against current usage."""
+        pool = headroom_pool
+        pool._entries["model-a"].estimated_size = 2000
+        pool._get_working_headroom = lambda: 500
+        # 2000 bytes of non-model baseline already in use; ceiling 3000.
+        # 2000(current) + 2000(weights) = 4000 > 3000, weights alone <= 3000.
+        monkeypatch.setattr(
+            "omlx.engine_pool.get_phys_footprint", lambda: 2000
+        )
+
+        mock_a = MagicMock()
+        mock_a.start = AsyncMock()
+        mock_a.has_active_requests.return_value = False
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_a):
+            with pytest.raises(InsufficientMemoryError):
+                await pool.get_engine("model-a")
+
+    @pytest.mark.asyncio
+    async def test_no_headroom_preserves_weight_only_coresidency(
+        self, headroom_pool
+    ):
+        """With headroom disabled (callback returns 0) the old weight-only
+        behavior holds: both small models co-reside (1000+1000<=3000)."""
+        pool = headroom_pool
+        pool._get_working_headroom = lambda: 0
+
+        mock_a = MagicMock()
+        mock_a.start = AsyncMock()
+        mock_a.stop = AsyncMock()
+        mock_a.has_active_requests.return_value = False
+        mock_b = MagicMock()
+        mock_b.start = AsyncMock()
+        mock_b.has_active_requests.return_value = False
+
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=self._engine_factory(mock_a, mock_b),
+        ):
+            await pool.get_engine("model-a")
+            await pool.get_engine("model-b")
+
+        assert pool._entries["model-a"].engine is not None
+        assert pool._entries["model-b"].engine is not None
+        mock_a.stop.assert_not_called()
+
+
 class TestEnginePoolStatus:
     """Tests for get_status is_loading field."""
 

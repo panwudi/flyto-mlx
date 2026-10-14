@@ -31,6 +31,7 @@ import asyncio
 import ctypes
 import ctypes.util
 import logging
+import os
 import subprocess
 import sys
 from collections import deque
@@ -39,7 +40,7 @@ from typing import TYPE_CHECKING, Any
 import mlx.core as mx
 import psutil
 
-from .utils.proc_memory import get_phys_footprint
+from .utils.proc_memory import get_phys_footprint, resident_usage_bytes
 
 if TYPE_CHECKING:
     from .engine_pool import EnginePool
@@ -53,6 +54,14 @@ logger = logging.getLogger(__name__)
 # afford a tier-scaled cut and still load any useful model.
 _SMALL_SYSTEM_RESERVE = 4 * 1024**3
 _SMALL_SYSTEM_THRESHOLD = 16 * 1024**3
+
+# Fraction of the LIVE ceiling reserved as generation-model working headroom
+# when memory_admission_headroom_gb is left at auto (0). Sized so two large
+# models cannot co-reside with no prefill room: on a 128 GB box (ceiling
+# ~107.5 GB) this is ~21.5 GB, so 68 GB + 21 GB of weights (89 GB) trips
+# eviction instead of stacking. Floored by prefill_transient_margin_bytes so it
+# never drops below a single request's forward-gate spike margin.
+_ADMISSION_HEADROOM_CEILING_FRACTION = 0.20
 
 # Tier map: static reserve (>= 16 GB systems). `custom` shares the
 # `balanced` reserve so the static cap stays sane regardless of what
@@ -168,6 +177,33 @@ def get_macos_vm_stats() -> dict[str, int] | None:
         }
     except Exception:  # noqa: BLE001
         return None
+
+
+def get_external_footprint_bytes(exclude_pids: "set[int] | None" = None) -> int:
+    """Bytes of phys_footprint held by every process except the excluded ones.
+
+    Same kernel ledger as `get_phys_footprint()`, so it is directly comparable
+    with omlx's own usage and -- unlike vm_statistics64's anonymous-page
+    counters -- it includes IOAccelerator (Metal) allocations. That matters:
+    MLX model weights are Metal-backed, so an anonymous-page metric reads a
+    model load as omlx's footprint growing while system anonymous memory does
+    not, which silently zeroes any growth signal derived from it.
+
+    Shared pages are counted once per mapping process, so the total can exceed
+    physical RAM. That over-counts in the conservative direction (tighter
+    ceiling), and only the *change* over time is used, where the shared
+    baseline cancels out.
+
+    Costs ~2 ms for a few hundred processes, so this belongs in the enforcer
+    poll loop, never on a per-request path.
+    """
+    excluded = exclude_pids or set()
+    total = 0
+    for pid in psutil.pids():
+        if pid in excluded:
+            continue
+        total += get_phys_footprint(pid)
+    return total
 
 
 def get_iogpu_wired_limit_bytes() -> int:
@@ -293,6 +329,7 @@ class ProcessMemoryEnforcer:
         prefill_safe_zone_ratio: float = 0.80,
         prefill_min_chunk_tokens: int = 32,
         prefill_transient_margin_gb: float = 0.0,
+        memory_admission_headroom_gb: float = 0.0,
     ):
         """
         Initialize the process memory enforcer.
@@ -341,6 +378,11 @@ class ProcessMemoryEnforcer:
         self._prefill_transient_margin_bytes = max(
             0, int(prefill_transient_margin_gb * 1024**3)
         )
+        # Explicit working-headroom override (bytes). 0 = auto-derive from the
+        # live ceiling in get_working_headroom(). See MemorySettings docstring.
+        self._admission_headroom_bytes = max(
+            0, int(memory_admission_headroom_gb * 1024**3)
+        )
         self._task: asyncio.Task | None = None
         self._running = False
         # Most recently observed pressure level, consumed by scheduler /
@@ -357,6 +399,17 @@ class ProcessMemoryEnforcer:
         # the next chunk. Updated on every poll iteration.
         self._usage_window: deque[int] = deque(maxlen=5)
         self._recent_peak_bytes: int = 0
+        # Ceiling from the last poll tick. _get_hard_limit_bytes() shells out to
+        # sysctl (get_iogpu_wired_limit_bytes), so hot per-request paths (the
+        # pre-stream admission gate, working-headroom derivation) read this
+        # cached value instead of forking a subprocess per request. Refreshed
+        # every poll via _propagate_memory_limit. 0 until the first poll.
+        self._last_ceiling_bytes: int = 0
+        # External-growth guard. Captured together in start(): how much memory
+        # other processes already held, and the ceiling that was resolved under
+        # exactly that condition. See _get_external_growth_ceiling.
+        self._baseline_external_bytes: int = 0
+        self._baseline_ceiling_bytes: int = 0
         # Video job memory lease (docs/video-generation-engine-spec.md 4.4).
         # While held, the lease is subtracted from the final ceiling so pool
         # admission, watermarks and the prefill gate all tighten coherently.
@@ -425,7 +478,16 @@ class ProcessMemoryEnforcer:
             return
         self._running = True
         self._propagate_memory_limit()
+        # Capture the external-growth baseline BEFORE resolving the ceiling, so
+        # the two describe the same instant. Order matters: reading it after
+        # would pin the ceiling to a condition that had already moved.
+        if self._prefill_memory_guard:
+            self._baseline_external_bytes = get_external_footprint_bytes(
+                self._external_pids_to_exclude()
+            )
         ceiling = self._get_hard_limit_bytes()
+        if self._prefill_memory_guard and self._baseline_external_bytes > 0:
+            self._baseline_ceiling_bytes = ceiling
 
         if self._prefill_memory_guard:
             static_ceiling = self._get_static_ceiling()
@@ -446,12 +508,25 @@ class ProcessMemoryEnforcer:
                 )
 
         self._task = asyncio.create_task(self._enforcement_loop())
+        # Fail-loud: surface the resolved admission state at startup so a
+        # disabled or misconfigured guard is never silent (lesson: the
+        # estimate-based guards were inert AND silent). load_headroom prevents
+        # big-model co-residency; request_margin is the per-request pre-stream
+        # gate reserve.
         logger.info(
             f"Process memory enforcer started "
             f"(tier={self._memory_guard_tier}, "
             f"ceiling={_format_gb(ceiling)}, "
+            f"load_headroom={_format_gb(self.get_working_headroom())}, "
+            f"request_margin={_format_gb(self._prefill_transient_margin_bytes)}, "
+            f"external_baseline={_format_gb(self._baseline_external_bytes)}, "
             f"interval={self._poll_interval}s)"
         )
+        if self._prefill_memory_guard and self._baseline_ceiling_bytes <= 0:
+            logger.warning(
+                "External-growth guard INERT: baseline capture returned 0. "
+                "Memory taken by other processes will not tighten the ceiling."
+            )
 
     def _get_static_ceiling(self) -> int:
         """Total RAM minus tier-scaled static reserve."""
@@ -514,6 +589,55 @@ class ProcessMemoryEnforcer:
         )
         return max(0, omlx_usage + worker_extra + reclaimable)
 
+    def _external_pids_to_exclude(self) -> set[int]:
+        """omlx's own processes -- their memory is not "external"."""
+        pids = {os.getpid()}
+        if self._video_worker_pid is not None:
+            pids.add(self._video_worker_pid)
+        return pids
+
+    def _get_external_growth_ceiling(self) -> int:
+        """Ceiling that shrinks 1:1 with memory taken by OTHER processes.
+
+        Why this exists: the dynamic ceiling is
+        ``omlx_usage + free + inactive + active * ratio``. When another process
+        takes memory, its pages land in active/inactive and are then credited
+        straight back as "reclaimable" -- 100% of the inactive share and
+        ``ratio`` of the active share. Measured on m5max (2026-08-25): a 22.4 GB
+        external allocation moved free by -24.1, inactive by +5.6 and active by
+        +18.5, so at ratio 0.5 the ceiling fell only 9.2 GB of the 22.4 that was
+        actually consumed. Those pages are dirty anonymous memory -- they can be
+        compressed or swapped but never dropped, and swapping under a prefill
+        spike is the documented path to a machine-wide stall.
+
+        This candidate closes that gap without re-basing anything: it is pinned
+        to the ceiling that was resolved at startup and only ever subtracts the
+        GROWTH in other processes' footprint since then. With no external growth
+        it equals the startup ceiling, sits above the live dynamic ceiling, and
+        is discarded by the min() in _get_hard_limit_bytes -- inert by
+        construction. omlx loading its own models does not move it, because its
+        own pids are excluded.
+
+        Deliberate limitations:
+
+        * Memory already resident at startup is baselined in, not protected
+          against. The scenario this guards is "something new takes memory while
+          omlx is serving", which is what the load-time admission race needs.
+        * The baseline never ratchets down, so if external memory is later
+          freed this candidate does not rise above the startup ceiling. That
+          forfeits upside; it never refuses anything that was loadable at
+          startup.
+
+        Returns 0 (excluded from the min) until start() captures a baseline.
+        """
+        if not self._prefill_memory_guard or self._baseline_ceiling_bytes <= 0:
+            return 0
+        current = get_external_footprint_bytes(self._external_pids_to_exclude())
+        if current <= 0:
+            return 0  # measurement failed -- do not tighten on bad data
+        growth = max(0, current - self._baseline_external_bytes)
+        return max(0, self._baseline_ceiling_bytes - growth)
+
     def _get_hard_limit_bytes(self) -> int:
         """Final hard ceiling = min(static, dynamic, metal_cap).
 
@@ -536,6 +660,9 @@ class ProcessMemoryEnforcer:
         metal_cap = get_effective_metal_cap_bytes()
         if metal_cap > 0:
             candidates.append(metal_cap)
+        external_ceiling = self._get_external_growth_ceiling()
+        if external_ceiling > 0:
+            candidates.append(external_ceiling)
         ceiling = min(candidates)
         if self._video_lease_bytes > 0:
             # Clamp to >= 1, never 0: every consumer treats ceiling 0 as
@@ -548,6 +675,82 @@ class ProcessMemoryEnforcer:
     def get_final_ceiling(self) -> int:
         """Public accessor used by engine_pool pre-load admission."""
         return self._get_hard_limit_bytes()
+
+    def _cached_ceiling(self) -> int:
+        """Ceiling from the last poll tick, for hot per-request paths.
+
+        _get_hard_limit_bytes() shells out to sysctl, so callers that run per
+        request (the admission gate, headroom derivation) read the ~1s-fresh
+        cached value instead of forking a subprocess each time. Falls back to a
+        fresh computation when the poll loop has not populated it yet (enforcer
+        not running).
+        """
+        if self._running and self._last_ceiling_bytes > 0:
+            return self._last_ceiling_bytes
+        return self._get_hard_limit_bytes()
+
+    def get_working_headroom(self) -> int:
+        """Working-set headroom reserved above model weights at pool LOAD
+        admission (engine_pool.get_engine) for generation models.
+
+        Returns 0 when the guard is disabled. When
+        ``memory_admission_headroom_gb`` is set (>0) it is returned verbatim;
+        otherwise it auto-derives from the LIVE ceiling as
+        ``max(prefill_transient_margin_bytes,
+        _ADMISSION_HEADROOM_CEILING_FRACTION * ceiling)`` so the reserve tracks
+        the dynamic ceiling (shrinks when other apps take memory) and never
+        drops below a single request's forward-gate spike margin. This prevents
+        two large generation models from co-residing with no prefill room --
+        the load-time root cause of the "mid-stream rejection after HTTP 200"
+        symptom.
+        """
+        if not self._prefill_memory_guard:
+            return 0
+        if self._admission_headroom_bytes > 0:
+            return self._admission_headroom_bytes
+        ceiling = self._cached_ceiling()
+        if ceiling <= 0:
+            return 0
+        return max(
+            self._prefill_transient_margin_bytes,
+            int(ceiling * _ADMISSION_HEADROOM_CEILING_FRACTION),
+        )
+
+    def prefill_admission_ok(self) -> tuple[bool, int, int]:
+        """Pre-stream request admission check, mirroring the scheduler's
+        phys-based forward gate (_prefill_forward_gate) but hoisted BEFORE the
+        SSE stream opens.
+
+        Returns ``(ok, current, ceiling)``. ``ok is False`` means
+        ``current + prefill_transient_margin`` would breach the ceiling, so the
+        caller must reject the request with HTTP 503 + Retry-After BEFORE
+        streaming instead of letting the forward gate raise a mid-stream error
+        event after HTTP 200. Uses the same final test as the forward gate --
+        resident memory (phys net of MLX's free-buffer pool, see
+        ``resident_usage_bytes``) plus the transient margin against the
+        ceiling -- so it admits exactly what the forward gate would run.
+        The rolling ``recent_peak`` is not used here: a one-tick spike that is
+        already gone (e.g. a finishing request's cache store) used to keep
+        rejecting every new request for the whole 5-tick window.
+        Returns ``(True, 0, 0)`` when the guard is disabled.
+        """
+        if not self._prefill_memory_guard:
+            return True, 0, 0
+        ceiling = self._cached_ceiling()
+        if ceiling <= 0:
+            return True, 0, ceiling
+        current, active, phys, cache = resident_usage_bytes()
+        ok = (current + self._prefill_transient_margin_bytes) <= ceiling
+        if not ok:
+            logger.warning(
+                "[memadmit] resident %s (active %s, phys %s, mlx free pool %s, "
+                "recent peak %s) + margin %s > ceiling %s",
+                _format_gb(current), _format_gb(active), _format_gb(phys),
+                _format_gb(cache), _format_gb(self._recent_peak_bytes),
+                _format_gb(self._prefill_transient_margin_bytes),
+                _format_gb(ceiling),
+            )
+        return ok, current, ceiling
 
     def recent_peak_bytes(self) -> int:
         """Recent high-water memory usage over the last few poll ticks."""
@@ -690,6 +893,7 @@ class ProcessMemoryEnforcer:
         schedulers as fast as the poll interval allows.
         """
         ceiling = self._get_hard_limit_bytes()
+        self._last_ceiling_bytes = ceiling
         soft_limit = int(ceiling * self._soft_threshold) if ceiling > 0 else 0
         admission_paused = self._pressure_level != "ok"
         for entry in self._engine_pool._entries.values():
@@ -803,9 +1007,11 @@ class ProcessMemoryEnforcer:
         if new_level != prev_level:
             self._pressure_level = new_level
             self._propagate_memory_limit()
+            _, active, phys, cache = resident_usage_bytes()
             logger.info(
                 f"Memory pressure level: {prev_level} -> {new_level} "
-                f"(current={_format_gb(current)}, "
+                f"(current={_format_gb(current)}, active={_format_gb(active)}, "
+                f"phys={_format_gb(phys)}, mlx_free_pool={_format_gb(cache)}, "
                 f"soft={_format_gb(soft)}, hard={_format_gb(hard)}, "
                 f"ceiling={_format_gb(ceiling)})"
             )

@@ -1269,3 +1269,205 @@ class TestTwoWatermarkPressureLevels:
         assert status["current_bytes"] == 88 * 1024**3
         # Utilization computed against the max value
         assert abs(status["utilization"] - 0.88) < 0.01
+
+
+class TestWorkingHeadroom:
+    """get_working_headroom(): load-admission co-residency reserve."""
+
+    def test_auto_derive_uses_fraction_of_ceiling(self, mock_engine_pool):
+        # auto: max(margin 12GB, 0.20*100GB=20GB) = 20GB
+        enforcer = _make_enforcer(
+            mock_engine_pool, ceiling=100 * 1024**3,
+            prefill_transient_margin_gb=12.0,
+        )
+        assert enforcer.get_working_headroom() == 20 * 1024**3
+
+    def test_auto_derive_floored_by_transient_margin(self, mock_engine_pool):
+        # small ceiling: 0.20*40GB=8GB < margin 12GB -> floor to margin
+        enforcer = _make_enforcer(
+            mock_engine_pool, ceiling=40 * 1024**3,
+            prefill_transient_margin_gb=12.0,
+        )
+        assert enforcer.get_working_headroom() == 12 * 1024**3
+
+    def test_explicit_override_returned_verbatim(self, mock_engine_pool):
+        enforcer = _make_enforcer(
+            mock_engine_pool, ceiling=100 * 1024**3,
+            prefill_transient_margin_gb=12.0,
+            memory_admission_headroom_gb=30.0,
+        )
+        assert enforcer.get_working_headroom() == 30 * 1024**3
+
+    def test_zero_when_guard_disabled(self, mock_engine_pool):
+        enforcer = _make_enforcer(
+            mock_engine_pool, ceiling=100 * 1024**3,
+            prefill_memory_guard=False,
+            prefill_transient_margin_gb=12.0,
+        )
+        assert enforcer.get_working_headroom() == 0
+
+
+GB = 1024**3
+
+
+class TestPrefillAdmissionOk:
+    """prefill_admission_ok(): pre-stream request gate, mirrors forward gate."""
+
+    @staticmethod
+    def _resident(monkeypatch, *, active, phys, cache):
+        resident = max(active, phys - cache)
+        monkeypatch.setattr(
+            "omlx.process_memory_enforcer.resident_usage_bytes",
+            lambda: (resident, active, phys, cache),
+        )
+
+    def test_ok_when_current_plus_margin_under_ceiling(
+        self, mock_engine_pool, monkeypatch
+    ):
+        enforcer = _make_enforcer(
+            mock_engine_pool, ceiling=100 * 1024**3,
+            prefill_transient_margin_gb=12.0,
+        )
+        self._resident(monkeypatch, active=50 * GB, phys=60 * GB, cache=0)
+        ok, current, ceiling = enforcer.prefill_admission_ok()
+        # resident = 60GB; 60+12=72 <= 100 -> ok
+        assert ok is True
+        assert current == 60 * GB
+        assert ceiling == 100 * GB
+
+    def test_reject_when_margin_would_breach(
+        self, mock_engine_pool, monkeypatch
+    ):
+        enforcer = _make_enforcer(
+            mock_engine_pool, ceiling=100 * 1024**3,
+            prefill_transient_margin_gb=12.0,
+        )
+        self._resident(monkeypatch, active=90 * GB, phys=92 * GB, cache=0)
+        ok, current, _ = enforcer.prefill_admission_ok()
+        # resident = 92GB; 92+12=104 > 100 -> reject
+        assert ok is False
+        assert current == 92 * GB
+
+    def test_free_buffer_pool_and_stale_peak_do_not_reject(
+        self, mock_engine_pool, monkeypatch
+    ):
+        """2026-10-13 m5max: phys 100GB of which ~30GB was MLX's free-buffer
+        pool, and a one-tick spike kept recent_peak at 100GB; every request
+        got 503 for seconds while resident memory was ~68GB."""
+        enforcer = _make_enforcer(
+            mock_engine_pool, ceiling=107 * 1024**3,
+            prefill_transient_margin_gb=12.0,
+        )
+        enforcer._recent_peak_bytes = 100 * GB
+        self._resident(monkeypatch, active=60 * GB, phys=100 * GB, cache=32 * GB)
+        ok, current, _ = enforcer.prefill_admission_ok()
+        assert ok is True
+        assert current == 68 * GB
+
+    def test_ok_when_guard_disabled(self, mock_engine_pool):
+        enforcer = _make_enforcer(
+            mock_engine_pool, ceiling=100 * 1024**3,
+            prefill_memory_guard=False,
+        )
+        assert enforcer.prefill_admission_ok() == (True, 0, 0)
+
+
+# ---------------------------------------------------------------------------
+# External-growth ceiling
+# ---------------------------------------------------------------------------
+
+
+class TestExternalFootprint:
+    """get_external_footprint_bytes: same ledger as omlx's own footprint."""
+
+    def test_sums_every_pid_except_the_excluded(self, monkeypatch):
+        from omlx import process_memory_enforcer as pme
+
+        monkeypatch.setattr(pme.psutil, "pids", lambda: [1, 2, 3, 4])
+        monkeypatch.setattr(
+            pme, "get_phys_footprint", lambda pid: {1: 10, 2: 20, 3: 30, 4: 40}[pid]
+        )
+        assert pme.get_external_footprint_bytes({2, 4}) == 40
+        assert pme.get_external_footprint_bytes(set()) == 100
+        assert pme.get_external_footprint_bytes(None) == 100
+
+
+class TestExternalGrowthCeiling:
+    """The candidate must be inert until OTHER processes grow.
+
+    Regression anchor for the real defect (measured m5max 2026-08-25): the
+    dynamic ceiling credits other processes' pages straight back as
+    reclaimable, so a 22.4 GB external allocation moved it by only 9.2 GB.
+    """
+
+    def _enforcer(self, monkeypatch, baseline_external, baseline_ceiling, current):
+        from omlx import process_memory_enforcer as pme
+
+        e = ProcessMemoryEnforcer.__new__(ProcessMemoryEnforcer)
+        e._prefill_memory_guard = True
+        e._video_worker_pid = None
+        e._baseline_external_bytes = baseline_external
+        e._baseline_ceiling_bytes = baseline_ceiling
+        monkeypatch.setattr(
+            pme, "get_external_footprint_bytes", lambda *a, **k: current
+        )
+        return e
+
+    def test_inert_when_external_unchanged(self, monkeypatch):
+        e = self._enforcer(monkeypatch, 50, 100, current=50)
+        assert e._get_external_growth_ceiling() == 100
+
+    def test_inert_when_external_shrinks(self, monkeypatch):
+        """A freed external process must not raise the candidate above the
+        startup ceiling -- growth is clamped at 0, never negative."""
+        e = self._enforcer(monkeypatch, 50, 100, current=30)
+        assert e._get_external_growth_ceiling() == 100
+
+    def test_tightens_one_for_one_with_external_growth(self, monkeypatch):
+        e = self._enforcer(monkeypatch, 50, 100, current=74)
+        assert e._get_external_growth_ceiling() == 76
+
+    def test_never_negative(self, monkeypatch):
+        e = self._enforcer(monkeypatch, 50, 100, current=500)
+        assert e._get_external_growth_ceiling() == 0
+
+    def test_disabled_without_a_baseline(self, monkeypatch):
+        """No baseline (start() never ran, or capture failed) -> excluded from
+        the min() rather than silently clamping everything to 0."""
+        e = self._enforcer(monkeypatch, 0, 0, current=999)
+        assert e._get_external_growth_ceiling() == 0
+
+    def test_disabled_when_guard_off(self, monkeypatch):
+        e = self._enforcer(monkeypatch, 50, 100, current=999)
+        e._prefill_memory_guard = False
+        assert e._get_external_growth_ceiling() == 0
+
+    def test_bad_measurement_does_not_tighten(self, monkeypatch):
+        """A failed scan reads as 0; tightening on that would clamp the ceiling
+        to the startup value for no reason."""
+        e = self._enforcer(monkeypatch, 50, 100, current=0)
+        assert e._get_external_growth_ceiling() == 0
+
+    def test_video_worker_is_not_external(self, monkeypatch):
+        """The video worker already has its lease subtracted in
+        _get_hard_limit_bytes; counting it again would double-penalise."""
+        import os
+
+        e = self._enforcer(monkeypatch, 50, 100, current=50)
+        e._video_worker_pid = 4242
+        assert e._external_pids_to_exclude() == {os.getpid(), 4242}
+
+
+class TestResidentUsageBytes:
+    """resident = max(active, phys - MLX free-buffer pool)."""
+
+    def test_subtracts_free_pool_but_never_below_active(self, monkeypatch):
+        from omlx.utils import proc_memory
+
+        monkeypatch.setattr(proc_memory, "get_phys_footprint", lambda *a: 100 * GB)
+        monkeypatch.setattr("mlx.core.get_active_memory", lambda: 60 * GB)
+        monkeypatch.setattr("mlx.core.get_cache_memory", lambda: 30 * GB)
+        assert proc_memory.resident_usage_bytes() == (70 * GB, 60 * GB, 100 * GB, 30 * GB)
+
+        monkeypatch.setattr("mlx.core.get_cache_memory", lambda: 50 * GB)
+        assert proc_memory.resident_usage_bytes()[0] == 60 * GB

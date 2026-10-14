@@ -121,6 +121,7 @@ class MockBaseEngine:
         )
 
     async def stream_chat(self, messages: List[Dict], **kwargs) -> AsyncIterator[MockGenerationOutput]:
+        self.last_stream_kwargs = kwargs
         if self._stream_outputs:
             for output in self._stream_outputs:
                 yield output
@@ -944,6 +945,60 @@ class TestStreamingHelperFunctions:
         assert len(tool_use_blocks) == 1
         assert tool_use_blocks[0]["name"] == "get_weather"
         assert "tool_use" in stop_reasons
+
+    @pytest.mark.asyncio
+    async def test_stream_anthropic_parses_deferred_tool_not_in_template(self):
+        """Tool search: a loaded defer_loading tool parses via parse_tools."""
+        from omlx.server import stream_anthropic_messages
+        from omlx.api.anthropic_models import MessagesRequest
+
+        call = '<tool_call>{"name":"mcp__rea__inspect_macho","arguments":{"binary":"/bin/ls"}}</tool_call>'
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text=call, new_text=call, completion_tokens=2,
+                finished=True, finish_reason="stop", tool_calls=None,
+            ),
+        ])
+        read_tool = {"type": "function", "function": {
+            "name": "Read", "description": "Read a file",
+            "parameters": {"type": "object", "properties": {}},
+        }}
+        macho_tool = {"type": "function", "function": {
+            "name": "mcp__rea__inspect_macho", "description": "Inspect Mach-O",
+            "parameters": {
+                "type": "object", "properties": {"binary": {"type": "string"}},
+            },
+        }}
+        request = MessagesRequest(
+            model="test-model", max_tokens=256, stream=True,
+            messages=[{"role": "user", "content": "Hi"}],
+        )
+
+        events = []
+        async for event in stream_anthropic_messages(
+            engine,
+            [{"role": "user", "content": "Hi"}],
+            request,
+            parse_tools=[read_tool, macho_tool],
+            max_tokens=256,
+            tools=[read_tool],
+        ):
+            events.append(event)
+
+        parsed = [
+            json.loads(line[6:])
+            for event in events
+            for line in event.split("\n")
+            if line.startswith("data: ")
+        ]
+        tool_uses = [
+            e["content_block"] for e in parsed
+            if e.get("type") == "content_block_start"
+            and e["content_block"]["type"] == "tool_use"
+        ]
+        assert [t["name"] for t in tool_uses] == ["mcp__rea__inspect_macho"]
+        assert "parse_tools" not in engine.last_stream_kwargs
 
     @pytest.mark.asyncio
     async def test_anthropic_tool_only_stream_starts_with_tool_use_block(self):

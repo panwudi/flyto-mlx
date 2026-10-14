@@ -234,12 +234,20 @@ def run(spec: dict) -> int:
             base_kwargs["negative_prompt"] = spec["negative_prompt"]
         if spec.get("guidance") is not None:
             base_kwargs["guidance"] = float(spec["guidance"])
+    # Inpaint pipelines (inpaint / controlnet_inpaint) take exactly one source
+    # image + one mask and run a masked-denoise loop (omlx/image/qwen_inpaint),
+    # NOT model.generate_image. Resolved from the model's declared pipeline so a
+    # Phase-2 controlnet variant slots in here without touching dispatch.
+    is_inpaint = pipeline in ("inpaint", "controlnet_inpaint")
+    mask_path = spec.get("mask_path")
+    if is_inpaint and not (image_paths and mask_path):
+        raise RuntimeError("inpaint pipeline requires both an image and a mask")
     if pipeline == "edit":
         # Edit conditions on reference images; width/height default to the
         # first reference's aspect at ~1MP inside mflux (the recommended
         # default -- forced square output degrades qwen-edit quality).
         base_kwargs["image_paths"] = image_paths
-    elif image_paths:
+    elif image_paths and not is_inpaint:
         # img2img on a t2i model: single source image + strength.
         base_kwargs["image_path"] = image_paths[0]
         strength = spec.get("image_strength")
@@ -253,6 +261,51 @@ def run(spec: dict) -> int:
     out_width = out_height = None
     for i in range(n):
         current_index = i
+        if is_inpaint:
+            # mask is the standard inpaint convention (white=regenerate); the
+            # caller already inverted BiRefNet foreground (spec section 2).
+            # width/height omitted -> follow the source aspect at ~1MP (mflux
+            # canvas policy); the mask is resized to match, so they stay aligned.
+            # Sibling import without the omlx package: this script runs as
+            # `python -I worker.py` (no parent package, and -I implies -P so the
+            # script dir is NOT on sys.path), so add the dir explicitly. A
+            # relative/omlx import would crash every inpaint job.
+            _here = os.path.dirname(os.path.abspath(__file__))
+            if _here not in sys.path:
+                sys.path.insert(0, _here)
+            import qwen_inpaint
+
+            def _inpaint_cb(step: int, total: int, _i: int = i) -> None:
+                _emit(
+                    phase="denoise", step=step, total_steps=total, image_index=_i
+                )
+
+            pil = qwen_inpaint.generate_inpaint(
+                model,
+                prompt=spec["prompt"],
+                image_path=image_paths[0],
+                mask_path=str(mask_path),
+                width=int(spec["width"]) if spec.get("width") else None,
+                height=int(spec["height"]) if spec.get("height") else None,
+                steps=int(spec["steps"]),
+                seed=seed + i,
+                guidance=spec.get("guidance"),
+                negative_prompt=spec.get("negative_prompt"),
+                image_strength=float(spec.get("image_strength") or 1.0),
+                progress_cb=_inpaint_cb,
+            )
+            _emit(phase="saving", image_index=i)
+            name = f"output-{i}.png"
+            pil.save(os.path.join(output_dir, name))
+            outputs.append(name)
+            if out_width is None:
+                out_width, out_height = pil.size
+            if n > 1:
+                try:
+                    mx.clear_cache()
+                except Exception:
+                    pass
+            continue
         generated = model.generate_image(seed=seed + i, **base_kwargs)
         _emit(phase="saving", image_index=i)
         name = f"output-{i}.png"

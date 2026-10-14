@@ -2,7 +2,7 @@
 <html lang="{{ current_lang }}">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}{{ t('common.app_title') }}{% endblock %}</title>
     <link rel="icon" type="image/svg+xml" href="/admin/static/favicon.svg">
 
@@ -22,6 +22,7 @@
 
     <!-- Tailwind CSS (pre-compiled) -->
     <link rel="stylesheet" href="/admin/static/css/tailwind.css">
+    <link rel="stylesheet" href="/admin/static/css/flyto.css">
 
     <!-- Alpine.js -->
     <script defer src="/admin/static/js/alpine.min.js"></script>
@@ -33,6 +34,7 @@
         // Apply theme immediately to prevent flash of wrong theme
         (function() {
             var theme = localStorage.getItem('omlx-chat-theme') || 'light';
+            if (theme === 'auto') theme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
             document.documentElement.setAttribute('data-theme', theme);
         })();
     </script>
@@ -45,7 +47,7 @@
 
     <style>
         /* Lucide icon fallback: ensure unprocessed <i data-lucide> elements
-           are inline-block so Tailwind w-*/h-* classes apply even if
+           are inline-block so Tailwind width and height classes apply even if
            lucide.min.js fails to load or createIcons() hasn't run yet. */
         [data-lucide] {
             display: inline-block;
@@ -74,34 +76,14 @@
 
         [x-cloak] { display: none !important; }
 
-        /* Subtle grain texture for background */
-        .bg-grain {
-            background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 400 400' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)' opacity='0.03'/%3E%3C/svg%3E");
-        }
-
-        /* Card hover effect */
-        .card-hover {
-            transition: transform 0.3s ease, box-shadow 0.3s ease;
-        }
-        .card-hover:hover {
-            transform: translateY(-4px);
-            box-shadow: 0 20px 40px -10px rgba(0,0,0,0.1);
-        }
-
-        /* Input focus ring */
-        input:focus, select:focus, textarea:focus {
-            outline: none;
-            box-shadow: 0 0 0 2px rgba(0,0,0,0.1);
-        }
-
         /* Benchmark tooltip (fixed position, outside overflow containers) */
         .bench-tip-fixed {
             position: fixed;
             z-index: 9999;
             max-width: 320px;
             padding: 10px 12px;
-            background: #171717;
-            color: #e5e5e5;
+            background: var(--text-primary);
+            color: var(--bg-primary);
             font-size: 12px;
             font-weight: 400;
             line-height: 1.5;
@@ -115,11 +97,11 @@
 
     {% block head %}{% endblock %}
 </head>
-<body class="font-sans bg-white text-neutral-900 antialiased selection:bg-neutral-900 selection:text-white">
+<body class="font-sans antialiased">
     {% block content %}{% endblock %}
 
     <script>
-        // Lucide icon processor — bypasses createIcons() which has Safari issues.
+        // Lucide icon processor: bypasses createIcons() which has Safari issues.
         // Directly creates SVGs from lucide.icons definitions.
         (function() {
             if (typeof lucide === 'undefined' || !lucide.icons) return;

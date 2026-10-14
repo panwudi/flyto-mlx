@@ -13,15 +13,16 @@ quantization, grammar-constrained structured output (xgrammar), and an admin UI.
 - CLI main name `fmlx`; `omlx` kept as an alias for upstream-script compat.
 - Renamed from `panwudi/omlx` on 2026-05-16.
 
-### Upstream relationship — soft fork
+### Upstream relationship — independent since 2026-10-14
 
-Upstream is `jundot/omlx` (`upstream` git remote). We **soft-fork**: cherry-pick
-upstream bug fixes and new-model support; we do **not** PR our own features back.
-Sync workflow: `git fetch upstream && git log upstream/main..main`, cherry-pick
-selectively (`-x`), and record every import/skip decision in
-`docs/upstream-sync.md`. To check whether an upstream commit is already in,
-actually `git cherry-pick` it (a "nothing to commit" means it is) — `git cherry`
-and grep both mis-report.
+Flyto MLX split from `jundot/omlx` on 2026-10-14 (owner decision). It no longer
+tracks upstream: there are no scheduled syncs, and upstream's direction, UI and
+features are not a reference for ours. We still share the MLX / mlx-lm / mlx-vlm
+foundation, so upstream PRs and issues stay a useful source: when one fixes a bug
+or supports a model we need, port it by hand as a reviewed change of ours (cite
+the upstream commit/PR in the message), with our own tests. The `upstream` git
+remote is kept for reading. Past imports and skips are recorded in
+`docs/upstream-sync.md`; add an entry there when porting something.
 
 ## Repo layout
 
@@ -84,13 +85,18 @@ destructive / shared-state operation" rule for this repo only.
 
 ## Machines
 
-- Flyto MLX servers run on **m2max** and **m5max** at `~/Code/omlx`, launched by
+- The Flyto MLX server runs only on **m5max** at `~/Code/omlx`, launched by
   `/Applications/Flyto MLX.app` -- a thin Swift menubar shell whose source lives
   in this repo at `apps/omlx-mac` (bundle dir/MachO still named `oMLX`). The
   shell embeds no Python; it shells out to the host venv
   `~/Code/omlx/.venv/bin/python -m omlx.cli serve` (see `PythonRuntime.swift`),
   so editing a `.py` in the worktree + restarting the server applies instantly.
   The local clone dir is named `omlx`; it is this `flyto-mlx` repo.
+- **m2max is a dev machine only.** Its server, app, cluster router and models
+  were removed on 2026-10-10 (it had been down since late September with no
+  traffic). Keep `~/Code/omlx` + `.venv` there for development and tests; do
+  not deploy to it. The m5max cluster router (`:9000`) now has m5max as its
+  only backend.
 - Rebuilding the menubar shell: `apps/omlx-mac/Scripts/build.sh` (needs Xcode;
   emits a few-MB `build/Stage/oMLX.app`, version tracked from `omlx/_version.py`).
   Deploy by replacing `/Applications/Flyto MLX.app` (`ditto` + `codesign --force

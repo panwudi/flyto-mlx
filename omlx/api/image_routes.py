@@ -81,6 +81,14 @@ _FALLBACK_STEPS = 30
 # does not guard this (the CLI does) -- wrong conditioning otherwise.
 _MULTI_REF_ALIASES = {"qwen-image-edit-2509", "qwen-image-edit-2511"}
 
+# Mask-driven inpaint pipelines (Phase 1 base; Phase 2 controlnet). Resolved
+# from the model entry's image_pipeline so a controlnet variant slots into the
+# same dispatch (docs/qwen-inpaint-engine-spec.md s4).
+_INPAINT_PIPELINES = {"inpaint", "controlnet_inpaint"}
+# Pipelines whose output follows the source image aspect rather than a default
+# canvas (edit + inpaint family).
+_SOURCE_ASPECT_PIPELINES = {"edit"} | _INPAINT_PIPELINES
+
 
 def _get_image_manager():
     """Active MediaJobManager from server state (test-patchable)."""
@@ -185,10 +193,18 @@ def _decode_image_string(value: str) -> bytes:
 
 async def _parse_create_body(
     request: Request,
-) -> tuple[ImageCreateParams, list[tuple[bytes, str]]]:
-    """Accept JSON or multipart. Returns (params, [(bytes, suffix), ...])."""
+) -> tuple[ImageCreateParams, list[tuple[bytes, str]], tuple[bytes, str] | None]:
+    """Accept JSON or multipart.
+
+    Returns (params, [(image_bytes, suffix), ...], (mask_bytes, suffix) | None).
+    The `mask` field (inpaint only) is a single image extracted the same way as
+    `image` -- a multipart file/string field or a JSON base64/data-URL string.
+    Standard inpaint convention (white=regenerate); the caller inverts a
+    foreground mask before sending (docs/qwen-inpaint-engine-spec.md s2).
+    """
     content_type = (request.headers.get("content-type") or "").lower()
     images: list[bytes] = []
+    mask_bytes: bytes | None = None
     try:
         if "multipart/form-data" in content_type:
             form = await request.form()
@@ -196,6 +212,7 @@ async def _parse_create_body(
                 k: v for k, v in form.items() if isinstance(v, str)
             }
             data.pop("image", None)
+            data.pop("mask", None)
             for upload in form.getlist("image"):
                 if isinstance(upload, str):
                     if upload:
@@ -204,6 +221,11 @@ async def _parse_create_body(
                     # Bounded read: an unbounded read() would materialize an
                     # arbitrarily large upload in RAM before the size check.
                     images.append(await upload.read(_MAX_INPUT_IMAGE_BYTES + 1))
+            mask_upload = form.get("mask")
+            if mask_upload is not None and not isinstance(mask_upload, str):
+                mask_bytes = await mask_upload.read(_MAX_INPUT_IMAGE_BYTES + 1)
+            elif isinstance(mask_upload, str) and mask_upload:
+                mask_bytes = _decode_image_string(mask_upload)
         else:
             data = await request.json()
             if not isinstance(data, dict):
@@ -217,6 +239,9 @@ async def _parse_create_body(
             for item in values:
                 if isinstance(item, str) and item:
                     images.append(_decode_image_string(item))
+            mask_value = data.pop("mask", None)
+            if isinstance(mask_value, str) and mask_value:
+                mask_bytes = _decode_image_string(mask_value)
     except HTTPException:
         raise
     except Exception:
@@ -233,9 +258,14 @@ async def _parse_create_body(
             raise HTTPException(
                 status_code=400, detail="image is empty (zero-byte upload)"
             )
+    if mask_bytes is not None and not mask_bytes:
+        raise HTTPException(
+            status_code=400, detail="mask is empty (zero-byte upload)"
+        )
     pairs = [(b, _sniff_image(b)) for b in images]
+    mask_pair = (mask_bytes, _sniff_image(mask_bytes)) if mask_bytes else None
     try:
-        return ImageCreateParams.model_validate(data), pairs
+        return ImageCreateParams.model_validate(data), pairs, mask_pair
     except ValidationError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -331,7 +361,10 @@ def _normalize_params(
         raise HTTPException(
             status_code=400, detail="width and height must be given together"
         )
-    if width is None and pipeline != "edit":
+    # edit and inpaint follow the source image aspect inside mflux (forcing a
+    # default canvas degrades quality / breaks the inpaint composite); only
+    # t2i resolves a default size.
+    if width is None and pipeline not in _SOURCE_ASPECT_PIPELINES:
         default_size = (
             getattr(model_settings, "image_default_size", None)
             or getattr(image_settings, "default_size", "1024x1024")
@@ -358,7 +391,19 @@ def _normalize_params(
                 ),
             )
 
-    if pipeline == "edit":
+    if pipeline in _INPAINT_PIPELINES:
+        # Inpaint takes exactly one source image (+ a mask, validated by the
+        # caller which holds the mask bytes). The masked-denoise loop runs in
+        # the worker (omlx/image/qwen_inpaint), not model.generate_image.
+        if input_count != 1:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Model '{entry.model_id}' is an inpaint model and requires "
+                    "exactly one input image plus a mask"
+                ),
+            )
+    elif pipeline == "edit":
         if input_count < 1:
             raise HTTPException(
                 status_code=400,
@@ -484,11 +529,19 @@ def _sync_response(
 async def _create_image_impl(request: Request, force_sync: bool):
     manager = _get_image_manager()
     image_settings = _image_settings()
-    params, input_images = await _parse_create_body(request)
+    params, input_images, input_mask = await _parse_create_body(request)
 
     pool = _get_engine_pool()
     if params.model:
         resolved = _resolve_model(params.model)
+    elif input_mask is not None:
+        # A mask only makes sense for an inpaint model; auto-pick can't tell
+        # which registered model is the inpaint one, so require an explicit id
+        # rather than silently routing the mask to an edit/t2i model.
+        raise HTTPException(
+            status_code=400,
+            detail="mask requires specifying an inpaint 'model'",
+        )
     else:
         picked = _pick_default_model(pool, want_edit=bool(input_images))
         if picked is None:
@@ -512,6 +565,23 @@ async def _create_image_impl(request: Request, force_sync: bool):
             detail=(
                 f"Model '{resolved}' is not an image generation model "
                 f"(model_type={getattr(entry, 'model_type', '?')})"
+            ),
+        )
+
+    # Mask <-> inpaint-pipeline must agree (the masked-denoise path is gated on
+    # the model's declared pipeline, not on mask presence -- spec s4).
+    entry_pipeline = getattr(entry, "image_pipeline", "") or "t2i"
+    if entry_pipeline in _INPAINT_PIPELINES and input_mask is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model '{resolved}' is an inpaint model and requires a mask",
+        )
+    if input_mask is not None and entry_pipeline not in _INPAINT_PIPELINES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Model '{resolved}' ({entry_pipeline}) does not accept a mask; "
+                "use an inpaint model"
             ),
         )
 
@@ -557,7 +627,11 @@ async def _create_image_impl(request: Request, force_sync: bool):
         lease_bytes=lease_bytes,
     )
     try:
-        await manager.submit(job, input_images=input_images or None)
+        await manager.submit(
+            job,
+            input_images=input_images or None,
+            input_mask=input_mask,
+        )
     except QueueFullError as e:
         raise HTTPException(status_code=503, detail=str(e))
     _record_image_request(resolved)

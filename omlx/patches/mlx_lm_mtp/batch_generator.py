@@ -166,13 +166,14 @@ def _model_has_mtp_module(model: Any) -> bool:
 def _is_mtp_eligible(gen_batch: Any) -> bool:
     """``__init__`` and ``next`` only engage MTP for single-sequence batches
     when the model exposes ``mtp_forward``, has an attached MTP head, and
-    the process-wide ``mtp_active`` flag is on.
+    MTP was enabled for that model when it loaded.
 
     The MTP head may be attached unconditionally (e.g. by the mlx-vlm
     runtime patches, which need it for weight-load matching even when
     inference-time MTP is off) — so head presence alone is not enough
-    to decide whether to run the draft/verify cycle. ``is_mtp_active``
-    reflects the per-load ``model_settings.mtp_enabled`` choice.
+    to decide whether to run the draft/verify cycle. ``model_mtp_active``
+    reads the ``model_settings.mtp_enabled`` choice stamped on the model at
+    load time, so loading another model cannot switch it off.
     """
     if not hasattr(gen_batch, "model"):
         return False
@@ -181,8 +182,8 @@ def _is_mtp_eligible(gen_batch: Any) -> bool:
     if not _model_has_mtp_module(gen_batch.model):
         return False
     try:
-        from . import is_mtp_active
-        if not is_mtp_active():
+        from . import model_mtp_active
+        if not model_mtp_active(gen_batch.model):
             return False
     except Exception:
         return False
@@ -447,6 +448,35 @@ def _rebuild_singleton_cache(model: Any) -> Optional[List[Any]]:
         return None
 
 
+# Re-prefill chunk for _reconcile_mtp_to_standard; matches prefill_step_size.
+_RECONCILE_CHUNK_TOKENS = 2048
+
+
+def _cache_state_arrays(cache: List[Any]) -> List[Any]:
+    """Every mx.array in the per-layer cache states, so each chunk's cache
+    update is evaluated before the next one is built on top of it."""
+    import mlx.core as mx
+
+    out: List[Any] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, mx.array):
+            out.append(value)
+        elif isinstance(value, dict):
+            for item in value.values():
+                collect(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                collect(item)
+
+    for c in cache or []:
+        try:
+            collect(getattr(c, "state", None))
+        except Exception:
+            continue
+    return out
+
+
 def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
     """Rewind a to-be-dropped MTP singleton into a standard-resumable state.
 
@@ -480,9 +510,20 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         procs = _proc_list(gen_batch)
         _set_singleton_mrope_delta(gen_batch)
         tok_arr = _ensure_uint32(mx.array(list(tokens)))
+        # Re-prefill with a plain forward (no per-position rollback capture,
+        # see _call_forward), in chunks, keeping only the last position's
+        # logits, so memory stays bounded however long the sequence is.
+        # Chunking also matches the 2048-token prefill step, so recurrent
+        # state is built the same way as the original prefill.
         # Inherits the per-engine stream from the enclosing BatchGenerator context.
-        logits, _, _ = _call_backbone(gen_batch.model, tok_arr[None, :], new_cache)
-        last_logits = logits[:, -1, :]  # (1, vocab) — dist after tokens[-1]
+        n_tokens = int(tok_arr.shape[0])
+        last_logits = None
+        for start in range(0, n_tokens, _RECONCILE_CHUNK_TOKENS):
+            piece = tok_arr[None, start : start + _RECONCILE_CHUNK_TOKENS]
+            logits = _call_forward(gen_batch.model, piece, new_cache)
+            last_logits = logits[:, -1, :]  # (1, vocab) — dist after the chunk's last token
+            del logits
+            mx.eval(last_logits, *_cache_state_arrays(new_cache))
 
         if state.queue:
             next_id, next_lp_1d, _src = state.queue[0]
@@ -671,6 +712,21 @@ def _call_backbone(
     raise TypeError(
         f"backbone returned unexpected shape: {type(result).__name__}"
     )
+
+
+def _call_forward(model: Any, inputs: Any, cache: List[Any]) -> Any:
+    """Plain backbone forward returning logits only.
+
+    Unlike ``_call_backbone`` this never asks for ``return_hidden``. On the
+    mlx-vlm path ``return_hidden`` captures every position's GatedDeltaNet
+    state for draft rollback: harmless for a 2-4 token verify, but ~150 MB
+    per token on Qwen 3.8, so a re-prefill of a few hundred tokens took
+    m5max past 100 GB and aborted the serve.
+    """
+    result = model(inputs, cache=cache)
+    if isinstance(result, tuple):
+        return result[0]
+    return getattr(result, "logits", result)
 
 
 def _clear_rollback(prompt_cache: List[Any]) -> None:

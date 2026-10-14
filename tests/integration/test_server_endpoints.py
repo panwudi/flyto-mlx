@@ -818,6 +818,51 @@ class TestAnthropicMessagesEndpoint:
 
         assert response.status_code == 200
 
+    def _anthropic_template_kwargs(self, client, mock_llm_engine, **extra):
+        mock_llm_engine.chat = AsyncMock(return_value=MockGenerationOutput(
+            text="ok", prompt_tokens=3, completion_tokens=1,
+        ))
+        body = {
+            "model": "test-model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        body.update(extra)
+        response = client.post("/v1/messages", json=body)
+        assert response.status_code == 200
+        return mock_llm_engine.chat.call_args.kwargs.get("chat_template_kwargs") or {}
+
+    def test_anthropic_output_config_effort_reaches_template(self, client, mock_llm_engine):
+        """Claude Code's output_config.effort becomes the template reasoning_effort."""
+        kwargs = self._anthropic_template_kwargs(
+            client, mock_llm_engine,
+            thinking={"type": "adaptive"}, output_config={"effort": "low"},
+        )
+        assert kwargs.get("reasoning_effort") == "low"
+        assert kwargs.get("enable_thinking") is True
+
+    def test_anthropic_output_config_effort_above_domain_folds_to_high(self, client, mock_llm_engine):
+        kwargs = self._anthropic_template_kwargs(
+            client, mock_llm_engine, output_config={"effort": "max"},
+        )
+        assert kwargs.get("reasoning_effort") == "high"
+
+    def test_anthropic_unknown_effort_is_not_forwarded(self, client, mock_llm_engine):
+        """Out-of-domain values would raise in strict templates; drop them."""
+        for raw in ("off", "banana"):
+            kwargs = self._anthropic_template_kwargs(
+                client, mock_llm_engine, output_config={"effort": raw},
+            )
+            assert "reasoning_effort" not in kwargs
+
+    def test_anthropic_explicit_template_kwarg_beats_output_config(self, client, mock_llm_engine):
+        kwargs = self._anthropic_template_kwargs(
+            client, mock_llm_engine,
+            output_config={"effort": "low"},
+            chat_template_kwargs={"reasoning_effort": "medium"},
+        )
+        assert kwargs.get("reasoning_effort") == "medium"
+
     def test_anthropic_messages_sanitize_thinking_tool_call_markup(self, client, mock_llm_engine):
         """Anthropic thinking blocks should not expose raw tool-call markup."""
         mock_llm_engine.chat = AsyncMock(return_value=MockGenerationOutput(
@@ -862,6 +907,49 @@ class TestAnthropicMessagesEndpoint:
         assert tool_use_blocks[0]["name"] == "get_weather"
         assert tool_use_blocks[0]["input"] == {"city": "SF"}
         assert data["stop_reason"] == "tool_use"
+
+    def test_anthropic_deferred_tool_is_callable_but_not_rendered(self, client, mock_llm_engine):
+        """Tool search: defer_loading tools stay out of the template, yet parse."""
+        mock_llm_engine.chat = AsyncMock(return_value=MockGenerationOutput(
+            text='<tool_call>{"name":"mcp__rea__inspect_macho","arguments":{"binary":"/bin/ls"}}</tool_call>',
+            prompt_tokens=10,
+            completion_tokens=5,
+            finish_reason="stop",
+            finished=True,
+        ))
+
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "test-model",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "inspect /bin/ls"}],
+                "tools": [
+                    {
+                        "name": "Read",
+                        "description": "Read a file",
+                        "input_schema": {"type": "object", "properties": {}},
+                    },
+                    {
+                        "name": "mcp__rea__inspect_macho",
+                        "description": "Inspect Mach-O",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"binary": {"type": "string"}},
+                        },
+                        "defer_loading": True,
+                    },
+                ],
+            },
+        )
+
+        assert response.status_code == 200
+        rendered = mock_llm_engine.chat.call_args.kwargs["tools"]
+        assert [t["function"]["name"] for t in rendered] == ["Read"]
+        tool_use_blocks = [b for b in response.json()["content"] if b["type"] == "tool_use"]
+        assert len(tool_use_blocks) == 1
+        assert tool_use_blocks[0]["name"] == "mcp__rea__inspect_macho"
+        assert tool_use_blocks[0]["input"] == {"binary": "/bin/ls"}
 
 
 class TestEmbeddingsEndpoint:

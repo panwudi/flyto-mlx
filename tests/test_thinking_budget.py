@@ -297,6 +297,77 @@ class TestResolveThinkingBudget:
 
 
 # ---------------------------------------------------------------------------
+# Effort levels forwarded into chat_template_kwargs
+# ---------------------------------------------------------------------------
+
+
+class TestTemplateForwardableEfforts:
+    """The set of efforts server.py forwards to chat templates.
+
+    Both /v1/chat/completions and /v1/responses gate on this one set, so the
+    unvalidated Responses dict cannot smuggle a level past the domain that
+    ChatCompletionRequest enforces.
+    """
+
+    def test_is_the_validated_domain_minus_off(self):
+        from omlx.api.openai_models import REASONING_EFFORT_LEVELS
+        from omlx.server import _TEMPLATE_FORWARDABLE_EFFORTS
+
+        assert _TEMPLATE_FORWARDABLE_EFFORTS == REASONING_EFFORT_LEVELS - {"off"}
+
+    def test_off_is_never_forwarded(self):
+        from omlx.server import _TEMPLATE_FORWARDABLE_EFFORTS
+
+        assert "off" not in _TEMPLATE_FORWARDABLE_EFFORTS
+
+    def test_template_native_levels_are_not_forwarded(self):
+        """Levels outside flyto's domain ride chat_template_kwargs instead."""
+        from omlx.server import _TEMPLATE_FORWARDABLE_EFFORTS
+
+        for level in ("xhigh", "max", "minimal", "none", "banana"):
+            assert level not in _TEMPLATE_FORWARDABLE_EFFORTS
+
+
+class TestAnthropicTemplateEffort:
+    """output_config.effort from Anthropic clients (Claude Code) folds onto
+    the forwardable domain; anything else keeps the template default."""
+
+    def _import(self):
+        from omlx.server import _anthropic_template_effort
+        return _anthropic_template_effort
+
+    def test_in_domain_levels_pass_through(self):
+        f = self._import()
+        for level in ("low", "medium", "high"):
+            assert f({"effort": level}) == level
+
+    def test_levels_above_domain_fold_to_high(self):
+        f = self._import()
+        assert f({"effort": "xhigh"}) == "high"
+        assert f({"effort": "max"}) == "high"
+
+    def test_normalises_case_and_whitespace(self):
+        f = self._import()
+        assert f({"effort": " Medium "}) == "medium"
+
+    def test_off_and_unknown_are_dropped(self):
+        f = self._import()
+        for raw in ("off", "none", "minimal", "banana", "", 3, None):
+            assert f({"effort": raw}) is None
+
+    def test_missing_config_is_dropped(self):
+        f = self._import()
+        assert f(None) is None
+        assert f({}) is None
+        assert f("high") is None
+
+    def test_result_is_always_forwardable(self):
+        from omlx.server import _ANTHROPIC_EFFORT_ALIASES, _TEMPLATE_FORWARDABLE_EFFORTS
+
+        assert set(_ANTHROPIC_EFFORT_ALIASES.values()) <= _TEMPLATE_FORWARDABLE_EFFORTS
+
+
+# ---------------------------------------------------------------------------
 # _effort_to_budget (server.py helper)
 # ---------------------------------------------------------------------------
 

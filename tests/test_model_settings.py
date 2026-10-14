@@ -469,3 +469,38 @@ class TestModelSettingsManager:
                 t.join()
 
             assert len(errors) == 0
+
+
+class TestPerModelMaxConcurrency:
+    """ModelSettings.max_concurrent_requests overrides the engine's own
+    scheduler cap without touching the shared/global config."""
+
+    def test_roundtrip(self):
+        from omlx.model_settings import ModelSettings
+
+        ms = ModelSettings.from_dict({"max_concurrent_requests": 1})
+        assert ms.max_concurrent_requests == 1
+        assert ms.to_dict()["max_concurrent_requests"] == 1
+        assert "max_concurrent_requests" not in ModelSettings().to_dict()
+
+    def test_override_applies_to_copy_only(self):
+        import copy
+
+        from omlx.model_settings import ModelSettings
+        from omlx.scheduler import SchedulerConfig, apply_model_concurrency_override
+
+        shared = SchedulerConfig(max_num_seqs=8, completion_batch_size=8)
+        mine = copy.copy(shared)
+        apply_model_concurrency_override(mine, ModelSettings(max_concurrent_requests=1))
+        assert (mine.max_num_seqs, mine.completion_batch_size) == (1, 1)
+        assert (shared.max_num_seqs, shared.completion_batch_size) == (8, 8)
+
+    def test_unset_or_invalid_keeps_global(self):
+        from omlx.model_settings import ModelSettings
+        from omlx.scheduler import SchedulerConfig, apply_model_concurrency_override
+
+        for ms in (None, ModelSettings(), ModelSettings(max_concurrent_requests=0),
+                   ModelSettings(max_concurrent_requests=True)):
+            cfg = SchedulerConfig(max_num_seqs=8, completion_batch_size=8)
+            apply_model_concurrency_override(cfg, ms)
+            assert cfg.max_num_seqs == 8

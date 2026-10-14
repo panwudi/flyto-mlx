@@ -30,18 +30,18 @@ classifiers = [
 ]
 
 dependencies = [
-    "mlx>=0.31.2",
+    "mlx==0.32.3",
     # Published metadata uses a PyPI spec (PyPI rejects direct git URLs in
-    # Requires-Dist). Local dev is pinned to commit ed1fca4 (v0.31.3 +
-    # thread-local generation stream + ArraysCache batch dim + think-token None
-    # fixes) via [tool.uv].override-dependencies below.
+    # Requires-Dist). Local dev is pinned to commit ab1806e (v0.31.3 + 15,
+    # the mlx-lm upstream oMLX ran with MLX 0.32.2 and pre-0.7 mlx-vlm) via
+    # [tool.uv].override-dependencies below.
     "mlx-lm==0.31.3",
     # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
     "regex",
     # PyPI spec for publish; dev pinned to commit 32981fa via override below.
     "mlx-embeddings==0.1.0",
     # mlx-vlm custom processors bypass HF AutoProcessor, so torch is not required
-    "transformers>=5.0.0",
+    "transformers>=5.12.1,<5.13",
     # transformers 5.x's tokenization_mistral_common module imports
     # ReasoningEffort from mistral_common (added in 1.10). The audio extras
     # transitively pull mistral-common via mlx-audio[stt], which historically
@@ -77,12 +77,15 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # PyPI spec for publish; dev pinned to v0.6.3 tag commit 5a4222a (gemma4
-    # quantization predicate #1288, gemma4_unified image/video drop fix, Qwen3-VL
-    # chunked-prefill mask fixes, speculative chunked prefill #1334) via
-    # override below. 0.6.2 is the minimum carrying gemma4_unified + MTP drafter
-    # (#1267) and the long-text chunked prefill fix (#1280) we rely on.
-    "mlx-vlm>=0.6.2",
+    # PyPI spec for publish; dev pinned to commit 78b96eb (v0.6.3 + 51, the
+    # pre-0.7 mlx-vlm upstream oMLX ran with MLX 0.32.2) via override below.
+    # mlx-vlm 0.7 rewrote the speculative-decode API; moving to it needs the
+    # Qwen3.5/3.6 VLM MTP integration ported first. MLX 0.32 compatibility
+    # for this pin comes from omlx/patches/mlx_vlm_mlx0322_compat.py.
+    # Published metadata pins 0.6.3 (the release production ran before this
+    # pin): 0.6.4 rewrote the caches, RoPE handling and the diffusion
+    # generation path and has not been verified with oMLX.
+    "mlx-vlm==0.6.3",
     "Pillow>=9.0.0",
     # PyPI spec for publish; dev pinned to commit 20d68db (bstnxbt repo: Gemma4
     # support, runtime package refactor, stable prefix snapshot reuse) via
@@ -93,7 +96,11 @@ dependencies = [
     # xgrammar 0.2.x dropped torch (~24MB total: xgrammar + apache-tvm-ffi),
     # so structured output works out of the box — no silent prompt-only
     # degrade when the extra was simply never installed.
-    "xgrammar>=0.1.32",
+    # Pinned exactly: 0.2.8 rejects wrong-type values for optional typed
+    # properties under additionalProperties (xgrammar #595) and turns inputs
+    # that used to segfault the process into exceptions (#869). Unpinned,
+    # a venv rebuild could land on any 0.2.x.
+    "xgrammar==0.2.8",
 ]
 
 [project.optional-dependencies]
@@ -207,9 +214,10 @@ include = ["omlx*"]
 # it both pins the commit and overrides transitive pins
 # (e.g. mlx-audio → mlx-lm==0.31.1) that would otherwise conflict.
 override-dependencies = [
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd",
+    "mlx==0.32.3",
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ab1806e8f5d6aa035973af194a1b9198ab4754dc",
     "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@5a4222a15c70cb3725179d591442b1fbe1044b60",
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@78b96eb5462141447b9a6b4943ef553891da56dd",
     "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@20d68db3b3c0ae3dd6d3a2f0d3c10b2344ee514e",
     "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@51753266e0a4f766fd5e6fbc46652224efc23981",
 ]

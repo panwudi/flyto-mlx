@@ -98,7 +98,9 @@ from .api.openai_models import (
     ModelInfo,
     ModelsResponse,
     PromptTokensDetails,
+    REASONING_EFFORT_LEVELS,
     Usage,
+    dump_chat_completion_response,
 )
 from .api.embedding_models import (
     EmbeddingRequest,
@@ -154,7 +156,7 @@ from .api.tool_calling import (
     sanitize_tool_call_markup,
 )
 from .api.thinking import ThinkingParser, extract_thinking
-from .api.utils import clean_output_text, clean_special_tokens, detect_and_strip_partial, extract_multimodal_content, extract_text_content
+from .api.utils import clean_output_text, clean_special_tokens, detect_and_strip_partial, extract_multimodal_content, extract_text_content, merge_reasoning_effort_chat_template_kwargs
 from .engine import BaseEngine, BatchedEngine, VLMBatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
@@ -363,10 +365,12 @@ async def lifespan(app: FastAPI):
             prefill_safe_zone_ratio=mem_cfg.prefill_safe_zone_ratio,
             prefill_min_chunk_tokens=mem_cfg.prefill_min_chunk_tokens,
             prefill_transient_margin_gb=mem_cfg.prefill_transient_margin_gb,
+            memory_admission_headroom_gb=mem_cfg.memory_admission_headroom_gb,
         )
         _server_state.process_memory_enforcer = enforcer
         _server_state.engine_pool._process_memory_enforcer = enforcer
         _server_state.engine_pool._get_final_ceiling = enforcer.get_final_ceiling
+        _server_state.engine_pool._get_working_headroom = enforcer.get_working_headroom
         enforcer.start()
 
     # Media job manager (video + image) -- constructed AFTER the enforcer
@@ -563,10 +567,18 @@ async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
             exc.detail,
         )
     if _is_api_route(request):
-        content = _openai_error_body(exc.detail, exc.status_code)
+        content = _openai_error_body(
+            exc.detail, exc.status_code, code=getattr(exc, "code", None)
+        )
     else:
         content = {"detail": exc.detail}
-    return JSONResponse(status_code=exc.status_code, content=content)
+    # Propagate any headers set on the exception (e.g. Retry-After on the 503
+    # admission gate / InsufficientMemoryError). Without this the generic
+    # handler silently dropped them -- the SchedulerQueueFullError handler only
+    # kept its Retry-After by building its own JSONResponse.
+    return JSONResponse(
+        status_code=exc.status_code, content=content, headers=exc.headers
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -830,9 +842,16 @@ async def get_engine(
         )
         raise HTTPException(status_code=404, detail=detail)
     except ModelTooLargeError as e:
+        # Model weights alone exceed the ceiling -- never fits, not retryable.
         raise HTTPException(status_code=507, detail=str(e))
     except InsufficientMemoryError as e:
-        raise HTTPException(status_code=507, detail=str(e))
+        # Transient co-residency over-commit: the resident model frees memory
+        # when idle, so the client should retry. 503 + Retry-After (not 507,
+        # which signals a permanent "won't fit"). Rejected here BEFORE any
+        # StreamingResponse, so the client never sees a mid-stream error event.
+        raise HTTPException(
+            status_code=503, detail=str(e), headers={"Retry-After": "1"}
+        )
     except ModelLoadingError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except ModelTypeNotLoadableError as e:
@@ -904,6 +923,45 @@ def _suggest_endpoint_for_engine(engine: object) -> str:
     return "Use the model's dedicated endpoint (see /v1/models)."
 
 
+def _memory_admission_gate() -> None:
+    """Pre-stream memory admission gate for generation requests.
+
+    Runs AFTER the engine is resolved (even on a pool cache hit) and BEFORE the
+    SSE stream opens, so a request that would breach the memory ceiling during
+    prefill is rejected with HTTP 503 + Retry-After up front, instead of a
+    mid-stream error event after HTTP 200 -- the hardest failure form for
+    clients (see docs/memory-admission-gate-design.md).
+
+    This is the axis the load-time headroom check cannot cover: many concurrent
+    requests against the SAME already-loaded big model accumulate KV and push
+    the baseline up. It mirrors the scheduler's phys-based forward gate
+    threshold, so it rejects exactly the requests the forward gate would -- only
+    earlier and cleanly. No-op when the enforcer is absent or the guard is
+    disabled.
+    """
+    pool = get_engine_pool()
+    enforcer = getattr(pool, "_process_memory_enforcer", None)
+    if enforcer is None:
+        return
+    ok, current, ceiling = enforcer.prefill_admission_ok()
+    if ok:
+        return
+    logger.warning(
+        "[memadmit] pre-stream 503: current %s + margin would breach "
+        "ceiling %s",
+        format_size(current), format_size(ceiling),
+    )
+    raise HTTPException(
+        status_code=503,
+        detail=(
+            "Server memory is at capacity "
+            f"({format_size(current)} of {format_size(ceiling)} ceiling). "
+            "Retry shortly."
+        ),
+        headers={"Retry-After": "1"},
+    )
+
+
 async def get_engine_for_model(model: str | None = None) -> BaseEngine:
     """
     Get LLM engine for the specified model (or default).
@@ -919,7 +977,12 @@ async def get_engine_for_model(model: str | None = None) -> BaseEngine:
     Raises:
         HTTPException: If model not found or memory error
     """
-    return await get_engine(model, EngineType.LLM)
+    engine = await get_engine(model, EngineType.LLM)
+    # Pre-stream memory admission: reject over-budget requests with 503 BEFORE
+    # any StreamingResponse opens (all LLM chat/completions/responses endpoints
+    # funnel through here). Runs even on a pool cache hit.
+    _memory_admission_gate()
+    return engine
 
 
 async def get_embedding_engine(model: str) -> EmbeddingEngine:
@@ -1112,6 +1175,31 @@ def get_sampling_params(
 # Per-model overrides live in ModelSettings.reasoning_effort_budgets.
 _REASONING_EFFORT_BUDGETS = {"low": 512, "medium": 2048, "high": 8192}
 
+# Effort levels forwarded into chat_template_kwargs so templates with native
+# reasoning levels (Qwen 3.8) can honour them. "off" is excluded: it is flyto
+# sugar for enable_thinking=False, not a template level.
+_TEMPLATE_FORWARDABLE_EFFORTS = REASONING_EFFORT_LEVELS - {"off"}
+
+# Anthropic output_config.effort levels above flyto's domain fold onto its top
+# level. Qwen 3.8's template maps "high" to its own top level xhigh, so a
+# client choosing xhigh or max still gets the deepest thinking the template
+# has, without widening what is forwarded.
+_ANTHROPIC_EFFORT_ALIASES = {"xhigh": "high", "max": "high"}
+
+
+def _anthropic_template_effort(output_config: dict | None) -> str | None:
+    """Map Anthropic ``output_config.effort`` onto a forwardable effort.
+
+    Returns None when absent or out of domain, so the template keeps its own
+    default exactly as before this field was read.
+    """
+    raw = output_config.get("effort") if isinstance(output_config, dict) else None
+    if not isinstance(raw, str):
+        return None
+    effort = raw.strip().lower()
+    effort = _ANTHROPIC_EFFORT_ALIASES.get(effort, effort)
+    return effort if effort in _TEMPLATE_FORWARDABLE_EFFORTS else None
+
 
 def _effort_to_budget(effort: str | None, ms) -> int | None:
     """Map an OpenAI ``reasoning_effort`` level to a thinking-token budget.
@@ -1244,6 +1332,14 @@ def scale_anthropic_tokens(token_count: int, model_id: str | None = None) -> int
     return int(token_count * cc.target_context_size / actual)
 
 
+class _ContextLengthExceededError(HTTPException):
+    # Clients compact only on overflow errors they recognize: this OpenAI
+    # code, "prompt is too long: N tokens > M", or "maximum context length".
+    # Claude Code 2.1.296 matches "prompt is too long" (lowercased) and reads
+    # the token gap from "prompt is too long ... N tokens > M".
+    code = "context_length_exceeded"
+
+
 def validate_context_window(
     num_prompt_tokens: int, model_id: str | None = None
 ) -> None:
@@ -1254,11 +1350,11 @@ def validate_context_window(
     """
     max_ctx = get_max_context_window(model_id)
     if max_ctx and num_prompt_tokens > max_ctx:
-        raise HTTPException(
+        raise _ContextLengthExceededError(
             status_code=400,
             detail=(
-                f"Prompt too long: {num_prompt_tokens} tokens exceeds "
-                f"max context window of {max_ctx} tokens"
+                f"Prompt is too long: {num_prompt_tokens} tokens > "
+                f"{max_ctx} maximum context length"
             ),
         )
 
@@ -2344,9 +2440,20 @@ async def create_chat_completion(
         # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
         if ms.preserve_thinking is not None:
             merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
+    # A top-level reasoning_effort also reaches the chat template so templates
+    # with native reasoning levels (Qwen 3.8) can honour it. The field is
+    # already validated into REASONING_EFFORT_LEVELS; only "off" is held back
+    # because that is flyto sugar for enable_thinking=False, not a template
+    # level. An explicit chat_template_kwargs entry always wins.
+    _request_ct_kwargs = merge_reasoning_effort_chat_template_kwargs(
+        request.chat_template_kwargs,
+        request.reasoning_effort
+        if request.reasoning_effort in _TEMPLATE_FORWARDABLE_EFFORTS
+        else None,
+    )
     # Per-request kwargs override model settings (except forced keys)
-    if request.chat_template_kwargs:
-        for k, v in request.chat_template_kwargs.items():
+    if _request_ct_kwargs:
+        for k, v in _request_ct_kwargs.items():
             if k not in forced_keys:
                 merged_ct_kwargs[k] = v
 
@@ -2671,7 +2778,7 @@ async def create_chat_completion(
 
         finish_reason = "tool_calls" if tool_calls else output.finish_reason
 
-        return ChatCompletionResponse(
+        _response = ChatCompletionResponse(
             model=request.model,
             choices=[ChatCompletionChoice(
                 message=AssistantMessage(
@@ -2691,7 +2798,11 @@ async def create_chat_completion(
                 model_load_duration=round(model_load_duration, 2) if model_load_duration > 1.0 else None,
                 total_time=round(elapsed, 2),
             ),
-        ).model_dump_json(exclude_none=True)
+        )
+        # Not model_dump_json(exclude_none=True): that drops message.content
+        # whenever the reply carries no visible text (tool calls only, or
+        # thinking only), which strict OpenAI clients read unconditionally.
+        return dump_chat_completion_response(_response)
 
     return StreamingResponse(
         _with_json_keepalive(http_request, _build_chat_completion()),
@@ -3673,6 +3784,7 @@ async def stream_anthropic_messages(
     messages: list,
     request: AnthropicMessagesRequest,
     resolved_model: Optional[str] = None,
+    parse_tools: Optional[list] = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """
@@ -3707,8 +3819,13 @@ async def stream_anthropic_messages(
     block_index = 0
     last_output = None  # Track last output for tool_calls and token counts
 
+    # Tools the parser accepts: the template's list plus loaded deferred
+    # (tool search) tools, which the template never renders.
+    if parse_tools is None:
+        parse_tools = kwargs.get("tools")
+
     # Filter tool-call markup from streamed content when tools are present.
-    has_tools = bool(kwargs.get("tools"))
+    has_tools = bool(parse_tools)
     tool_filter = None
     thinking_filter = None
     if has_tools:
@@ -3741,6 +3858,7 @@ async def stream_anthropic_messages(
         message_id=message_id,
         model=request.model,
         input_tokens=scale_anthropic_tokens(estimated_input_tokens, request.model),
+        prefix_cache_enabled=engine.prefix_cache_enabled,
     )
 
     # 3. Stream content with thinking/content separation
@@ -3795,7 +3913,7 @@ async def stream_anthropic_messages(
                         # tool_use blocks.
                         if (
                             not text_block_started
-                            and kwargs.get("tools")
+                            and parse_tools
                             and not content_delta.strip()
                         ):
                             pass  # drop leading whitespace adjacent to tool envelopes
@@ -3900,7 +4018,7 @@ async def stream_anthropic_messages(
             )
             for tc in last_output.tool_calls
         ]
-    elif kwargs.get("tools"):
+    elif parse_tools:
         # Non-Harmony: separate thinking, then parse tool calls from content
         # (falls back to thinking content for small models)
         thinking_content, regular_content = extract_thinking(accumulated_text)
@@ -3908,7 +4026,7 @@ async def stream_anthropic_messages(
             thinking_content,
             regular_content,
             tokenizer=engine.tokenizer,
-            tools=kwargs.get("tools"),
+            tools=parse_tools,
         )
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
@@ -4070,9 +4188,16 @@ async def create_anthropic_message(
         # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
         if ms.preserve_thinking is not None:
             merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
+    # output_config.effort reaches the chat template the same way a
+    # top-level reasoning_effort does on /v1/chat/completions. An explicit
+    # chat_template_kwargs entry always wins.
+    _request_ct_kwargs = merge_reasoning_effort_chat_template_kwargs(
+        request.chat_template_kwargs,
+        _anthropic_template_effort(request.output_config),
+    )
     # Per-request kwargs override model settings (except forced keys)
-    if request.chat_template_kwargs:
-        for k, v in request.chat_template_kwargs.items():
+    if _request_ct_kwargs:
+        for k, v in _request_ct_kwargs.items():
             if k not in forced_keys:
                 merged_ct_kwargs[k] = v
 
@@ -4161,8 +4286,15 @@ async def create_anthropic_message(
     ):
         merged_ct_kwargs["preserve_thinking"] = True
 
-    # Merge MCP tools with user-provided Anthropic tools
-    user_internal = convert_anthropic_tools_to_internal(request.tools)
+    # Merge MCP tools with user-provided Anthropic tools. Tool-search tools
+    # (defer_loading) stay out of the template; their definitions arrive
+    # inline via tool_reference, so only the parser needs to know them.
+    user_internal = convert_anthropic_tools_to_internal(
+        request.tools, include_deferred=False
+    )
+    deferred_internal = convert_anthropic_tools_to_internal(
+        request.tools, only_deferred=True
+    )
     if getattr(engine, "is_diffusion_model", False):
         if user_internal:
             raise InvalidRequestError(
@@ -4189,6 +4321,9 @@ async def create_anthropic_message(
         internal_tools = enrich_tool_params_for_gemma4(internal_tools)
     if internal_tools:
         chat_kwargs["tools"] = internal_tools
+    parse_tools = internal_tools
+    if deferred_internal and not getattr(engine, "is_diffusion_model", False):
+        parse_tools = (internal_tools or []) + deferred_internal
 
     # Add chat template kwargs
     if merged_ct_kwargs:
@@ -4225,7 +4360,10 @@ async def create_anthropic_message(
     if request.stream:
         return StreamingResponse(
             _with_sse_keepalive(
-                stream_anthropic_messages(engine, messages, request, resolved_model=resolved_model, **chat_kwargs),
+                stream_anthropic_messages(
+                    engine, messages, request, resolved_model=resolved_model,
+                    parse_tools=parse_tools, **chat_kwargs,
+                ),
                 http_request=http_request,
                 keepalive_chunk=_resolve_keepalive("anthropic"),
             ),
@@ -4280,7 +4418,7 @@ async def create_anthropic_message(
                 thinking_content,
                 regular_content,
                 tokenizer=engine.tokenizer,
-                tools=internal_tools,
+                tools=parse_tools,
             )
             cleaned_text = extraction.cleaned_text
             tool_calls = extraction.tool_calls
@@ -4351,8 +4489,10 @@ async def count_anthropic_tokens(
     )
     messages = convert_anthropic_to_internal(temp_request)
 
-    # Convert tools if present
-    internal_tools = convert_anthropic_tools_to_internal(request.tools)
+    # Convert tools if present (deferred tool-search tools are not rendered)
+    internal_tools = convert_anthropic_tools_to_internal(
+        request.tools, include_deferred=False
+    )
 
     # Apply chat template to get prompt
     tokenizer = engine.tokenizer
@@ -4496,6 +4636,29 @@ async def create_response(
         # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
         if ms.preserve_thinking is not None:
             merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
+    # Responses API carries the effort under reasoning.effort. Unlike
+    # /v1/chat/completions this is an unvalidated dict, so restrict it to the
+    # same domain here -- out-of-domain values are dropped silently (clients
+    # such as Codex CLI send reasoning.effort unprompted; rejecting would
+    # break them) and behave exactly as they did before this field was
+    # forwarded at all. "off" is flyto sugar for enable_thinking=False, not a
+    # template level, so it is not forwarded either.
+    _raw_effort = (
+        request.reasoning.get("effort")
+        if isinstance(request.reasoning, dict)
+        else None
+    )
+    _reasoning_effort = (
+        _raw_effort.strip().lower() if isinstance(_raw_effort, str) else None
+    )
+    if _reasoning_effort not in _TEMPLATE_FORWARDABLE_EFFORTS:
+        _reasoning_effort = None
+    merged_ct_kwargs = (
+        merge_reasoning_effort_chat_template_kwargs(
+            merged_ct_kwargs, _reasoning_effort
+        )
+        or {}
+    )
 
     # Note: extract_text_content/extract_harmony_messages/extract_multimodal_content
     # are NOT called here because convert_responses_input_to_messages() already

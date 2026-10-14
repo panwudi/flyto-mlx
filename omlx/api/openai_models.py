@@ -22,6 +22,12 @@ from omlx.api.shared_models import (
     get_unix_timestamp,
 )
 
+# Accepted ``reasoning_effort`` levels. flyto treats the field as sugar over
+# thinking_budget (see server._effort_to_budget), so the domain is fixed here
+# rather than following whatever levels a given chat template understands.
+# Template-native levels outside this set ride chat_template_kwargs instead.
+REASONING_EFFORT_LEVELS = frozenset({"off", "low", "medium", "high"})
+
 
 # =============================================================================
 # Content Types
@@ -294,10 +300,10 @@ class ChatCompletionRequest(BaseModel):
         if not isinstance(v, str):
             raise ValueError("reasoning_effort must be a string")
         v = v.strip().lower()
-        allowed = {"off", "low", "medium", "high"}
-        if v not in allowed:
+        if v not in REASONING_EFFORT_LEVELS:
             raise ValueError(
-                f"reasoning_effort must be one of {sorted(allowed)}, got {v!r}"
+                "reasoning_effort must be one of "
+                f"{sorted(REASONING_EFFORT_LEVELS)}, got {v!r}"
             )
         return v
 
@@ -308,6 +314,30 @@ class AssistantMessage(BaseModel):
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = None
+
+
+def dump_chat_completion_response(response: "ChatCompletionResponse") -> str:
+    """Serialise a chat completion with ``message.content`` always present.
+
+    ``exclude_none`` keeps the optional usage metrics out of the payload, but
+    it also drops ``message.content`` whenever the assistant produced no
+    visible text -- a tool-call-only reply, or a thinking-only one. The OpenAI
+    schema has the field present and null in exactly those cases, and strict
+    clients read ``message["content"]`` unconditionally, so omitting the key
+    raises a KeyError instead of yielding None.
+
+    Only the non-streaming body is normalised. Streaming deltas legitimately
+    omit fields that did not change in that chunk, which is what upstream
+    OpenAI does too.
+    """
+    payload = response.model_dump(exclude_none=True)
+    for choice in payload.get("choices", []):
+        message = choice.get("message")
+        if isinstance(message, dict):
+            message.setdefault("content", None)
+    # separators match pydantic's compact output; the default json.dumps
+    # spacing would change every byte of the wire format for no reason.
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 class ChatCompletionChoice(BaseModel):

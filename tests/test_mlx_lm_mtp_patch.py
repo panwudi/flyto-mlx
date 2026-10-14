@@ -396,6 +396,95 @@ class TestBatchGeneratorDispatch:
         finally:
             set_mtp_active(prior_active)
 
+    def test_per_model_stamp_survives_later_loads(self):
+        """Loading another model resets the process-wide flag; a model stamped
+        at load time must keep its own MTP choice (Qwen 3.8 lost MTP the
+        moment Gemma 4 loaded next to it)."""
+        from omlx.patches.mlx_lm_mtp import (
+            is_mtp_active,
+            model_mtp_active,
+            set_mtp_active,
+            stamp_model_mtp_active,
+        )
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        _is_mtp_eligible = batch_generator._is_mtp_eligible
+
+        class _MtpModel:
+            def __init__(self):
+                self.mtp = object()
+
+            def mtp_forward(self, *_):
+                pass
+
+        class _VlmRoot:
+            """VLM root whose language_model carries the MTP head."""
+
+            def __init__(self):
+                self.language_model = _MtpModel()
+
+            def mtp_forward(self, *_):
+                pass
+
+        class _GenBatch:
+            def __init__(self, model, uids):
+                self.model = model
+                self.uids = uids
+
+        prior_active = is_mtp_active()
+        try:
+            qwen = _MtpModel()
+            set_mtp_active(True)
+            stamp_model_mtp_active(qwen, True)
+            # A later load of a non-MTP model flips the global flag off...
+            set_mtp_active(False)
+            # ...but the stamped model keeps MTP.
+            assert model_mtp_active(qwen) is True
+            assert _is_mtp_eligible(_GenBatch(qwen, uids=[1])) is True
+
+            # The reverse: stamped off stays off even if the flag is on.
+            other = _MtpModel()
+            stamp_model_mtp_active(other, False)
+            set_mtp_active(True)
+            assert _is_mtp_eligible(_GenBatch(other, uids=[1])) is False
+
+            # VLM root: stamp on the root is visible from its language_model
+            # and vice versa.
+            root = _VlmRoot()
+            stamp_model_mtp_active(root, True)
+            set_mtp_active(False)
+            assert model_mtp_active(root.language_model) is True
+            assert _is_mtp_eligible(_GenBatch(root, uids=[1])) is True
+
+            # VLMModelAdapter keeps the stamped objects in private attributes;
+            # the stamp must be found through it (this is what BatchGenerator
+            # holds for Qwen 3.8 on the VLM engine).
+            class _Adapter:
+                def __init__(self, vlm):
+                    self._vlm_model = vlm
+                    self._language_model = vlm.language_model
+
+                @property
+                def mtp(self):
+                    return getattr(self._language_model, "mtp", None)
+
+                def mtp_forward(self, *_):
+                    pass
+
+            vlm = _VlmRoot()
+            stamp_model_mtp_active(vlm, True)
+            set_mtp_active(False)
+            assert _is_mtp_eligible(_GenBatch(_Adapter(vlm), uids=[1])) is True
+
+            # Unstamped models fall back to the process-wide flag.
+            plain = _MtpModel()
+            set_mtp_active(False)
+            assert _is_mtp_eligible(_GenBatch(plain, uids=[1])) is False
+            set_mtp_active(True)
+            assert _is_mtp_eligible(_GenBatch(plain, uids=[1])) is True
+        finally:
+            set_mtp_active(prior_active)
+
     def test_mtp_state_valid_requires_single_matching_uid(self):
         from omlx.patches.mlx_lm_mtp.batch_generator import (
             _MtpState,
@@ -520,14 +609,24 @@ class TestBatchGeneratorDispatch:
         def fake_rebuild(model):
             return [_FakeCache()]
 
-        def fake_backbone(model, inputs, cache, n_confirmed=0):
-            cache[0].offset = int(inputs.shape[1])
+        calls = []
+
+        def fake_forward(model, inputs, cache):
+            calls.append(int(inputs.shape[1]))
+            cache[0].offset += int(inputs.shape[1])
             arr = np.full((1, int(inputs.shape[1]), vocab), -10.0, dtype=np.float32)
             arr[0, -1, 5] = 10.0  # last-position argmax -> token 5
-            return mx.array(arr), None, None
+            return mx.array(arr)
+
+        def no_backbone(*_a, **_k):
+            raise AssertionError(
+                "reconcile must not use the return_hidden backbone "
+                "(captures per-position recurrent state)"
+            )
 
         monkeypatch.setattr(batch_generator, "_rebuild_singleton_cache", fake_rebuild)
-        monkeypatch.setattr(batch_generator, "_call_backbone", fake_backbone)
+        monkeypatch.setattr(batch_generator, "_call_forward", fake_forward)
+        monkeypatch.setattr(batch_generator, "_call_backbone", no_backbone)
         # ``_get_generation_stream`` was removed in #1304 when the patch
         # moved stream selection to the enclosing BatchGenerator context.
         # The fake_backbone / fake_rebuild monkeypatches above bypass the
@@ -551,7 +650,49 @@ class TestBatchGeneratorDispatch:
             prompt_cache=[object()],  # old MTP-advanced cache, to be replaced
             _omlx_mtp_state=state,
         )
+        batch._backbone_calls = calls
         return batch_generator, batch, state
+
+    def test_reconcile_reprefills_in_bounded_chunks(self, monkeypatch):
+        """A long sequence is re-prefilled chunk by chunk (never one forward
+        over the whole context), and the cache ends at the full length."""
+        bg, batch, state = self._make_reconcile_batch(
+            monkeypatch,
+            uid=7,
+            tokens=list(range(10, 10 + 25)),
+            queue_entries=[],
+        )
+        monkeypatch.setattr(bg, "_RECONCILE_CHUNK_TOKENS", 8)
+
+        assert bg._reconcile_mtp_to_standard(batch, state) is True
+        assert batch._backbone_calls == [8, 8, 8, 1]
+        assert max(batch._backbone_calls) <= 8
+        assert batch.prompt_cache[0].offset == 25
+        # next token still comes from the last position of the final chunk
+        assert batch._next_tokens.tolist() == [5]
+
+    def test_call_forward_never_requests_hidden_capture(self):
+        """_call_forward passes no return_hidden / capture kwargs and unwraps
+        tuple and .logits results."""
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        seen = {}
+
+        class _Model:
+            def __init__(self, result):
+                self.result = result
+
+            def __call__(self, inputs, **kwargs):
+                seen.update(kwargs)
+                return self.result
+
+        assert batch_generator._call_forward(_Model("L"), "x", ["c"]) == "L"
+        assert seen == {"cache": ["c"]}
+        assert batch_generator._call_forward(_Model(("L", "h", "g")), "x", []) == "L"
+        assert (
+            batch_generator._call_forward(_Model(SimpleNamespace(logits="L")), "x", [])
+            == "L"
+        )
 
     def test_reconcile_uses_queue_front_as_next_token(self, monkeypatch):
         import mlx.core as mx

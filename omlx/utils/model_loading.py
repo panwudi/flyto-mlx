@@ -101,6 +101,11 @@ def maybe_apply_pre_load_patches(
     - mlx-vlm diffusion mxfp4 embedding patch when ``for_vlm`` is True and
       the checkpoint declares ``model_type == "diffusion_gemma"``.
 
+    - mlx-vlm MLX 0.32 compatibility backport when ``for_vlm`` is True
+      (upstream oMLX 8b2ade32): carries only mlx-vlm PRs #1949, #1982 and
+      #2006 into the pinned pre-0.7 mlx-vlm, transforming the affected
+      sources as they load.
+
     Both patches inject modules into ``sys.modules`` and replace mlx-lm
     internals; gating keeps non-affected models at zero cost.
 
@@ -114,6 +119,13 @@ def maybe_apply_pre_load_patches(
     set_mtp_active(False)
 
     _patch_mlx_lm_load_config()
+
+    if for_vlm:
+        from ..patches.mlx_vlm_mlx0322_compat import (
+            apply_mlx_vlm_mlx0322_compat_patch,
+        )
+
+        apply_mlx_vlm_mlx0322_compat_patch()
 
     config_path = Path(model_name) / "config.json"
     if not config_path.exists():
@@ -499,6 +511,17 @@ def maybe_load_custom_quantization(
 
     if not quant_method:
         return None
+
+    if quant_method.lower() == "compressed-tensors":
+        from ..patches import qwen38_modelopt_mixed
+
+        if qwen38_modelopt_mixed.is_supported_config(config):
+            if not is_vlm:
+                raise ValueError(
+                    "The supported Qwen3.8 ModelOpt mixed checkpoint is a VLM; "
+                    "refusing the text-only fallback loader"
+                )
+            return qwen38_modelopt_mixed.load(model_name)
 
     if quant_method.lower() == "paroquant":
         try:

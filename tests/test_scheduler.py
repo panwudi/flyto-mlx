@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch, PropertyMock
 
 import mlx.core as mx
 import pytest
+from types import SimpleNamespace
 
 from omlx.request import Request, RequestOutput, RequestStatus, SamplingParams
 import omlx.scheduler as scheduler_module
@@ -1115,6 +1116,85 @@ class TestSchedulerBoundarySnapshots:
         assert kwargs["model_cache_config"] == "boundary-config"
         assert "req-partial" not in scheduler._boundary_cache_snapshots
 
+    def test_store_cache_fully_evaluates_kv_on_owner_thread(
+        self, mock_model, mock_tokenizer
+    ):
+        """The KV arrays handed to the store worker must be concrete.
+
+        The engine stream is thread-local, so a lazy array left for the
+        worker aborts it ("There is no Stream(gpu, N) in current thread").
+        _cleanup_finished must block on mx.eval, not mx.async_eval
+        (upstream 74d71687).
+        """
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+
+        request = Request(
+            request_id="req-eval",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1, 2, 3, 4]
+        request.num_prompt_tokens = 4
+        request.output_token_ids = [5, 6, 7, 8]
+        request._extracted_cache = [{"state": "final-cache"}]
+        scheduler.running["req-eval"] = request
+        scheduler.requests["req-eval"] = request
+
+        arrays = [object(), object()]
+        with patch.object(
+            scheduler, "_collect_arrays_from_extracted_cache", return_value=arrays
+        ), patch.object(scheduler_module.mx, "eval") as eval_, patch.object(
+            scheduler_module.mx, "async_eval"
+        ) as async_eval:
+            scheduler._cleanup_finished({"req-eval"})
+
+        async_eval.assert_not_called()
+        assert any(c.args == tuple(arrays) for c in eval_.call_args_list)
+
+    @pytest.mark.parametrize("store_saves", [None, False])
+    def test_in_memory_prefill_snapshot_is_frozen_at_capture(
+        self, mock_model, mock_tokenizer, store_saves
+    ):
+        """In-memory prefill snapshots (no SSD store, or a failed save such
+        as a full write queue) must keep the state AT the boundary.
+
+        Prefill passes the live prompt-cache objects, which keep updating
+        in place (ArraysCache writes into its own list). Keeping the objects
+        would store the state of a later boundary. The snapshot must also be
+        evaluated on this thread, since the store worker reads it off-thread.
+        """
+        from mlx_lm.models.cache import ArraysCache
+
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        if store_saves is None:
+            scheduler._boundary_snapshot_store = None
+        else:
+            scheduler._boundary_snapshot_store = MagicMock()
+            scheduler._boundary_snapshot_store.save.return_value = store_saves
+
+        live = ArraysCache(size=2)
+        live[0] = mx.zeros((1, 3, 4))
+        live[1] = mx.zeros((1, 2, 4, 4))
+
+        with patch.object(scheduler, "_eval_snapshot_cache") as eval_snap:
+            scheduler._on_prefill_boundary_snapshot("req-snap", [live], 4)
+        eval_snap.assert_called_once()
+
+        # Prefill moves on and updates the same cache object in place.
+        live[0] = mx.ones((1, 3, 4))
+        live[1] = mx.ones((1, 2, 4, 4))
+
+        stored = scheduler._boundary_cache_snapshots["req-snap"][4]
+        extracted, _ = scheduler._extract_cache_states(stored)
+        conv, ssm = extracted[0]["state"][:2]
+        assert mx.all(conv == 0).item()
+        assert mx.all(ssm == 0).item()
+
     def test_boundary_snapshot_synchronizes_generation_stream(
         self, mock_model, mock_tokenizer
     ):
@@ -1189,7 +1269,14 @@ class TestSchedulerBoundarySnapshots:
     def test_prefill_boundary_snapshot_records_rotating_cache(
         self, mock_model, mock_tokenizer
     ):
-        """Prefill callback should store rotating boundary snapshots."""
+        """Prefill callback should store rotating boundary snapshots.
+
+        Regression: deliberately leave ``request_id_to_uid`` /
+        ``uid_to_request_id`` unset, matching what happens in production
+        during prefill (the request has not been inserted into
+        BatchGenerator yet). The earlier shape passed a uid that
+        resolved to None and silently dropped the snapshot.
+        """
         scheduler = Scheduler(
             model=mock_model,
             tokenizer=mock_tokenizer,
@@ -1202,19 +1289,20 @@ class TestSchedulerBoundarySnapshots:
             prompt="hello",
             sampling_params=SamplingParams(),
         )
-        uid = 77
         scheduler.requests[request.request_id] = request
         scheduler.running[request.request_id] = request
-        scheduler.request_id_to_uid[request.request_id] = uid
-        scheduler.uid_to_request_id[uid] = request.request_id
 
         RotatingStub = type("RotatingKVCache", (), {})
         snapshot_cache = [RotatingStub()]
 
-        scheduler._on_prefill_boundary_snapshot(uid, snapshot_cache, 4)
+        scheduler._on_prefill_boundary_snapshot(
+            request.request_id, snapshot_cache, 4
+        )
 
         assert 4 in scheduler._boundary_cache_snapshots[request.request_id]
-        assert scheduler._boundary_cache_snapshots[request.request_id][4] == snapshot_cache
+        # Stored as a state frozen at capture, not the live cache objects.
+        stored = scheduler._boundary_cache_snapshots[request.request_id][4]
+        assert isinstance(stored, scheduler_module._PreExtractedSnapshot)
         assert scheduler._boundary_snapshot_required is True
 
     def test_prefill_boundary_snapshot_ignores_non_boundary_token_count(
@@ -1233,16 +1321,56 @@ class TestSchedulerBoundarySnapshots:
             prompt="hello",
             sampling_params=SamplingParams(),
         )
-        uid = 78
         scheduler.requests[request.request_id] = request
         scheduler.running[request.request_id] = request
-        scheduler.request_id_to_uid[request.request_id] = uid
-        scheduler.uid_to_request_id[uid] = request.request_id
 
         RotatingStub = type("RotatingKVCache", (), {})
-        scheduler._on_prefill_boundary_snapshot(uid, [RotatingStub()], 3)
+        scheduler._on_prefill_boundary_snapshot(
+            request.request_id, [RotatingStub()], 3
+        )
 
         assert request.request_id not in scheduler._boundary_cache_snapshots
+
+    def test_emit_prefill_boundary_snapshot_persists_before_uid_assignment(
+        self, mock_model, mock_tokenizer
+    ):
+        """Snapshots emitted during prefill must persist even though the
+        request has not yet been inserted into BatchGenerator.
+
+        The regression this guards against: the wrapper used to route
+        through ``request_id_to_uid.get(rid, -1)`` →
+        ``uid_to_request_id.get(-1)`` → ``None`` → silent return, so
+        every block-boundary snapshot during prefill was dropped. For
+        hybrid (ArraysCache / GDN) models that meant every non-last
+        cached block stored a placeholder and identical-prefix re-
+        uploads re-prefilled from scratch.
+        """
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4),
+        )
+        scheduler.block_aware_cache = MagicMock()
+
+        request = Request(
+            request_id="req-prefill-pre-insert",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        scheduler.requests[request.request_id] = request
+        scheduler.running[request.request_id] = request
+        # Deliberately do NOT populate request_id_to_uid /
+        # uid_to_request_id — that mirrors production state at the
+        # time _emit_prefill_boundary_snapshot fires.
+        assert request.request_id not in scheduler.request_id_to_uid
+
+        RotatingStub = type("RotatingKVCache", (), {})
+        prompt_cache = [RotatingStub()]
+
+        scheduler._emit_prefill_boundary_snapshot(request, prompt_cache, 4)
+
+        assert request.request_id in scheduler._boundary_cache_snapshots
+        assert 4 in scheduler._boundary_cache_snapshots[request.request_id]
 
 
 class TestSchedulerRotatingBlockAlignment:
@@ -1628,6 +1756,64 @@ class TestExtractCacheStatesRotatingNormalization:
 class TestCacheCorruptionRecovery:
     """Tests for cache corruption detection and recovery."""
 
+
+    def test_drain_after_fail_all_leaves_reused_uid_alone(
+        self, mock_model, mock_tokenizer
+    ):
+        """A deferred remove must not touch a uid the next generator reused
+        (upstream 4f5c6ce7)."""
+        import concurrent.futures
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        finished = Request(
+            request_id="req-finished",
+            prompt="finished",
+            sampling_params=SamplingParams(),
+        )
+        future = concurrent.futures.Future()
+        scheduler.requests[finished.request_id] = finished
+        scheduler._inflight_store_futures[finished.request_id] = future
+        scheduler.request_id_to_uid[finished.request_id] = 0
+        scheduler.uid_to_request_id[0] = finished.request_id
+        scheduler._pending_async_removes.append((0, finished.request_id, future))
+        scheduler.batch_generator = MagicMock()
+
+        scheduler.fail_all_requests()
+
+        # mlx-lm BatchGenerator uids restart at 0 on a new instance.
+        new_batch_generator = MagicMock()
+        scheduler.batch_generator = new_batch_generator
+        scheduler.request_id_to_uid["req-new"] = 0
+        scheduler.uid_to_request_id[0] = "req-new"
+        future.set_result(None)
+
+        with patch("omlx.scheduler._safe_sync_stream"):
+            scheduler._drain_pending_async_removes()
+
+        new_batch_generator.remove.assert_not_called()
+        assert scheduler.uid_to_request_id[0] == "req-new"
+        assert scheduler.request_id_to_uid["req-new"] == 0
+        assert finished.request_id not in scheduler.request_id_to_uid
+        assert finished.request_id not in scheduler.requests
+
+    def test_drain_removes_uid_still_owned(self, mock_model, mock_tokenizer):
+        """The normal path still removes and unmaps the finished row."""
+        import concurrent.futures
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        future = concurrent.futures.Future()
+        future.set_result(None)
+        scheduler.request_id_to_uid["req-done"] = 3
+        scheduler.uid_to_request_id[3] = "req-done"
+        scheduler._pending_async_removes.append((3, "req-done", future))
+        scheduler.batch_generator = MagicMock()
+
+        with patch("omlx.scheduler._safe_sync_stream"):
+            scheduler._drain_pending_async_removes()
+
+        scheduler.batch_generator.remove.assert_called_once_with([3])
+        assert 3 not in scheduler.uid_to_request_id
+        assert "req-done" not in scheduler.request_id_to_uid
     def _make_scheduler(self, mock_model, mock_tokenizer):
         """Create a Scheduler with requests in running state."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
@@ -1821,6 +2007,73 @@ class TestDetectNeedsThinkPrefix:
         request = self._make_request([1, 2, 3, 4, 5])
         assert scheduler._detect_needs_think_prefix(request) is False
 
+    def test_protocol_parser_close_marker_means_thinking_off(self, mock_model):
+        """Gemma 4 with enable_thinking=False must NOT be seeded in-thought.
+
+        Regression anchor. Its template renders "<|channel>thought\\n<channel|>"
+        -- opened and immediately closed, i.e. thinking OFF. The close marker
+        is the parser's ``<channel|>``, not ``</think>``. Before the fix the
+        scheduler resolved the close marker by tokenising the literal string
+        "</think>" (3 tokens that no Gemma 4 prompt contains), so neither close
+        check could fire, this returned True, the parser session was seeded as
+        already-in-thought, and every generated token was filed as reasoning --
+        leaving `content` empty. Observed on m5max with
+        gemma4-moe-26b-a4b-q6: prompt tail [100, 45518, 107, 101], answer "42"
+        landed in reasoning_content with no content at all.
+        """
+        from conftest import MockTokenizer
+
+        tokenizer = MockTokenizer()
+
+        def encode(text, **kwargs):
+            return {
+                "<|channel>thought": [100, 45518],
+                "<channel|>": [101],
+                "</think>": [954, 36345, 236813],
+            }.get(text, [])
+
+        tokenizer.encode = encode
+        scheduler = Scheduler(model=mock_model, tokenizer=tokenizer)
+        scheduler._output_parser_factory = SimpleNamespace(
+            thinking_start_text="<|channel>thought",
+            thinking_end_text="<channel|>",
+        )
+        # ...<|channel>thought \n <channel|>  -> opened then closed
+        request = self._make_request([4368, 107, 100, 45518, 107, 101])
+        assert scheduler._detect_needs_think_prefix(request) is False
+
+    def test_protocol_parser_open_without_close_still_seeds(self, mock_model):
+        """The same prompt WITHOUT the close marker must still return True."""
+        from conftest import MockTokenizer
+
+        tokenizer = MockTokenizer()
+
+        def encode(text, **kwargs):
+            return {
+                "<|channel>thought": [100, 45518],
+                "<channel|>": [101],
+            }.get(text, [])
+
+        tokenizer.encode = encode
+        scheduler = Scheduler(model=mock_model, tokenizer=tokenizer)
+        scheduler._output_parser_factory = SimpleNamespace(
+            thinking_start_text="<|channel>thought",
+            thinking_end_text="<channel|>",
+        )
+        request = self._make_request([4368, 107, 100, 45518, 107])
+        assert scheduler._detect_needs_think_prefix(request) is True
+
+    def test_falls_back_to_think_end_when_parser_has_no_close(self, mock_model):
+        """A parser without thinking_end_text keeps the </think> behaviour."""
+        scheduler = self._make_scheduler(
+            mock_model, think_start_id=100, think_end_id=101
+        )
+        scheduler._output_parser_factory = SimpleNamespace(
+            thinking_start_text=None, thinking_end_text=None
+        )
+        request = self._make_request([1, 2, 100, 101])
+        assert scheduler._detect_needs_think_prefix(request) is False
+
     def test_no_think_start_id_on_tokenizer(self, mock_model):
         """Tokenizer without think_start_id -> False."""
         from conftest import MockTokenizer
@@ -1893,6 +2146,10 @@ class TestOutputParserSmoke:
         def encode(self, text: str, add_special_tokens: bool = True):
             if text == "\n":
                 return [198]
+            if text == "<|channel>thought":
+                return [100, 45518]
+            if text == "<channel|>":
+                return [101]
             return [10]
 
         def decode(self, token_ids, skip_special_tokens: bool = True):
@@ -1951,6 +2208,64 @@ class TestOutputParserSmoke:
         assert "<|channel>" not in full_stream
         assert "<channel|>" not in full_stream
         assert full_stream == "<think>\nreasoning</think>\nanswer"
+
+
+    def test_gemma4_prefilled_thought_after_tool_response(self, mock_model):
+        """Tool continuations open the thought channel in the prompt.
+
+        Gemma 4's template writes ``<|channel>thought`` into the prompt when
+        generation resumes after a tool response, so the model emits only the
+        thought body and the close marker. The scheduler must detect the
+        multi-token opener, seed the parser session as already-in-thought, and
+        prepend the normalized ``<think>`` tag -- otherwise the reasoning
+        leaks into visible content and the reply carries a lone ``</think>``.
+        """
+        mock_model.config.model_type = "gemma4"
+        tokenizer = self._GemmaTokenizer(
+            {
+                13: "reasoning",
+                14: "<channel|>",
+                15: "answer",
+                16: "<turn|>",
+            }
+        )
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=tokenizer,
+            config=SchedulerConfig(model_name="google/gemma-4b"),
+        )
+
+        request = Request(
+            request_id="gemma-prefilled-thought",
+            prompt="prompt",
+            sampling_params=SamplingParams(max_tokens=4),
+            # Prompt tail = <|channel>thought (tokens 100, 45518) + newline.
+            prompt_token_ids=[9, 100, 45518, 198],
+            num_prompt_tokens=4,
+            status=RequestStatus.RUNNING,
+            batch_uid=99,
+        )
+        assert scheduler._detect_needs_think_prefix(request) is True
+        request.needs_think_prefix = True
+
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+        scheduler.uid_to_request_id[99] = request.request_id
+        scheduler.request_id_to_uid[request.request_id] = 99
+
+        responses = [
+            type("Resp", (), {"uid": 99, "token": 13, "finish_reason": None})(),
+            type("Resp", (), {"uid": 99, "token": 14, "finish_reason": None})(),
+            type("Resp", (), {"uid": 99, "token": 15, "finish_reason": None})(),
+            type("Resp", (), {"uid": 99, "token": 16, "finish_reason": "stop"})(),
+        ]
+
+        outputs, finished_ids = scheduler._process_batch_responses(responses)
+
+        assert finished_ids == {request.request_id}
+        full_stream = "".join(output.new_text for output in outputs)
+        assert full_stream == "<think>\nreasoning</think>\nanswer"
+        assert "<channel|>" not in full_stream
 
 
 class TestVLMPositionStateClearing:
@@ -2192,3 +2507,32 @@ class TestTokenBufferSeedOnCacheHit:
         call_kwargs = scheduler.batch_generator.insert.call_args.kwargs
         assert "all_tokens" in call_kwargs
         assert call_kwargs["all_tokens"] == [[]]
+
+
+def test_step_keeps_refused_prefill_output_when_decode_runs(mock_model, mock_tokenizer):
+    """A refused prefill's error output must survive a decode step.
+
+    step() used to assign the decode outputs over the list that already
+    held this step's rejections, so a request refused by the memory gate
+    while another one was decoding never got its error output: its client
+    waited forever and its collector counted as active (m5max, 2026-10-13).
+    """
+    scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+    refused = RequestOutput(
+        request_id="refused", finished=True, finish_reason="error",
+        error="Prefill refused before forward",
+    )
+    decoded = RequestOutput(request_id="decoding", new_text="x")
+
+    scheduler._schedule_waiting = lambda: ([], [refused])
+    scheduler.batch_generator = MagicMock()
+    scheduler.batch_generator.next_generated.return_value = [object()]
+    scheduler.running = {"decoding": MagicMock()}
+    scheduler._process_batch_responses = lambda responses: ([decoded], [])
+    scheduler._cleanup_finished = lambda finished_ids: None
+
+    output = scheduler.step()
+
+    ids = [o.request_id for o in output.outputs]
+    assert "refused" in ids
+    assert "decoding" in ids

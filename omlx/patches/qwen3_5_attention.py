@@ -30,8 +30,11 @@ per-token target-verify attention paths -- is preserved unchanged.
 flyto's spec-decode (DFlash / native MTP) depends on those paths, so
 they MUST survive the patch.
 
-Patch target (current upstream): mlx-vlm v0.6.3 (5a4222a)
-- ``mlx_vlm.models.qwen3_5.language.Qwen3_5Attention``
+Patch target: ``mlx_vlm.models.qwen3_5.language.Qwen3_5Attention``.
+- mlx-vlm v0.6.3 (5a4222a): ``__call__`` body replacement.
+- mlx-vlm >= 0.7 (v0.7.7, 4f4634b): q/k/v preparation moved into
+  ``_prepare_projected_qkv`` and the ``target_verify`` helpers are gone, so
+  only that method is replaced (RoPE step swapped, rest verbatim).
 
 The companion file ``gated_delta_advance.py`` previously patched the
 GatedDeltaNet of the same module. As of mlx-vlm v0.6.3 (5a4222a) that patch is
@@ -124,6 +127,142 @@ def _is_text_only_position_ids(position_ids: "mx.array") -> bool:
     return bool(same_12)
 
 
+def _flyto_rope(self, queries, keys, cache, position_ids, position_embeddings):
+    """Apply RoPE to projected q/k: plain 1D RoPE for text-only positions,
+    mlx-vlm's mRoPE otherwise. Shared by the mlx-vlm 0.6 ``__call__``
+    replacement and the 0.7 ``_prepare_projected_qkv`` replacement."""
+    from mlx_vlm.models.qwen3_5.language import apply_multimodal_rotary_pos_emb
+
+    B, L = queries.shape[0], queries.shape[2]
+    # ----- flyto RoPE block (replaces upstream lines ~1429-1438) -----
+    # Decide RoPE path. Default = plain (text-only); fall back to mRoPE
+    # only when position_ids carries genuinely different multimodal
+    # positions across the 3 sections.
+    #
+    # When position_embeddings (precomputed cos/sin) is passed in by the
+    # caller we honor it directly -- that is the genuine multimodal /
+    # batched path and we never override it with plain RoPE.
+    #
+    # Fast path: when VLMModelAdapter wraps a text-only decode with
+    # force_text_only_rope(), skip the .item() probes entirely.
+    forced = _is_force_text_only()
+    use_plain = position_embeddings is None
+    if use_plain and not forced and position_ids is not None:
+        try:
+            use_plain = _is_text_only_position_ids(position_ids)
+        except Exception as e:
+            logger.warning(
+                f"Qwen3_5Attention patch: position_ids check failed ({e}); "
+                "falling back to mRoPE path."
+            )
+            use_plain = False
+
+    # Track usage so it's visible in logs whether the plain/mRoPE/forced
+    # branch is being exercised.
+    if forced and use_plain:
+        _call_counter["forced"] += 1
+        if _call_counter["forced"] in (1, 100, 1000):
+            logger.debug(
+                f"[qwen3_5-attn-patch] forced-plain call #{_call_counter['forced']} "
+                f"B,L={B},{L}"
+            )
+    elif use_plain:
+        _call_counter["plain"] += 1
+        if _call_counter["plain"] in (1, 100, 1000):
+            logger.debug(
+                f"[qwen3_5-attn-patch] plain-rope call #{_call_counter['plain']} "
+                f"B,L={B},{L} cache_offset="
+                f"{getattr(cache, 'offset', '-') if cache is not None else '-'}"
+            )
+    else:
+        _call_counter["mrope"] += 1
+        if _call_counter["mrope"] in (1, 100, 1000):
+            logger.debug(
+                f"[qwen3_5-attn-patch] mRoPE call #{_call_counter['mrope']} "
+                f"B,L={B},{L}"
+            )
+
+    if use_plain:
+        # Plain RoPE branch -- mirror mlx-lm Qwen3NextAttention behavior.
+        # Qwen3_5RotaryEmbedding uses style="interleaved", which maps to
+        # _HALF_SPLIT pairing in rope_utils (cos = concat([freqs, freqs]),
+        # pair element at +half_dim, rotate_half). So the plain half-split
+        # construction below is numerically consistent with the upstream
+        # apply_multimodal_rotary_pos_emb path on text-only inputs.
+        #
+        # cache.offset can be int (single-batch) or mx.array (batched
+        # with per-element offsets). For multi-element offset arrays we
+        # cannot model per-batch offsets with this simple path, so we
+        # defer to the mRoPE branch (use_plain=False) and fall through.
+        offset = (
+            cache.offset
+            if cache is not None and hasattr(cache, "offset")
+            else 0
+        )
+
+        offset_val = None
+        if isinstance(offset, mx.array):
+            if offset.ndim == 0:
+                offset_val = int(offset.item())
+            else:
+                # Per-element offsets: defer to mRoPE, fall through to
+                # the shared (target_verify-aware) attention code below.
+                use_plain = False
+        else:
+            offset_val = int(offset)
+
+        if use_plain:
+            # rotary_emb.inv_freq has shape (rotary_dim/2,), where
+            # rotary_dim = int(head_dim * partial_rotary_factor).
+            inv_freq = self.rotary_emb.inv_freq  # (rotary_dim/2,)
+            positions = mx.arange(
+                offset_val, offset_val + L
+            ).astype(mx.float32)
+            # freqs: (L, rotary_dim/2)
+            freqs = positions[:, None] * inv_freq[None, :].astype(
+                mx.float32
+            )
+            # emb: (L, rotary_dim) -- duplicate to match half-split layout
+            emb = mx.concatenate([freqs, freqs], axis=-1)
+            cos = mx.cos(emb)[None, None, :, :]  # (1, 1, L, rotary_dim)
+            sin = mx.sin(emb)[None, None, :, :]
+
+            rotary_dim = cos.shape[-1]
+            q_rot = queries[..., :rotary_dim]
+            q_pass = queries[..., rotary_dim:]
+            k_rot = keys[..., :rotary_dim]
+            k_pass = keys[..., rotary_dim:]
+
+            dtype = queries.dtype
+            q_rot = ((q_rot * cos) + (_rotate_half(q_rot) * sin)).astype(
+                dtype
+            )
+            k_rot = ((k_rot * cos) + (_rotate_half(k_rot) * sin)).astype(
+                dtype
+            )
+
+            queries = mx.concatenate([q_rot, q_pass], axis=-1)
+            keys = mx.concatenate([k_rot, k_pass], axis=-1)
+
+    if not use_plain:
+        # multimodal mRoPE branch -- original mlx-vlm v0.6.3 (5a4222a) flow,
+        # honoring precomputed position_embeddings when provided.
+        if position_embeddings is None:
+            queries, keys = self.rotary_emb.apply_rotary(
+                queries,
+                keys,
+                position_ids,
+                unsqueeze_dim=1,
+            )
+        else:
+            cos, sin = position_embeddings
+            queries, keys = apply_multimodal_rotary_pos_emb(
+                queries, keys, cos, sin
+            )
+    # ----- end flyto RoPE block -----
+    return queries, keys
+
+
 def _build_replacement_call():
     """Construct the replacement Qwen3_5Attention.__call__.
 
@@ -199,132 +338,9 @@ def _build_replacement_call():
         else:
             kv_seq_len += cache.offset + 1 if cache is not None else 0
 
-        # ----- flyto RoPE block (replaces upstream lines ~1429-1438) -----
-        # Decide RoPE path. Default = plain (text-only); fall back to mRoPE
-        # only when position_ids carries genuinely different multimodal
-        # positions across the 3 sections.
-        #
-        # When position_embeddings (precomputed cos/sin) is passed in by the
-        # caller we honor it directly -- that is the genuine multimodal /
-        # batched path and we never override it with plain RoPE.
-        #
-        # Fast path: when VLMModelAdapter wraps a text-only decode with
-        # force_text_only_rope(), skip the .item() probes entirely.
-        forced = _is_force_text_only()
-        use_plain = position_embeddings is None
-        if use_plain and not forced and position_ids is not None:
-            try:
-                use_plain = _is_text_only_position_ids(position_ids)
-            except Exception as e:
-                logger.warning(
-                    f"Qwen3_5Attention patch: position_ids check failed ({e}); "
-                    "falling back to mRoPE path."
-                )
-                use_plain = False
-
-        # Track usage so it's visible in logs whether the plain/mRoPE/forced
-        # branch is being exercised.
-        if forced and use_plain:
-            _call_counter["forced"] += 1
-            if _call_counter["forced"] in (1, 100, 1000):
-                logger.debug(
-                    f"[qwen3_5-attn-patch] forced-plain call #{_call_counter['forced']} "
-                    f"B,L={B},{L}"
-                )
-        elif use_plain:
-            _call_counter["plain"] += 1
-            if _call_counter["plain"] in (1, 100, 1000):
-                logger.debug(
-                    f"[qwen3_5-attn-patch] plain-rope call #{_call_counter['plain']} "
-                    f"B,L={B},{L} cache_offset="
-                    f"{getattr(cache, 'offset', '-') if cache is not None else '-'}"
-                )
-        else:
-            _call_counter["mrope"] += 1
-            if _call_counter["mrope"] in (1, 100, 1000):
-                logger.debug(
-                    f"[qwen3_5-attn-patch] mRoPE call #{_call_counter['mrope']} "
-                    f"B,L={B},{L}"
-                )
-
-        if use_plain:
-            # Plain RoPE branch -- mirror mlx-lm Qwen3NextAttention behavior.
-            # Qwen3_5RotaryEmbedding uses style="interleaved", which maps to
-            # _HALF_SPLIT pairing in rope_utils (cos = concat([freqs, freqs]),
-            # pair element at +half_dim, rotate_half). So the plain half-split
-            # construction below is numerically consistent with the upstream
-            # apply_multimodal_rotary_pos_emb path on text-only inputs.
-            #
-            # cache.offset can be int (single-batch) or mx.array (batched
-            # with per-element offsets). For multi-element offset arrays we
-            # cannot model per-batch offsets with this simple path, so we
-            # defer to the mRoPE branch (use_plain=False) and fall through.
-            offset = (
-                cache.offset
-                if cache is not None and hasattr(cache, "offset")
-                else 0
-            )
-
-            offset_val = None
-            if isinstance(offset, mx.array):
-                if offset.ndim == 0:
-                    offset_val = int(offset.item())
-                else:
-                    # Per-element offsets: defer to mRoPE, fall through to
-                    # the shared (target_verify-aware) attention code below.
-                    use_plain = False
-            else:
-                offset_val = int(offset)
-
-            if use_plain:
-                # rotary_emb.inv_freq has shape (rotary_dim/2,), where
-                # rotary_dim = int(head_dim * partial_rotary_factor).
-                inv_freq = self.rotary_emb.inv_freq  # (rotary_dim/2,)
-                positions = mx.arange(
-                    offset_val, offset_val + L
-                ).astype(mx.float32)
-                # freqs: (L, rotary_dim/2)
-                freqs = positions[:, None] * inv_freq[None, :].astype(
-                    mx.float32
-                )
-                # emb: (L, rotary_dim) -- duplicate to match half-split layout
-                emb = mx.concatenate([freqs, freqs], axis=-1)
-                cos = mx.cos(emb)[None, None, :, :]  # (1, 1, L, rotary_dim)
-                sin = mx.sin(emb)[None, None, :, :]
-
-                rotary_dim = cos.shape[-1]
-                q_rot = queries[..., :rotary_dim]
-                q_pass = queries[..., rotary_dim:]
-                k_rot = keys[..., :rotary_dim]
-                k_pass = keys[..., rotary_dim:]
-
-                dtype = queries.dtype
-                q_rot = ((q_rot * cos) + (_rotate_half(q_rot) * sin)).astype(
-                    dtype
-                )
-                k_rot = ((k_rot * cos) + (_rotate_half(k_rot) * sin)).astype(
-                    dtype
-                )
-
-                queries = mx.concatenate([q_rot, q_pass], axis=-1)
-                keys = mx.concatenate([k_rot, k_pass], axis=-1)
-
-        if not use_plain:
-            # multimodal mRoPE branch -- original mlx-vlm v0.6.3 (5a4222a) flow,
-            # honoring precomputed position_embeddings when provided.
-            if position_embeddings is None:
-                queries, keys = self.rotary_emb.apply_rotary(
-                    queries,
-                    keys,
-                    position_ids,
-                    unsqueeze_dim=1,
-                )
-            else:
-                cos, sin = position_embeddings
-                queries, keys = apply_multimodal_rotary_pos_emb(
-                    queries, keys, cos, sin
-                )
-        # ----- end flyto RoPE block -----
+        queries, keys = _flyto_rope(
+            self, queries, keys, cache, position_ids, position_embeddings
+        )
 
         if mask is not None and isinstance(mask, mx.array):
             if (
@@ -386,12 +402,94 @@ def _build_replacement_call():
     return __call__
 
 
+def _build_replacement_prepare():
+    """Replacement for mlx-vlm >= 0.7 ``Qwen3_5Attention._prepare_projected_qkv``.
+
+    mlx-vlm 0.7 moved q/k/v preparation (norms, positions, RoPE, cache
+    update) out of ``__call__`` into this method and dropped the
+    ``target_verify`` helpers the 0.6 replacement imports. The body below is
+    mlx-vlm v0.7.7 (4f4634b) verbatim except the RoPE step, which goes
+    through ``_flyto_rope``.
+    """
+
+    def _prepare_projected_qkv(
+        self,
+        q_proj_output,
+        keys,
+        values,
+        cache,
+        position_ids,
+        position_embeddings,
+        mask,
+    ):
+        B, L, _ = q_proj_output.shape
+        queries, gate = mx.split(
+            q_proj_output.reshape(B, L, self.num_attention_heads, -1), 2, axis=-1
+        )
+        gate = gate.reshape(B, L, -1)
+
+        queries = self.q_norm(queries).transpose(0, 2, 1, 3)
+        keys = self.k_norm(
+            keys.reshape(B, L, self.num_key_value_heads, -1)
+        ).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
+            0, 2, 1, 3
+        )
+
+        kv_seq_len = keys.shape[-2]
+
+        if position_ids is None:
+            cache_offset = cache.offset
+            if isinstance(cache_offset, mx.array) and cache_offset.ndim > 0:
+                offsets = mx.maximum(cache_offset[:B], 0)
+                kv_seq_len = kv_seq_len + offsets + 1
+                position_ids = offsets[:, None] + mx.arange(L)[None, :]
+                position_ids = mx.expand_dims(position_ids, axis=0)
+                position_ids = mx.tile(position_ids, (3, 1, 1))
+            else:
+                if isinstance(cache_offset, mx.array):
+                    cache_offset = int(cache_offset.item())
+                kv_seq_len += cache_offset + 1
+                position_ids = mx.arange(cache_offset, cache_offset + L)
+                position_ids = mx.expand_dims(position_ids, axis=0)
+                position_ids = mx.tile(position_ids, (3, 1, 1))
+        else:
+            kv_seq_len += cache.offset + 1 if cache is not None else 0
+
+        queries, keys = _flyto_rope(
+            self, queries, keys, cache, position_ids, position_embeddings
+        )
+
+        if mask is not None and isinstance(mask, mx.array):
+            if (
+                cache is not None
+                and hasattr(cache, "_idx")
+                and hasattr(cache, "left_padding")
+            ):
+                kv_seq_len = int(cache._idx) + L
+            elif isinstance(kv_seq_len, mx.array):
+                kv_seq_len = kv_seq_len.max().item()
+            mask = mask[..., : int(kv_seq_len)]
+
+        if cache is not None:
+            keys, values = cache.update_and_fetch(keys, values)
+        return queries, keys, values, gate, mask
+
+    return _prepare_projected_qkv
+
+
 def _patch_class(cls: Any, label: str) -> bool:
     if id(cls) in _patched_classes:
         return True
-    cls.__call__ = _build_replacement_call()
+    if "_prepare_projected_qkv" in cls.__dict__:
+        # mlx-vlm >= 0.7: RoPE lives in _prepare_projected_qkv.
+        cls._prepare_projected_qkv = _build_replacement_prepare()
+        how = "_prepare_projected_qkv replacement"
+    else:
+        cls.__call__ = _build_replacement_call()
+        how = "__call__ body replacement"
     _patched_classes.add(id(cls))
-    logger.info(f"Qwen3_5Attention patch applied (body replacement): {label}")
+    logger.info(f"Qwen3_5Attention patch applied ({how}): {label}")
     return True
 
 

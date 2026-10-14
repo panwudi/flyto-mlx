@@ -7,17 +7,13 @@
 {% endblock %}
 
 {% block content %}
-<div class="min-h-screen bg-white flex flex-col" x-data="dashboard()" x-init="init()">
+<div class="flyto-workspace" x-data="dashboard()">
     <!-- Navigation Bar -->
     {% include "dashboard/_navbar.html" %}
 
     <!-- Main Content -->
-    <main class="flex-grow relative overflow-hidden">
-        <!-- Background Effects -->
-        <div class="absolute inset-0 bg-grain pointer-events-none z-0"></div>
-        <div class="absolute top-0 left-1/2 -translate-x-1/2 w-[800px] h-[400px] bg-gradient-to-b from-neutral-50 to-transparent rounded-full blur-3xl -z-10 opacity-50"></div>
-
-        <div class="max-w-7xl mx-auto px-4 sm:px-6 py-6 sm:py-10 relative z-10">
+    <main class="flyto-main" id="main-content">
+        <div class="flyto-page">
             <!-- Status Main Tab -->
             {% include "dashboard/_status.html" %}
 
@@ -33,11 +29,14 @@
             <!-- Benchmark Main Tab -->
             {% include "dashboard/_bench.html" %}
 
-            <!-- Cluster Main Tab -->
-            {% include "dashboard/_cluster.html" %}
 
         </div>
     </main>
+
+    <div class="flyto-toast" x-show="notice.message" x-cloak x-transition.opacity role="status" aria-live="polite" :class="{ 'is-error': notice.error }">
+        <i data-lucide="info" class="w-5 h-5"></i><span x-text="notice.message"></span>
+        <button class="flyto-icon-button" @click="notice.message = ''" aria-label="{{ t('shell.dismiss') }}"><i data-lucide="x" class="w-4 h-4"></i></button>
+    </div>
 
     <!-- Model Settings Modal -->
     {% include "dashboard/_modal_model_settings.html" %}
@@ -48,27 +47,27 @@
          @keydown.escape.window="showHfMirrorModal = false">
         <div class="fixed inset-0 bg-black/50" @click="showHfMirrorModal = false"></div>
         <div class="flex min-h-full items-center justify-center p-4">
-            <div class="relative bg-white rounded-2xl shadow-2xl max-w-md w-[28rem] overflow-hidden"
+            <div class="relative bg-surface rounded-2xl shadow-2xl max-w-md w-[28rem] overflow-hidden"
                  @click.stop>
-                <div class="flex items-center justify-between px-6 py-4 border-b border-neutral-200">
-                    <h3 class="text-base font-semibold text-neutral-900">{{ t('models.downloader.mirror_settings') }}</h3>
+                <div class="flex items-center justify-between px-6 py-4 border-b border-line">
+                    <h3 class="text-base font-semibold text-fg">{{ t('models.downloader.mirror_settings') }}</h3>
                     <button @click="showHfMirrorModal = false"
-                            class="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 transition-all">
+                            class="p-1 rounded-lg text-fg-tertiary hover:text-fg-secondary hover:bg-surface-muted transition-all">
                         <i data-lucide="x" class="w-4 h-4"></i>
                     </button>
                 </div>
                 <div class="px-6 py-5">
-                    <label class="block text-sm font-medium text-neutral-700 mb-1.5">{{ t('settings.huggingface.endpoint') }}</label>
-                    <p class="text-xs text-neutral-400 mb-1.5">{{ t('settings.huggingface.endpoint_hint') }}</p>
-                    <p class="text-xs text-neutral-400 mb-3">{{ t('settings.huggingface.endpoint_clear_hint') }}</p>
+                    <label class="block text-sm font-medium text-fg-secondary mb-1.5">{{ t('settings.huggingface.endpoint') }}</label>
+                    <p class="text-xs text-fg-tertiary mb-1.5">{{ t('settings.huggingface.endpoint_hint') }}</p>
+                    <p class="text-xs text-fg-tertiary mb-3">{{ t('settings.huggingface.endpoint_clear_hint') }}</p>
                     <input type="text" x-model="hfMirrorEndpoint"
                            placeholder="https://huggingface.co"
                            @keydown.enter="saveHfMirrorEndpoint()"
-                           class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
+                           class="w-full px-3 py-2 text-sm border border-line rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
                 </div>
-                <div class="flex items-center justify-end gap-3 px-6 py-4 border-t border-neutral-100 bg-neutral-50">
+                <div class="flex items-center justify-end gap-3 px-6 py-4 border-t border-line bg-surface-alt">
                     <button @click="showHfMirrorModal = false"
-                            class="px-4 py-2 text-sm text-neutral-600 hover:text-neutral-900 transition-colors">
+                            class="px-4 py-2 text-sm text-fg-secondary hover:text-fg transition-colors">
                         {{ t('models.downloader.mirror_cancel') }}
                     </button>
                     <button @click="saveHfMirrorEndpoint()"

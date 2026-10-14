@@ -82,6 +82,29 @@ class TestGemma4OutputParserSession:
         assert "<|channel>" not in full_stream
         assert "<channel|>" not in full_stream
 
+    def test_prefilled_thought_closes_before_visible_content(self):
+        """A prompt-side opener must seed the parser before generation.
+
+        Gemma 4 tool continuations start generation inside the thought
+        channel, so the generated stream contains only the body, close marker,
+        and visible answer.
+        """
+        token_map = {
+            1: "reasoning",
+            2: "<channel|>",
+            3: "answer",
+        }
+        tokenizer = GemmaTokenizer(token_map)
+        session = Gemma4OutputParserSession(tokenizer)
+        session.notify_prefilled_thought()
+
+        parts = []
+        for token_id in [1, 2, 3]:
+            parts.append(session.process_token(token_id).stream_text)
+        parts.append(session.finalize().stream_text)
+
+        assert "".join(parts) == "reasoning</think>\nanswer"
+
     def test_empty_thought_block(self):
         token_map = {
             1: "<|channel>thought\n",

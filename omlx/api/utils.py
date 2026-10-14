@@ -5,10 +5,13 @@ Utility functions for text processing.
 """
 
 import json
+import logging
 import re
 from typing import Any, List
 
 from .openai_models import Message
+
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -38,6 +41,17 @@ def detect_and_strip_partial(messages: list[dict]) -> bool:
     for msg in messages:
         msg.pop("partial", None)
     return is_partial
+
+
+def merge_reasoning_effort_chat_template_kwargs(
+    chat_template_kwargs: dict[str, Any] | None,
+    reasoning_effort: Any | None,
+) -> dict[str, Any] | None:
+    """Forward an API reasoning effort without overriding explicit template kwargs."""
+    merged = dict(chat_template_kwargs or {})
+    if reasoning_effort is not None:
+        merged.setdefault("reasoning_effort", reasoning_effort)
+    return merged or None
 
 
 # =============================================================================
@@ -282,6 +296,233 @@ def _consolidate_system_messages(messages: list[dict]) -> list[dict]:
 
     merged_system = {"role": "system", "content": "\n\n".join(system_parts)}
     return [merged_system] + non_system
+
+
+# --- Mid-conversation system messages as user notes -------------------------
+#
+# Ported from upstream 473f6291 (#1826), helpers only. Hoisting a mid-
+# conversation system message to the front (``_consolidate_system_messages``)
+# changes the prompt head whenever a new one appears, so the whole prefix
+# cache is lost. Folding it into the adjacent user text keeps every earlier
+# token in place. Only the Anthropic path uses this so far; the OpenAI path
+# still hoists.
+
+
+def _system_content_as_text(content: Any) -> str:
+    if isinstance(content, list):
+        return _extract_text_from_content_list(content)
+    return content if isinstance(content, str) else str(content)
+
+
+def _is_system_role(role: Any) -> bool:
+    return role in {"system", "developer"}
+
+
+def has_nonleading_system_message(messages: list[dict]) -> bool:
+    """Return True when a system message appears after a non-system turn."""
+    seen_non_system = False
+    for msg in messages:
+        if _is_system_role(msg.get("role")):
+            if seen_non_system:
+                return True
+        else:
+            seen_non_system = True
+    return False
+
+
+def _is_text_only_content_list(content: Any) -> bool:
+    if not isinstance(content, list):
+        return False
+    for part in content:
+        if not isinstance(part, dict):
+            return False
+        if part.get("type", "text") != "text":
+            return False
+        text = part.get("text", "")
+        if text is not None and not isinstance(text, str):
+            return False
+    return True
+
+
+def _is_safe_user_note_target(msg: dict | None) -> bool:
+    if not msg or msg.get("role") != "user":
+        return False
+    if msg.get(_PRESERVE_BOUNDARY_KEY):
+        return False
+    if msg.get("tool_calls") or msg.get("tool_call_id") or msg.get("tool_responses"):
+        return False
+    content = msg.get("content", "")
+    return (
+        content is None
+        or isinstance(content, str)
+        or _is_text_only_content_list(content)
+    )
+
+
+def _is_safe_tool_result_note_target(msg: dict | None) -> bool:
+    """A tool-result turn whose text can take an appended note.
+
+    Native tool calling yields role="tool" messages; without it the results
+    are user text marked with the role-boundary key. Appending keeps the
+    role sequence unchanged, so this is safe even at a tool-call boundary.
+    """
+    if not msg:
+        return False
+    role = msg.get("role")
+    if role == "tool":
+        pass
+    elif role == "user" and msg.get(_PRESERVE_BOUNDARY_KEY):
+        if msg.get("tool_calls") or msg.get("tool_responses"):
+            return False
+    else:
+        return False
+    content = msg.get("content", "")
+    return isinstance(content, str) or _is_text_only_content_list(content)
+
+
+def _message_has_tool_calls(msg: dict | None) -> bool:
+    return bool(msg and msg.get("role") == "assistant" and msg.get("tool_calls"))
+
+
+def _format_system_note(parts: list[str]) -> str:
+    return "[System note]\n" + "\n\n".join(parts) + "\n[/System note]"
+
+
+def _merge_note_text(existing: str, note: str, *, placement: str) -> str:
+    if not existing:
+        return note
+    if placement == "prepend":
+        return f"{note}\n\n{existing}"
+    return f"{existing}\n\n{note}"
+
+
+def _rewrite_user_content_with_note(
+    msg: dict,
+    note: str,
+    *,
+    placement: str,
+) -> dict:
+    rewritten = dict(msg)
+    content = rewritten.get("content", "")
+    if isinstance(content, list):
+        parts = [dict(part) for part in content]
+        if not parts:
+            rewritten["content"] = [{"type": "text", "text": note}]
+            return rewritten
+        index = 0 if placement == "prepend" else len(parts) - 1
+        existing = parts[index].get("text") or ""
+        parts[index]["text"] = _merge_note_text(
+            existing,
+            note,
+            placement=placement,
+        )
+        rewritten["content"] = parts
+        return rewritten
+
+    existing = content if isinstance(content, str) else ""
+    rewritten["content"] = _merge_note_text(existing, note, placement=placement)
+    return rewritten
+
+
+def _downgrade_mid_system_to_user_notes(messages: list[dict]) -> list[dict] | None:
+    """Move non-leading system runs into adjacent safe user text.
+
+    Leading system messages stay where they are. Each later run of system
+    messages becomes a ``[System note]`` block appended to the preceding user
+    or tool-result message (when the run is followed by an assistant turn or
+    ends the list) or prepended to the following user message. Returns None
+    when no such target exists, e.g. next to multimodal user content; the
+    caller then falls back to hoisting.
+
+    Claude Code appends a system "# Environment update" right after the tool
+    result whose command changed the working directory. Hoisting that would
+    rewrite the prompt head and force a full re-prefill on every cd.
+    """
+    rewritten: list[dict] = []
+    seen_non_system = False
+    i = 0
+
+    while i < len(messages):
+        msg = messages[i]
+        if not _is_system_role(msg.get("role")):
+            rewritten.append(msg)
+            seen_non_system = True
+            i += 1
+            continue
+
+        start = i
+        parts: list[str] = []
+        while i < len(messages) and _is_system_role(messages[i].get("role")):
+            content = messages[i].get("content", "")
+            if content:
+                text = _system_content_as_text(content)
+                if text:
+                    parts.append(text)
+            i += 1
+
+        if not seen_non_system:
+            rewritten.extend(messages[start:i])
+            continue
+        if not parts:
+            continue
+
+        note = _format_system_note(parts)
+        next_msg = messages[i] if i < len(messages) else None
+        next_role = next_msg.get("role") if next_msg is not None else None
+
+        prev_msg = rewritten[-1] if rewritten else None
+        if (
+            _is_safe_user_note_target(prev_msg)
+            or _is_safe_tool_result_note_target(prev_msg)
+        ) and (next_msg is None or next_role == "assistant"):
+            rewritten[-1] = _rewrite_user_content_with_note(
+                rewritten[-1],
+                note,
+                placement="append",
+            )
+            continue
+
+        if next_msg is not None and _is_safe_user_note_target(next_msg):
+            if _message_has_tool_calls(rewritten[-1] if rewritten else None):
+                return None
+            rewritten.append(
+                _rewrite_user_content_with_note(
+                    next_msg,
+                    note,
+                    placement="prepend",
+                )
+            )
+            seen_non_system = True
+            i += 1
+            continue
+
+        return None
+
+    return rewritten
+
+
+def place_mid_conversation_system_messages(messages: list[dict]) -> list[dict]:
+    """Fold non-leading system messages into user notes, else hoist them.
+
+    The note form keeps the prompt prefix stable across turns. When a
+    system run cannot be placed safely, every system message is hoisted to
+    the front instead, which is always a valid shape for strict templates.
+    """
+    if not has_nonleading_system_message(messages):
+        return messages
+    downgraded = _downgrade_mid_system_to_user_notes(messages)
+    if downgraded is not None:
+        return downgraded
+    # Hoisting rewrites the prompt head, so the next request misses the
+    # prefix cache from the system prompt on. Log the shape to spot it.
+    logger.info(
+        "Mid-conversation system message hoisted to the front "
+        "(%d messages, last roles: %s); prefix cache will miss from the "
+        "system prompt",
+        len(messages),
+        [m.get("role") for m in messages[-6:]],
+    )
+    return _consolidate_system_messages(messages)
 
 
 def _merge_consecutive_roles(messages: list[dict]) -> list[dict]:

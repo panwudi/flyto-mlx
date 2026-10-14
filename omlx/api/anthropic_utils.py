@@ -8,14 +8,17 @@ Handles conversion between Anthropic API format and internal oMLX format.
 import base64
 import json
 import logging
+import re
 import uuid
 from typing import Any
 
 from .anthropic_models import (
+    AnthropicMessage,
     AnthropicTool,
     AnthropicUsage,
     ContentBlockText,
     ContentBlockThinking,
+    ContentBlockToolResult,
     ContentBlockToolUse,
     MessagesRequest,
     MessagesResponse,
@@ -154,16 +157,29 @@ def convert_anthropic_to_internal(
     processed_messages: list[dict[str, Any]] = []
     native_tool_calling = bool(tokenizer and getattr(tokenizer, "has_tool_calling", False))
 
-    # Handle system message (Anthropic has separate 'system' field)
-    if request.system:
-        system_text = _extract_system_text(request.system)
-        if system_text:
-            processed_messages.append({"role": "system", "content": system_text})
+    # Normalize: merge leading role="system" entries from messages[] into the
+    # canonical request.system field (claude-code 2.1.154+ sends system
+    # content inline). Later ones (mid-conversation-system beta) stay in
+    # place and become user notes below, so the prompt head stays stable.
+    system_text, normalized_messages = _normalize_in_messages_system(
+        request, leading_only=True
+    )
+    normalized_messages = _expand_tool_references(
+        normalized_messages, getattr(request, "tools", None)
+    )
+    if system_text:
+        processed_messages.append({"role": "system", "content": system_text})
 
     # Process messages
-    for msg in request.messages:
+    for msg in normalized_messages:
         role = msg.role
         content = msg.content
+
+        if role == "system":
+            text = _anthropic_system_message_text(msg)
+            if text:
+                processed_messages.append({"role": "system", "content": text})
+            continue
 
         if isinstance(content, str):
             # Simple text message
@@ -343,8 +359,20 @@ def convert_anthropic_to_internal(
             # Unknown format
             processed_messages.append({"role": role, "content": str(content)})
 
-    from .utils import _merge_consecutive_roles
+    # Claude Code 2.1.154+ may carry system content inline in messages[]
+    # (see _normalize_in_messages_system); with consolidation off those
+    # blocks bypass _extract_system_text, so the budget markers are
+    # stripped here too before role merging.
+    for msg in processed_messages:
+        if msg.get("role") in ("system", "developer") and isinstance(
+            msg.get("content"), str
+        ):
+            msg["content"] = _strip_client_budget_markers(msg["content"])
 
+    # Markers are stripped first so they never leak into a user note.
+    from .utils import _merge_consecutive_roles, place_mid_conversation_system_messages
+
+    processed_messages = place_mid_conversation_system_messages(processed_messages)
     return _merge_consecutive_roles(processed_messages)
 
 
@@ -371,14 +399,18 @@ def convert_anthropic_to_internal_harmony(
     """
     processed_messages: list[dict[str, Any]] = []
 
-    # Handle system message (Anthropic has separate 'system' field)
-    if request.system:
-        system_text = _extract_system_text(request.system)
-        if system_text:
-            processed_messages.append({"role": "system", "content": system_text})
+    # Normalize: extract any role="system" entries from messages[] and merge
+    # with the canonical request.system field (claude-code 2.1.154+ sends
+    # system content inline instead of using the separate field).
+    system_text, normalized_messages = _normalize_in_messages_system(request)
+    normalized_messages = _expand_tool_references(
+        normalized_messages, getattr(request, "tools", None)
+    )
+    if system_text:
+        processed_messages.append({"role": "system", "content": system_text})
 
     # Process messages
-    for msg in request.messages:
+    for msg in normalized_messages:
         role = msg.role
         content = msg.content
 
@@ -531,6 +563,16 @@ def convert_anthropic_to_internal_harmony(
             # Unknown format
             processed_messages.append({"role": role, "content": str(content)})
 
+    # Claude Code 2.1.154+ may carry system content inline in messages[]
+    # (see _normalize_in_messages_system); with consolidation off those
+    # blocks bypass _extract_system_text, so the budget markers are
+    # stripped here too before role merging.
+    for msg in processed_messages:
+        if msg.get("role") in ("system", "developer") and isinstance(
+            msg.get("content"), str
+        ):
+            msg["content"] = _strip_client_budget_markers(msg["content"])
+
     from .utils import _merge_consecutive_roles
 
     return _merge_consecutive_roles(processed_messages)
@@ -540,11 +582,30 @@ def convert_anthropic_to_internal_harmony(
 # contains randomly changing values, breaking prefix cache).
 _BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
 
+# Claude Code appends a `<total_tokens>N tokens left</total_tokens>` budget
+# marker to the end of the system prompt with a freshly decremented N on
+# every request, keeping the stale copies, so the prompt head both changes
+# and grows each call and no prefix past it can ever be reused (measured as
+# full ~60k-token re-prefills per turn). The marker is informational only —
+# nothing downstream parses it — so it is stripped wholesale, like the
+# billing header above.
+_TOTAL_TOKENS_MARKER_RE = re.compile(
+    r"\n{0,2}<total_tokens>\d+ tokens left</total_tokens>"
+)
+
+
+def _strip_client_budget_markers(text: str) -> str:
+    """Remove Claude Code per-request token-budget markers from system text."""
+    if "<total_tokens>" not in text:
+        return text
+
+    return _TOTAL_TOKENS_MARKER_RE.sub("", text)
+
 
 def _extract_system_text(system: str | list[SystemContent]) -> str:
     """Extract text from system field."""
     if isinstance(system, str):
-        return system
+        return _strip_client_budget_markers(system)
     elif isinstance(system, list):
         text_parts = []
         for block in system:
@@ -558,8 +619,62 @@ def _extract_system_text(system: str | list[SystemContent]) -> str:
             if text.startswith(_BILLING_HEADER_PREFIX):
                 continue
             text_parts.append(text)
-        return "\n".join(text_parts)
+        return _strip_client_budget_markers("\n".join(text_parts))
     return ""
+
+
+def _anthropic_system_message_text(msg: AnthropicMessage) -> str:
+    """Join the text of an inline role="system" message from messages[]."""
+    content = msg.content
+    if isinstance(content, str):
+        return content
+    parts: list[str] = []
+    if isinstance(content, list):
+        for block in content:
+            block_dict = _content_block_to_dict(block)
+            if block_dict is None:
+                continue
+            if block_dict.get("type") == "text":
+                text = block_dict.get("text", "")
+                if text:
+                    parts.append(text)
+    return "\n".join(parts)
+
+
+def _normalize_in_messages_system(
+    request: MessagesRequest,
+    leading_only: bool = False,
+) -> tuple[str, list[AnthropicMessage]]:
+    """Extract role="system" entries from messages[] and merge with request.system.
+
+    Claude Code 2.1.154+ began sending system content inline in the messages
+    array instead of (or in addition to) the canonical Anthropic ``system``
+    field. Returns the combined system text and the message list with system
+    entries removed, so downstream conversion sees the canonical shape.
+
+    With ``leading_only`` only the system entries before the first non-system
+    message are merged; later ones stay in the list so the caller can fold
+    them into user notes without changing the prompt head.
+    """
+    extracted_parts: list[str] = []
+    filtered_messages: list[AnthropicMessage] = []
+    seen_non_system = False
+    for msg in request.messages:
+        if msg.role != "system" or (leading_only and seen_non_system):
+            filtered_messages.append(msg)
+            seen_non_system = seen_non_system or msg.role != "system"
+            continue
+        text = _anthropic_system_message_text(msg)
+        if text:
+            extracted_parts.append(text)
+
+    base = _extract_system_text(request.system) if request.system else ""
+    if extracted_parts:
+        extra = "\n".join(extracted_parts)
+        system_text = "\n\n".join(p for p in (base, extra) if p)
+    else:
+        system_text = base
+    return system_text, filtered_messages
 
 
 def truncate_tool_result(
@@ -688,8 +803,139 @@ def _is_server_side_tool(tool_dict: dict[str, Any]) -> bool:
     return tool_type.startswith(SERVER_SIDE_TOOL_TYPE_PREFIXES)
 
 
+def _is_deferred_tool(tool_dict: dict[str, Any]) -> bool:
+    """Return True if the tool is marked ``defer_loading`` (tool search).
+
+    Deferred tools are callable but must not be rendered into the prompt's
+    tool list: their definitions reach the model inline, where a
+    ``tool_reference`` block in a tool result names them.
+    """
+    return tool_dict.get("defer_loading") is True
+
+
+def _tool_dict(tool: Any) -> dict[str, Any] | None:
+    if hasattr(tool, "model_dump"):
+        return tool.model_dump()
+    if isinstance(tool, dict):
+        return tool
+    return None
+
+
+def _render_tool_reference_definitions(
+    names: list[str], tools_by_name: dict[str, dict[str, Any]]
+) -> str:
+    """Render referenced tools the way Claude Code's ToolSearch describes.
+
+    Its tool description promises one ``<function>{json}</function>`` line
+    per matched tool inside a ``<functions>`` block, so the model is told to
+    expect exactly this shape.
+    """
+    lines = ["<functions>"]
+    for name in names:
+        tool = tools_by_name.get(name)
+        if tool is None:
+            lines.append(
+                f"Tool {name} was referenced but its definition is not in this request."
+            )
+            continue
+        definition = {
+            "description": tool.get("description") or "",
+            "name": name,
+            "parameters": tool.get("input_schema") or {},
+        }
+        lines.append(
+            "<function>" + json.dumps(definition, ensure_ascii=False) + "</function>"
+        )
+    lines.append("</functions>")
+    return "\n".join(lines)
+
+
+def _expand_tool_result_references(
+    content: list[Any], tools_by_name: dict[str, dict[str, Any]]
+) -> list[Any]:
+    """Replace each run of tool_reference items with one rendered text item."""
+    expanded: list[Any] = []
+    pending: list[str] = []
+
+    def flush() -> None:
+        if pending:
+            expanded.append({
+                "type": "text",
+                "text": _render_tool_reference_definitions(pending, tools_by_name),
+            })
+            pending.clear()
+
+    for item in content:
+        if isinstance(item, dict) and item.get("type") == "tool_reference":
+            pending.append(str(item.get("tool_name", "")))
+            continue
+        flush()
+        expanded.append(item)
+    flush()
+    return expanded
+
+
+def _expand_tool_references(
+    messages: list[AnthropicMessage],
+    tools: list[AnthropicTool] | None,
+) -> list[AnthropicMessage]:
+    """Inline the definitions that ``tool_reference`` blocks point to.
+
+    With tool search (Claude Code ``ENABLE_TOOL_SEARCH``), the client sends
+    rarely used tools with ``defer_loading: true`` and loads one by returning
+    a ``tool_reference`` block from its ToolSearch tool. The Anthropic API
+    expands that block into the tool's definition at that point of the
+    conversation. Doing the same here keeps the prompt head (system + tool
+    list) unchanged when a tool is loaded, so the prefix cache stays valid.
+    """
+    tools_by_name: dict[str, dict[str, Any]] = {}
+    for tool in tools or []:
+        tool_dict = _tool_dict(tool)
+        if tool_dict and tool_dict.get("name"):
+            tools_by_name[tool_dict["name"]] = tool_dict
+
+    result: list[AnthropicMessage] = []
+    for msg in messages:
+        if not isinstance(msg.content, list):
+            result.append(msg)
+            continue
+        changed = False
+        new_content: list[Any] = []
+        for block in msg.content:
+            block_dict = _content_block_to_dict(block)
+            inner = block_dict.get("content") if block_dict else None
+            if (
+                block_dict is not None
+                and block_dict.get("type") == "tool_result"
+                and isinstance(inner, list)
+                and any(
+                    isinstance(item, dict) and item.get("type") == "tool_reference"
+                    for item in inner
+                )
+            ):
+                new_content.append(
+                    ContentBlockToolResult(
+                        **{
+                            **block_dict,
+                            "content": _expand_tool_result_references(
+                                inner, tools_by_name
+                            ),
+                        }
+                    )
+                )
+                changed = True
+            else:
+                new_content.append(block)
+        result.append(
+            msg.model_copy(update={"content": new_content}) if changed else msg
+        )
+    return result
+
+
 def convert_anthropic_tools_to_internal(
     tools: list[AnthropicTool] | None,
+    include_deferred: bool = True,
+    only_deferred: bool = False,
 ) -> list[dict[str, Any]] | None:
     """
     Convert Anthropic tools to internal/OpenAI format.
@@ -702,6 +948,10 @@ def convert_anthropic_tools_to_internal(
 
     Args:
         tools: List of Anthropic tool definitions
+        include_deferred: If False, skip ``defer_loading`` tools (the list
+            rendered into the chat template).
+        only_deferred: If True, return only ``defer_loading`` tools (added to
+            the tool-call parser's list so loaded tools stay callable).
 
     Returns:
         List of internal tool definitions, or None if no executable tools
@@ -713,16 +963,16 @@ def convert_anthropic_tools_to_internal(
     dropped: list[str] = []
 
     for tool in tools:
-        # Handle both Pydantic models and dicts
-        if hasattr(tool, "model_dump"):
-            tool_dict = tool.model_dump()
-        elif isinstance(tool, dict):
-            tool_dict = tool
-        else:
+        tool_dict = _tool_dict(tool)
+        if tool_dict is None:
             continue
 
         if _is_server_side_tool(tool_dict):
             dropped.append(f"{tool_dict.get('type')}:{tool_dict.get('name', '')}")
+            continue
+
+        deferred = _is_deferred_tool(tool_dict)
+        if (deferred and not include_deferred) or (only_deferred and not deferred):
             continue
 
         internal_tools.append(
@@ -912,9 +1162,29 @@ def format_sse_event(event_type: str, data: dict[str, Any]) -> str:
 
 
 def create_message_start_event(
-    message_id: str, model: str, input_tokens: int = 0
+    message_id: str,
+    model: str,
+    input_tokens: int = 0,
+    prefix_cache_enabled: bool = False,
 ) -> str:
-    """Create message_start SSE event."""
+    """Create message_start SSE event.
+
+    With prefix caching on, usage already takes the disjoint shape that
+    message_delta reports (input 0, the prompt as cache creation until the
+    real split is known). Claude Code keeps message_start's input_tokens when
+    message_delta sends 0, so a full count here was added on top of the
+    delta's cache_read_input_tokens: context usage read about twice the real
+    size and auto-compact fired at roughly half the window.
+    """
+    if prefix_cache_enabled:
+        usage = {
+            "input_tokens": 0,
+            "cache_creation_input_tokens": input_tokens,
+            "cache_read_input_tokens": 0,
+            "output_tokens": 0,
+        }
+    else:
+        usage = {"input_tokens": input_tokens, "output_tokens": 0}
     return format_sse_event(
         "message_start",
         {
@@ -927,7 +1197,7 @@ def create_message_start_event(
                 "content": [],
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+                "usage": usage,
             },
         },
     )

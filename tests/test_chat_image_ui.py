@@ -203,6 +203,27 @@ class TestImagePersistence:
             "still-running jobs must resume polling on chat reopen"
         )
 
+    def test_rehydrate_retries_transient_status_failure(self, chat_source):
+        """A transient !s.ok status poll during loadChat rehydration must NOT
+        bare-return and strand the bubble. loadChat strips the session blob
+        urls before calling rehydrate un-awaited, so a single failed status
+        poll left the persisted "100% done" caption with no image until the
+        NEXT load happened to succeed -- the intermittent "image never
+        showed, refresh fixed it" report. The image and video rehydrators
+        share a bounded retry guard."""
+        for fn in ("rehydrateImage", "rehydrateVideo"):
+            body = _function_body(chat_source, fn)
+            assert "if (!s.ok) return;" not in body, (
+                f"{fn} must not bare-return on a transient status failure"
+            )
+            assert body.count("retryTransient()") >= 2, (
+                f"{fn} must retry on both the !ok arm and the network-error "
+                f"catch before abandoning the bubble"
+            )
+            assert "attempt < 4" in body and "attempt + 1" in body, (
+                f"{fn} transient retry must be bounded by an attempt counter"
+            )
+
     def test_expired_placeholder_in_template(self, chat_source):
         assert "msg._image.error === 'artifact_expired'" in chat_source
         assert "chat.image.expired" in chat_source

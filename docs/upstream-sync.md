@@ -5,6 +5,12 @@
 
 上游:<https://github.com/jundot/omlx>(git remote 名 `upstream`)
 
+**2026-10-14 起 flyto-mlx 与上游分道扬镳** (owner 决定). 不再跟随上游做定期同步,
+上游的方向, 界面和功能不再是我们的参照. 底层 (MLX / mlx-lm / mlx-vlm) 仍然相同,
+所以上游的 PR 和 issue 仍可借鉴: 遇到修我们也有的 bug, 或支持我们需要的模型,
+按我们自己的改动手工移植, 写明出处并配自己的测试, 在本文件追加一条记录.
+以下 "方法" 一节和历史条目保留作参考.
+
 ## 方法(重要)
 
 判断"某个上游 commit 是否已在 flyto" —— **唯一可靠的方式是实际
@@ -575,3 +581,423 @@ PR #76 起全量基线为 0 fail (旧的 3 个 OMLX_SERVER_API_KEY env-override
 wired-limit 警告的 dashboard getter 与 8 语言 i18n (此前模板引用但
 JS 从未移植, 设置页每次渲染报 Alpine 错), 并修 bench/cluster 两处
 null 读取。
+
+## 2026-08-20 同步: 工具调用 / VLM / Gemma 4 正确性修复 (PR #91)
+
+上次同步点是 2026-06-13, 到本次时上游领先 1262 commits (三个月约 997 个).
+共享文件已大幅分化 (scheduler.py 1472+/7546-, tool_calling.py 283+/1808-,
+admin 整目录 9077+/154991-), 抽样 21 个上游 commit 做 `git cherry-pick -n`
+探测, 20 个冲突. **后续同步应按功能点手工移植, 不再按 commit 批量 pick.**
+
+引入 (全部手工移植, 上游测试一并搬入):
+
+- `093e7df1` (#2332) + `60e03c43` XML 工具调用回退路径的 schema 感知类型
+  转换. flyto 的 `_parse_xml_tool_calls` 对每个 `<parameter=k>` 值裸调
+  `json.loads`, 没有 schema 参与. 三个抽取分支 (Qwen/Llama, GLM arg_key,
+  namespaced invoke) 全部接上 `_coerce_param_value`. 含容器类型的括号修复
+  与 JSON 引号字面量回环.
+- `44effa29` (#2339) VLM 模型的 `frequency_penalty`. 两处 SamplingParams
+  构造 (generate / stream_generate) 完全没写该字段, 参数落进 **kwargs 被
+  丢弃. 链路其余部分早已接好 (openai_models / server.py / request /
+  scheduler 两处读 / BatchedEngine 两处传), 只有 VLM 引擎漏了 -- 对 m5max
+  上整个 Gemma 4 系列都是空转.
+- `13997cec` (#2533) + 后续把播种挪进 `_get_output_parser_session` 的重构.
+  Gemma 4 prompt 预开思考通道. 三处同时坏: ① `_detect_needs_think_prefix`
+  只匹配单 token `<think>` id, 而 Gemma 4 开标记 `<|channel>thought` 是多
+  token, 检测恒为 False; ② parser session 起始 `_in_thought=False`, 闭标记
+  被当杂散丢掉, 思考漏进正文; ③ 有 parser 接管流时不发 `<think>` 前缀,
+  导致有闭无开. 取上游最终形态 (播种在 session 创建处), 不依赖检测与创建
+  的先后顺序.
+
+跳过 (本轮明确不引):
+
+- `bddc9f88` (#2483) + `d5637c54` (#2753) tool-adjacent mid-system 模板校验.
+  上游有一整套 probe 机制探测模板是否原地保留 mid-system 消息 (flyto 全仓
+  `_MID_SYSTEM` / `mid_system` 命中 0 次). flyto 的
+  `_consolidate_system_messages` 是无条件把系统消息前置, 与上游是两套语义,
+  不是补丁而是换设计. 需单独 spike.
+  (2026-10-10 补记: Anthropic 路径已改为把中间系统消息并成用户备注, 见
+  "2026-10-10 同步: Claude Code 对话中间的系统消息"一节. OpenAI 路径仍是
+  无条件前置, 上游的模板探测机制仍未引入.)
+- ANE prefill 线 (`fbb98dc2` / `3d8e661c` / `166c8f48` 等, 约 20 commits).
+  三重阻塞: ① 需 `omlx/custom_kernels/` 原生扩展源码构建
+  (`OMLX_WITH_CUSTOM_KERNEL=1`); ② kernel ABI 锁死 `mlx==0.32.0` +
+  nanobind 2.13.0 (上游 `2ce529d4` 2026-07-09 移的 pin), flyto pin
+  `mlx>=0.31.2` 实装 0.31.2; ③ 双 ANE 路径面向 M3 Ultra 双 die, m2max 单
+  die 不适用. 且我们生产的 qwen3.6-dense-27b-nvfp4 不在 ANE 支持的 affine
+  q4/q5/q6/q8 列表内. 上游自测 M3 Ultra 32K 上下文 +18.9%.
+- 分布式集群线 (`cb8ca432` #2423 / `858e0ddc` #2591 等). 上游
+  `omlx/cluster/` 已有 20+ 文件 (rank 生命周期 / collective / 异构
+  Metal+CUDA 池 / SSD boundary-snapshot prompt cache); flyto 的
+  `omlx/cluster/` 只有 `router.py` (自研请求级负载路由, `53e6b116`), 是
+  完全不同的东西 -- 上游拆模型, flyto 分请求. 战略方向, 属业务决策.
+- 内存 / 准入线 (`31700cb3` #2390 / `045694f0` / `4dc9baab` #2573 /
+  `9acccab9` 等). 与 flyto PR#90 自研 phys-based 准入门正面重叠, 实现完全
+  分叉. 上游 `memory_guard_tier` 迁移是 breaking config (旧台账已标 flyto
+  113 处旧字段引用), 现在只会更贵.
+- Chat UI 大改版 (`9cacab80` #2379 + 聊天设置弹窗 / 历史下载 / chat 内 STT).
+  admin 分化 9077+/154991-, 移植等于重写.
+- 新模型支持 (MiniMax M3, Ling 3.0 Flash, MiMo V2.5, Tencent Hy3,
+  Meta Muse Glimmer 30B, DeepSeek V4 Flash 0731, Step-3.7-Flash,
+  Laguna S-2.1, Inkling Small, Baidu Unlimited-OCR). flyto 一个都没在跑.
+  ~~Qwen3.8 FP8/NVFP4~~ **此条已在 2026-08-24 反转, 见下一节** -- 当时判
+  "没在跑"所以跳过, owner 随后决定要上, 已移植.
+
+待评估 (下批候选, 已探测冲突但未逐行核实我们是否真缺):
+
+| 上游 commit | 内容 | 优先级 |
+|---|---|---|
+| `0121b8f1` (#2400) | 停止虚报 Claude Code token 用量, 删 `scale_anthropic_tokens()` | 高 (**已核实命中**: flyto `server.py:1274` 有该函数, 3802/4031/4034/4037 四处用于 Anthropic usage 上报; 但为 breaking config, 换 `autocompact_threshold_pct` 默认 80%) |
+| `d4e3c10a` (#2420) | 流未闭合时释放被扣住的封套后缀 | 高 |
+| `cdeea4c5` (#2507) / `12937527` / `d5592aa0` / `16930223` (#2593) | 工具调用流式解析四个边界修复 | 高 |
+| `acfb863f` (#1854) / `26f3f024` (#1886) | Gemma 4 namespaced 单引号参数 / 括号式工具调用 | 中高 |
+| `5be99248` (#2363) | 多 token decode 窗口内 rope 位置未推进 (影响 MTP verify 窗口) | 中高 (flyto 有 vlm_mtp) |
+| `f46abde3` (#1965) | Gemma4 E2B/E4B shared-KV VLM checkpoint | 中 (两台机都注册了 e2b/e4b) |
+| `b876be8e` (#2740) | 跨 chat template 归一化 reasoning effort (新增 `omlx/reasoning_effort.py`) | 中 |
+| `c59b4cb1` (#2435) | VLM chat-template render 尊重 partial 模式 | 中 |
+| `9f563da6` (#2633) | 并发 prefill 下的 decode 公平性 (scheduler +315, 新增 `omlx/decode_activity.py`) | 中 (scheduler 已分化, 需判断值不值) |
+| `2c10f0fb` (#2561) | grammar 采样 token 延到下一步开头接收 | 中 (flyto grammar 分化小, 28+/24-) |
+
+**上游 cache 修复线与 flyto 的 SSD 写路径 abort 无关** (memory
+`paged-ssd-cache-write-abort`): 逐个验证 `0d6b2667` / `330df4c0` /
+`cbd7daa4` / `f37a773a` 均不触及 `_extract_tensor_bytes` (grep 命中数全 0),
+而那正是 m5max 生产崩溃的栈顶. 不过 `0d6b2667` 的思路 (递归闭包形成自引用
+环把 KV 数组钉住) 值得借鉴 -- flyto `paged_ssd_cache.py` 的
+`_store_nstate_elements` 是同款嵌套闭包, 且同样在异步写线程里跑.
+
+**上游全仓 diarization 命中数 = 0**. 说话人分离 / energy_tripass /
+word_timestamps / forced aligner 整套是 flyto 独有 (audio_routes.py 比上游
+多 1224 行即此). 上游三个月只有 4 个音频 commit, 其中 STT `prompt` 透传
+(`bc63094b` #2082) flyto 早在 `403f886d` (2026-05-17) 就自研了, 早两个月.
+另三个 (`c1624efe` STT stream SSE / `f2c85e80` GET /v1/audio/voices /
+`214fc489` TTS 转码 mp3/opus/flac/pcm) flyto 都没有, 优先级低.
+
+测试: 全量 5154 passed / 0 failed / 19 skipped, 对基线 (0 fail) 零回归,
+新增 18 个测试全绿. 三个修复均通过回退验证是承重的.
+
+部署: m5max (PID 56893) + m2max (PID 96715) 双机部署, 各发真实工具调用
+请求验证 (`gemma4-e2b-4bit` + `frequency_penalty=0.5` + get_weather tool),
+均正确返回 `{"city": "北京"}` 且类型为 str. m5max 部署时用
+stash -> ff-merge -> stash pop 保住 PR#87 的 admin 本地改动 (12 个文件,
+与本次改动零重叠).
+
+**注意**: 旧的「待引入」表 (5 月的 #844 / #822 / #1056 / #805 / #933 /
+#1225 / #1268 / #1149 / memory tier 那条) 已严重过期 -- 上游那时到 #1445,
+现在到 #2946, 表里多数条目早被后续 commit 覆盖或废弃. 下次同步应整表重写.
+
+## 2026-08-24 同步: Qwen 3.8 支持 (PR #93)
+
+上一节把 Qwen3.8 归到「跳过」, 理由是"flyto 一个都没在跑". owner 随后决定
+要上, 本次移植. 只动这一条, 上一节其余跳过项不变.
+
+引入:
+
+- `c82cabca` (#2659) Qwen3.8 mixed ModelOpt NVFP4 权重加载器.
+  `git cherry-pick -x` **零冲突直接落地**: 新文件
+  `omlx/patches/qwen38_modelopt_mixed.py` (416 行) + `model_loading.py`
+  11 行接线 + 两个测试文件 (单测 11 个 + 一个 `slow` 标记的真模型集成测试,
+  不下权重, 全量跑时被 deselect).
+- `2bb2cc51` (#2653) Qwen3.8 FP8 + reasoning levels. **手工移植**, 三块里
+  两块原样落地 (`qwen38_fp8.py` 分块 FP8 反量化 + `qwen35_vlm_model.py`
+  的 sanitize 钩子), 第三块 reasoning_effort 改写, 见下.
+
+reasoning_effort 为什么不能照搬:
+
+flyto 早就有这个字段, 语义完全不同 -- 它是 `thinking_budget` 的语法糖
+(`_effort_to_budget`), 取值域 `{off, low, medium, high}` 由 pydantic
+validator 强制, `off` 表示 `enable_thinking=False`. 上游是把原始字符串直接
+转发给 chat template 且不限取值 (他们的测试用 `xhigh`, flyto 会 400).
+
+做法: validator 和预算映射一律不动, 额外把 effort 转发进
+`chat_template_kwargs`. 转发集合 = 校验过的取值域减 `off`
+(`server._TEMPLATE_FORWARDABLE_EFFORTS`). 域外档位继续走原有逃生口
+`chat_template_kwargs={"reasoning_effort": "xhigh"}` -- 那条路本来就通,
+本次没变.
+
+两个端点都接上了, 且**取值域限制是两边同一个常量**:
+
+- `/v1/chat/completions` 读 `request.reasoning_effort`, pydantic 已校验.
+- `/v1/responses` 读 `request.reasoning["effort"]`. **这是个没有任何校验的
+  `Dict[str, Any]`** -- 不显式限制的话 `xhigh` / 整数 / 列表都会直接进模板.
+  所以那一侧显式过一遍同一个集合, 域外值和非字符串值静默丢弃(不报错:
+  Codex CLI 会主动发 `reasoning.effort`, 拒掉会打断它), 对这些值行为与移植
+  前逐字节一致.
+- Anthropic `MessagesRequest` 没有 effort 字段, 不动. 上游也只接了两处.
+
+已实测确认 (下次别重做):
+
+1. **不需要升 mlx.** mlx 0.31.2 上 `mx.quantized_matmul(mode="mxfp8"/"nvfp4")`
+   以及 FP8 路径要的 `mx.to_fp8` / `mx.from_fp8` 全都在, 反量化实跑对得上
+   期望值. 上游钉 `mlx==0.32.0` 是为了他们自编译的 `omlx/custom_kernels/`
+   原生 kernel 的 nanobind ABI 对齐 (见上游 `2ce529d4` commit message),
+   那套 kernel 我们根本没有, 理由对我们不成立.
+2. **架构不用新写.** Qwen3.8 的 `config.model_type` 报的是 `qwen3_5`
+   (加载器第 157 行 `if config.get("model_type") != "qwen3_5"` 即证据),
+   复用现成 qwen3_5 架构; 我们装的 mlx-vlm 0.6.3 有 `qwen3_5` 模块.
+   那 416 行只是权重解包器 (处理 FP8 + NVFP4 混合量化).
+3. FP8 sanitize 钩子**只挂 dense 变体**, 与上游一致. flyto 另有
+   `qwen35_moe_vlm_model.py`, 上游同样没挂 -- 加载器自己注释说判定"刻意严格,
+   只认已发布的 dense 64 层 Qwen3.8 VLM 几何". 权重格式一变就得跟着改,
+   **不要为了通用去放宽这个判定**(放宽会让不匹配的 checkpoint 走错路径).
+
+刻意不引 (但因本次改动升了优先级):
+
+- `b876be8e` (#2740) 跨 chat template 归一化 reasoning effort. 上游新增
+  `omlx/reasoning_effort.py`, 在模板拒绝某个 effort 值时用别名重试渲染,
+  再退到模板原生默认. **这证明了"模板确实会因为不认识的 effort 值报错"**,
+  不是理论风险. 但它接的是 `apply_chat_template` 调用点, 上游只有 4 处,
+  flyto 有十几处 (batched 2 / dflash 2 / vlm 8+, 含 processor 回退、prefix、
+  diffusion 三条上游没有的路径) -- 漏接一处等于洞还在. 本次改为收窄转发取值
+  域, 同样堵住且可证明. 该 commit 留在下表, 若将来放宽取值域则变成必需前置.
+
+测试 (2026-08-24 m2max, 同一台机同一天):
+
+| | passed | failed | skipped | deselected |
+|---|---|---|---|---|
+| 基线 (干净 `main` @ `e1de07bd`, 独立 worktree) | 5222 | 0 | 19 | 59 |
+| 本分支 | 5244 | 0 | 19 | 60 |
+
+**零回归**, 且差值逐条对得上: +22 passed = 上游搬入 16 个
+(qwen38_modelopt 11 + api_utils 3 + vlm_mtp 2) + flyto 自加 6 个
+(openai_models 3: 接受 high / 拒绝 xhigh / chat_template_kwargs 逃生口;
+thinking_budget 3: 转发集合 = 取值域减 off 的不变式). +1 deselected =
+新增的 `slow` 标记真模型集成测试.
+
+**基线数字更正**: 上一节记的 "5154 passed" 在同一棵树上没能复现, 差 68 个,
+未追查原因. 本次是在独立 worktree 上 checkout 干净 `main` 当场重测的, 后续
+同步请以当场实测为准, 不要引用台账里的历史数字.
+
+**Qwen3.8 上 `reasoning_effort` 会同时有两层含义** (真机实测时会撞到):
+`high` 一边经 `_effort_to_budget` 变成 8192 的 thinking token 硬上限 (由
+`ThinkingBudgetProcessor` 执行), 一边作为模板档位让 Qwen3.8 自己决定思考深度.
+两层同时生效时, flyto 的预算表会把模板想花的量截断. 现役模型上看不出来
+(模板根本不读这个 kwarg), Qwen3.8 是第一个两层都活的模型. 不是 bug, 但
+"为什么 high 档思考说到一半就停了"的答案在这里, 调法是 per-model 的
+`ModelSettings.reasoning_effort_budgets`.
+
+真机验证 (owner 批了下权重, 已完成):
+
+`unsloth/Qwen3.8-27B-NVFP4` 从 ModelScope 下到 m5max, 23.4445 GB / 13 个文件,
+每个文件大小与仓库清单逐字节吻合, 53 分钟 (~8 MB/s). 放在
+`~/.cache/modelscope/hub/models/unsloth/Qwen3___8-27B-NVFP4` -- 即
+`omlx/admin/ms_downloader.py` 放真身的位置, 注册表只放软链
+`~/.fmlx/models/qwen3.8-dense-27b-nvfp4`.
+
+**下之前先验判定**, 免得 23 GB 花在一个 dispatch miss 上: 只拉 `config.json`
+跑 `is_supported_config` -> True, `quant_method: compressed-tensors`,
+`model_type: qwen3_5`. 又拿 `model.safetensors.index.json` 对了一遍: checkpoint
+里 `weight_scale` 张量正好 **401** 个, 与集成测试断言的模块数一致.
+
+集成测试在 m5max 通过. 但 23 GB 模型 6.5 秒跑完不足以自证, 所以改写成带
+instrumentation 的脚本重跑:
+
+```
+LOAD_SECONDS: 2.2                    (mmap 惰性加载 -- 权重全程不反量化,
+MLX_ACTIVE_MEMORY_GB: 23.75           所以这个耗时是合理的)
+SCALED_QUANTIZED_LINEAR_COUNT: 401 (expected 401)
+TEXT_OUTPUT:   '...Need answer one word: Paris. Ensure'
+VISION_OUTPUT: '...left is red, right is blue...'
+PEAK_MEMORY_GB: 24.24
+```
+
+23.75 GB 真占住了, 模块数精确对上, 文字答对, 视觉路径通过 NVFP4 权重正确读出
+合成的红蓝图.
+
+### Qwen3.8 模板实测: `off` 不转发是承重的, 不是洁癖
+
+拿真模板逐档渲染:
+
+| 传入 | 结果 |
+|---|---|
+| `low` / `medium` | OK, prompt 真的变了 |
+| `high` | OK, 模板自己映射成 `xhigh`, 与默认同 |
+| `xhigh` | OK (模板默认值) |
+| **`off`** | **TemplateError: Unexpected reasoning effort off** |
+| **`banana`** | **TemplateError** |
+
+模板只认 `xhigh` / `medium` / `low`, 别的直接抛. 所以:
+
+- **不转发 `off` 不是风格问题** -- 转发了的话, 每个对 Qwen3.8 发
+  `reasoning_effort: "off"` 的请求都会 500.
+- **给 `/v1/responses` 加取值域闸门堵的是真洞** -- 那条路的 `reasoning` 是
+  无校验 dict, 没有闸门的话 `banana` 会一路撞到 TemplateError.
+
+端到端 (m5max :8000, 真实请求):
+
+| 请求 | 结果 |
+|---|---|
+| 裸 chat | `content: '51'`, `reasoning_content` 正确分离 |
+| chat `reasoning_effort` = low/medium/high | 全部 200, 答案正确 |
+| chat `reasoning_effort=off` | 200, 思考 token 降到 2 |
+| responses `effort` = low | 200, 转发生效 |
+| responses `effort` = xhigh / banana / off / `["high"]` | **全部 200**, 域外值静默丢弃 |
+
+m2max 回归 (没有 Qwen3.8 权重, 验的是别打坏现役模型): `gemma4-e2b-4bit` 在
+`reasoning_effort=high` / `=off` / `chat_template_kwargs` 逃生口三种请求下均
+正确返回 `42`.
+
+**注意**: owner 批的权重是 **NVFP4**, 所以以上**全都没验到 `qwen38_fp8.py` 的
+分块 FP8 反量化** -- 那是另一种 checkpoint 格式 (带 `weight_scale_inv`).
+FP8 这块目前只有单测覆盖.
+
+部署: PR #93 已合并 (`5b2c7c33`), m5max (PID 22250, model_count 34 -> 35) +
+m2max (PID 50770) 双机部署. m5max 部署用 stash -> ff-merge -> stash pop 保住
+PR#87 的 12 个 admin 本地改动.
+
+## 2026-10-10 同步: 卸载模型时 serve 进程 SIGSEGV (sync/compile-cache-thread-exit)
+
+引入: `e623151a` fix(engine): clear MLX thread_local compile cache before
+worker thread exit. cherry-pick 零冲突.
+
+起因是生产事故. 2026-10-10 m5max 上同一晚崩了两次 (03:23 卸载 Qwen3.8,
+03:31 `POST /admin/api/reload` 先卸载已加载模型), 崩溃报告的栈与上游 commit
+描述逐帧一致: `_pthread_exit -> ThreadLocalVariables::finalizeList ->
+CompilerCache::~CompilerCache -> tupledealloc`, KERN_INVALID_ADDRESS 0x10.
+菜单栏 app 会在 2 到 10 秒内拉起 serve, 但在途请求全断. TTL 闲置卸载走的是
+同一条 `EngineCore.close()` 路径, 所以不只是手动卸载会碰上.
+
+根因: mlx 0.31 起 `@mx.compile` 的缓存是 C++ `thread_local`. 每个 engine 有
+自己的 MLX 工作线程 (#1248), 卸载时线程退出, 析构缓存时在没有 GIL 的情况下
+释放 Python 对象. 修法是在线程退出前, 在该线程上 (持有 GIL) 用 ctypes 调
+`libmlx` 导出的 `mlx::core::detail::compile_clear_cache()` 清空缓存. 符号解析
+不到时退回为让线程常驻不退出.
+
+本地复现补充了上游没写的触发条件: **只有多输出 (元组 / 字典) 的编译图会崩**,
+单输出的不崩 (它们的缓存项不持有 Python 输出结构对象). 上游自带的测试恰好用的
+是单输出函数, 撤掉修复照样通过, 守不住回归. 所以 flyto 加了一个子进程测试,
+跑元组和字典输出的编译图: mlx 0.31.2 上不清缓存以 SIGSEGV (-11) 退出, 清缓存
+正常退出. 回退验证: 撤掉 `close()` 里的清缓存调用,
+`test_close_clears_compile_cache_then_shuts_down` 变红.
+
+为什么有的卸载不崩 (比如 10-01 的 TTL 卸载): 取决于这个 engine 线程上有没有
+跑过多输出的编译图, 这又取决于请求走了哪条路径. 不是模型特有的问题.
+
+刻意不引: `1d071cb1` (#2052) / `0fb48c5c` (#2053) 给 embedding / reranker 卸载
+也加了清缓存. 它们跑在全局 executor 上, 那个线程不退出, 不会触发本崩溃,
+上游加的目的是释放显存. flyto 生产没有挂 embedding / reranker, 暂不需要.
+
+## 2026-10-10 同步: Claude Code 对话中间的系统消息 (sync/anthropic-mid-system)
+
+起因: owner 在 m5max 上装了 Claude Code 2.1.296 接本地 fmlx, 第一个请求就
+422 (`messages -> 1 -> role: Input should be 'user' or 'assistant'`). 这个版本
+带 `anthropic-beta: mid-conversation-system-2026-04-07`, 在第一条用户消息
+之后放一条约 5600 字的 role="system" 环境说明, 客户端没有开关能关掉.
+
+引入:
+
+- `6a9eb746` (#1511) `AnthropicMessage.role` 放开 `"system"`. 零冲突.
+- `d86461e6` 把 messages[] 里的 role="system" 并入标准 system 字段. 零冲突.
+- `4ee255bc` (#2882) 剥掉 Claude Code 每轮都会变的
+  `<total_tokens>N tokens left</total_tokens>` 预算标记, 否则提示词开头每轮都
+  变, 前缀缓存永远用不上. 测试文件冲突: 丢掉冲突块里无关的上游音频测试,
+  删掉一条测试的 `consolidate_system_messages=False` 参数 (来自未引入的
+  `473f6291`). 上游提交信息里的 AI 共同作者行按本仓规定去掉了.
+
+flyto 自己的改动 (Anthropic 主路径): 只有开头的内联系统消息并入标准系统块,
+后面的留在原位, 以 `[System note]...[/System note]` 并入相邻用户消息. 辅助
+函数移植自 `473f6291` (#1826) 的 `_downgrade_mid_system_to_user_notes` 一族,
+只搬函数, 没搬它的模板探测和配置项. 挨着工具调用边界或带图片的用户消息时,
+照旧整体上提 (`_consolidate_system_messages`), 这对严格模板总是合法的.
+预算标记先剥再并, 保证不会进备注. Harmony 路径 (gpt-oss) 保留 `d86461e6`
+的整体上提, 两条路径行为不同是刻意的.
+
+为什么不直接用 `d86461e6` 的整体上提: 只有一条固定环境说明时两种做法前缀都
+稳定, 区别在后续轮次出现新的中间系统消息时. 整体上提会把它塞进开头, 从第一
+条消息起整段提示词都变; 备注只改尾部. 测试用真实 Qwen3.8 模板渲染两轮, 断言
+第二轮以第一轮 "到第一条用户消息结束" 为前缀. 回退验证: 把备注步骤换成纯上提,
+这条和另外四条测试变红.
+
+离线验证: omlx-4d 抓到的 Claude Code 2.1.296 首个真实请求 (21 个工具, 列表
+形式 system, `thinking: adaptive`, `output_config`) 在 main 上校验失败, 与线上
+422 一致; 本分支通过校验, 转换后渲染正常. 多轮带 tool_result 的真实样本要等
+部署后才能抓到.
+
+没验证到的: 前缀缓存实际命中率. 按设计第二轮应大部分命中, 要部署后看服务端
+日志才算数.
+
+## 2026-10-14 同步: 缓存正确性, Claude Code 超长报错, 崩溃修复 (sync/upstream-2026-10)
+
+起因: m5max 断联期间对上游做了一次全面普查. 上游领先 2080 个 commit, 2026-08-20
+以来 818 个. 按领域分四路看 (引擎/缓存, 接口/工具调用, 模型支持, 依赖库), 每条
+结论都要求给出我们代码里的对应位置或已有的修复. 本次只引入 "必须" 一档的 9 项,
+"值得" 一档列在后面待排期.
+
+引入:
+
+- `9407468f` (cherry-pick 零冲突) + `8986da14` (手工移植并收紧). 分段预填时
+  边界快照全部丢失 (请求还没进 BatchGenerator, uid 查不到, 静默返回); 又因为
+  store_cache 跳过末尾残块, 最后一个整块存的却是读完全部内容后的 GDN 实时状态,
+  复用时尾巴被再喂一遍, 循环状态静默出错. 上游的判断条件是 "token 数正好对齐
+  块大小就信任实时状态", 对我们不够: 思考型请求只存提示部分, 提示可以正好对齐,
+  但状态已经读进了生成内容. 所以改为由调用方声明 live_state_at_end, 只有走边界
+  快照覆盖路径时才置位, 其余一律存占位, 复用时回退到最后一个有真快照的块.
+  Claude Code 实测看到的 "每轮命中 16384, 尾部约 2K 重算" 正好是会触发它的形态.
+- flyto 自己补的一处: 预填边界快照的内存回退 (没有快照存储, 或写队列满) 原来存
+  的是活的缓存对象, 预填继续原地更新它们, 存缓存时读到的是后面边界的状态. 有了
+  `9407468f` 这条路才走得到 (20 万提示约 100 个快照, 写队列上限 128). 改为拍下时
+  提取并复制状态容器.
+- `df7fa9eb` 超长报错改为 "Prompt is too long: N tokens > M maximum context
+  length" 并带 code=context_length_exceeded. Claude Code 2.1.296 只认小写后含
+  "prompt is too long" 的错误 (已在其二进制里核实), 原措辞导致超限会话永不自动
+  压缩. 保留 #90 的 exc.headers 透传 (上游丢了).
+- `74d71687` + `1710a61d` + `eed2576a` SSD 缓存写入崩溃的根因: 引擎计算流是线程
+  本地的, 推理线程只 async_eval 就把数组交给存储线程, 存储线程上实现惰性数组时
+  报 "no Stream(gpu, N)", 在 buffer protocol 里变成 SIGABRT. 改为推理线程完整
+  eval, 内存快照拍下即 eval, 存储线程显式 eval 切片和 bf16 视图. 子进程测试在
+  MLX 0.32.3 上复现了该错误. **更正 2026-08-20 一节**: 当时说 "上游 cache 修复线
+  与 SSD 写崩溃无关", 漏看了这一对 6 月的提交.
+- mlx-lm `e2f2fb2` (以补丁回移, 不升 mlx-lm). GenerationBatch.filter 在所有行都
+  没有处理器时不收缩列表, 之后插入的请求读到错位的行, 格式约束和惩罚被跳过.
+- `4f5c6ce7` 出错恢复后新生成器从 0 重新编 uid, 延后的删除会误删新请求.
+- `sdpa256_attention.py` 最终形态 (`16358a9c` ... `0eb8df1f`). MLX 0.32.3 对
+  head_dim 256 在查询少于 1024 (有 NAX) 时走非融合路径, 生成整张分数矩阵;
+  Claude Code 几百 token 的新内容接 20 万前缀时每层几 GB. 改走 force_fused. NAX
+  检测在本地用 Python 镜像实现 (上游在原生扩展里); 不注册内存监视器 (我们的估算
+  监视器没有接线).
+- `5be99248` mRoPE 多 token 窗口位置逐个递增. 影响 Qwen3.8 MTP 验证窗口和 MTP
+  加入时的重新预填, 两个分支都改了.
+- `e981616a` Gemma4 形状不同的单图视觉缓存不再拼接 (原来 500 且反复失败).
+- xgrammar 锁定 `==0.2.8`. 已本地核实 0.2.1 对 {"n": integer} 接受 {"n": "x"},
+  0.2.8 拒绝 (#595).
+
+没验证到的 (要等 m5max): Qwen3.6 同一段对话走缓存和不走缓存的输出是否一致;
+分段预填时边界快照现在每 2048 token 存一次 (Qwen3.6 的 GDN 状态约 60MB, 20 万
+上下文约 100 次, 序列化在推理线程上, 待写队列最多 128 个即约 7.7GB 内存), 对长预填
+耗时, 内存峰值和 SSD 缓存占用 (每块从只存 KV 约 40MB 变成再加 60MB GDN 状态) 的
+影响; Qwen3.8 开关 MTP 的输出一致性; sdpa256 在
+M5 (NAX) 上的实际峰值和速度.
+
+部署 m5max 时必须做:
+
+- 清掉现有前缀缓存 (SSD 分页缓存目录, 边界快照目录, 重启进程清热缓存). 旧代码
+  已经存下的坏块不会被修好: 去重时不重写已有块, 回退时也会接受它. 不清的话新
+  代码照样恢复坏块, 对比实验也会被污染. 代价是每个会话第一轮冷预填一次.
+- xgrammar 单独装 `xgrammar==0.2.8` (连带 `apache-tvm-ffi>=0.1.11`), 不要整体
+  `uv sync`, 上次重建漂了 mcp 和 torch. 0.2.8 的 `libxgrammar_bindings.dylib`
+  路径和 rpath 与 0.2.1 相同, Formula 的 post_install 不用改.
+
+m5max 上的判据: 不要用 "走缓存和不走缓存整段贪心输出逐字一致", 分块边界不同加上
+sdpa256 换了内核, 位级差异会让长输出分叉. 改比恢复出的 GDN 状态与冷算到同一边界
+的状态的最大差, 或首 token logits 的 top-k 和最大差, 并用修复前的构建做对照.
+MTP 开关同理比前若干 token 的 logprob. 日志里长提示应出现 `Using boundary cache
+snapshot for`, 不应出现 `Boundary snapshot write queue full`. 热缓存按字节限额,
+每块变大只会降低命中块数, 不会涨内存.
+
+刻意没引, 留作下一批 ("值得" 一档):
+
+- 工具调用解析: mlx-lm qwen3_coder 解析器的 anyOf/无 type 参数 (`a537041` 等),
+  `9f2c8bd4` 带连字符的 MCP 工具名, `9529ea32` 缺 `>`, 未闭合 `<tool_call>` 的
+  回退, `cdeea4c5` 参数里出现字面 `</tool_call>`, `f519a399` 正文里出现字面
+  `<tool_call>`.
+- `72294f3a` 思考中途触到 max_tokens, `85b14f90` 未知 Anthropic 内容块 422,
+  `008356db` 纯文本文档被误当 base64, `e1fcf2ca` / `8238975a` 结构化输出空白和
+  转义.
+- 缓存命中: 新鲜度闸门 (`4a17c629` + `43ecc1da` + `8827f095`), `229adb54` 思考
+  输出入缓存, `8288884d` + `a28e5a87` 尾块复用 (大), `b628475e`, `ffc2d059`,
+  热缓存收缩接入 #113 闸门.
+- dflash-mlx `76c3d1d` (drafter 长跑变慢 5 倍), mlx `a59cc231` GPU 保温 (等 0.32.4
+  发 PyPI), mlx-audio `e1da179` 对齐器 O(n^2).
+- Gemma4: `43762299`, `2d71e37b`, `8cc02d69`.
+
+依赖版本: mlx 0.32.3, mlx-lm ab1806e, mlx-vlm 78b96eb, dflash-mlx, mlx-audio 都
+不动. 升 mlx-lm 会改缓存状态格式让 SSD 缓存全部失效; mlx-vlm 0.7 是大移植.

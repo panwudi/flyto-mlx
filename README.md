@@ -47,7 +47,7 @@ pip install flyto-mlx
 从 0.6.0 起 PyPI 通道已开通：mlx-vlm 0.6.x 把此前只存在于 git 提交里的依赖正式发版了，整条依赖链都能从 PyPI 解析。想跟最新主干也可以从 git 装：
 
 ```
-pip install git+https://github.com/panwudi/flyto-mlx@v0.6.0
+pip install git+https://github.com/panwudi/flyto-mlx@v0.7.0
 ```
 
 ## 一个示例
@@ -149,7 +149,7 @@ pip install flyto-mlx
 The PyPI channel is live as of 0.6.0: mlx-vlm 0.6.x released the commits we previously had to pin from git, so the whole dependency chain now resolves from PyPI. To track the latest main instead:
 
 ```
-pip install git+https://github.com/panwudi/flyto-mlx@v0.6.0
+pip install git+https://github.com/panwudi/flyto-mlx@v0.7.0
 ```
 
 ### Video and image generation

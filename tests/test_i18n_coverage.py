@@ -32,7 +32,6 @@ DASHBOARD_JS = _ADMIN / "static" / "js" / "dashboard.js"
 # allowed to be absent from the static scan. The full concrete forms ARE
 # still covered by the all-locales-match-en check below.
 _DYNAMIC_PREFIXES = (
-    "bench.upload_skipped.features.",
     "settings.resource.guard_tier_desc.",
 )
 

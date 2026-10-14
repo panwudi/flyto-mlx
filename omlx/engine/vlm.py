@@ -782,6 +782,15 @@ class VLMBatchedEngine(BaseEngine):
             get_mlx_executor(), _load_vlm_sync
         )
 
+        # Pin this model's MTP choice on the model itself; the process-wide
+        # flag is reset by every later load.
+        from ..patches.mlx_lm_mtp import stamp_model_mtp_active
+
+        stamp_model_mtp_active(
+            self._vlm_model,
+            bool(getattr(self._model_settings, "mtp_enabled", False)),
+        )
+
         # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
         # loader thread so per-engine inference threads can read them (#1304).
         from ..utils.model_loading import materialize_lazy_state
@@ -857,6 +866,9 @@ class VLMBatchedEngine(BaseEngine):
             else SchedulerConfig()
         )
         scheduler_config.model_name = self._model_name
+        from ..scheduler import apply_model_concurrency_override
+
+        apply_model_concurrency_override(scheduler_config, self._model_settings)
 
         engine_config = EngineConfig(
             model_name=self._model_name,
@@ -889,6 +901,17 @@ class VLMBatchedEngine(BaseEngine):
                     self._model_settings, "turboquant_skip_last", True
                 )
                 logger.info(f"TurboQuant KV cache enabled for VLM: {tq_bits} bits")
+
+        # head_dim=256 long-context prefill (Qwen3.5/3.6/3.8) -> MLX's fused
+        # SDPA kernel. Installed after TurboQuant so quantized caches keep
+        # their own path. Strictly shape-gated; everything else passes
+        # through unchanged (upstream sdpa256_attention).
+        try:
+            from ..patches.sdpa256_attention import apply_sdpa256_attention_patch
+
+            apply_sdpa256_attention_patch()
+        except Exception:
+            logger.debug("sdpa256 attention patch not applied", exc_info=True)
 
         # SpecPrefill: load draft model and pass to scheduler
         if self._model_settings is not None:
@@ -1748,8 +1771,22 @@ class VLMBatchedEngine(BaseEngine):
                     self._vision_cache.get(h, self._model_name) for h in per_hashes
                 ]
 
+                # Per-image entries are keyed by the image alone, but the
+                # number of soft tokens an image encodes to depends on the
+                # resize regime, which depends on the other images in the
+                # request (Gemma 4 per-image resize: 1024x1024 -> 256 tokens,
+                # 1536x640 -> 250). Entries cached from separate single-image
+                # requests can disagree, and mx.concatenate raises before
+                # _vision_features_match_image_tokens can reject them. Check
+                # the shapes agree first and otherwise fall through to the
+                # whole-request entry, then a recompute (upstream e981616a).
+                per_image_usable = (
+                    all(f is not None for f in cached_per_image)
+                    and len({f.shape[1:] for f in cached_per_image}) == 1
+                )
+
                 cached_whole = None
-                if not all(f is not None for f in cached_per_image):
+                if not per_image_usable:
                     # Fallback: whole-request entry (stored when per-image split
                     # is unsupported, e.g. Gemma 4 multi-image with per-image
                     # resize). Mirrors the store-side branch below.
@@ -1758,7 +1795,7 @@ class VLMBatchedEngine(BaseEngine):
                     )
 
                 used_cached_features = False
-                if all(f is not None for f in cached_per_image):
+                if per_image_usable:
                     # All images cached individually — combine and use
                     combined = mx.concatenate(cached_per_image, axis=0)
                     if self._vision_features_match_image_tokens(
@@ -2003,6 +2040,7 @@ class VLMBatchedEngine(BaseEngine):
             xtc_threshold=kwargs.get("xtc_threshold", 0.1),
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
+            frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
             stop_token_ids=extra_stop_ids or None,
             thinking_budget=kwargs.get("thinking_budget", None),
@@ -2107,6 +2145,7 @@ class VLMBatchedEngine(BaseEngine):
             xtc_threshold=kwargs.get("xtc_threshold", 0.1),
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
+            frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
             stop_token_ids=extra_stop_ids or None,
             thinking_budget=kwargs.get("thinking_budget", None),

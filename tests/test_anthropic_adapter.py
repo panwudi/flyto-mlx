@@ -108,6 +108,71 @@ class TestAnthropicAdapter:
         assert internal.messages[0].content == "You are a helpful assistant."
         assert internal.messages[1].role == "user"
 
+    def test_parse_request_in_messages_system(self, adapter):
+        """A mid-conversation role="system" entry (claude-code
+        mid-conversation-system beta) becomes a note on the preceding user
+        message instead of moving to the front, so the prompt head is
+        unchanged."""
+        request = MessagesRequest(
+            model="claude-3-sonnet",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role="user", content="Hi there"),
+                AnthropicMessage(role="system", content="Be terse."),
+                AnthropicMessage(role="assistant", content="ok"),
+            ],
+        )
+
+        internal = adapter.parse_request(request)
+
+        assert [m.role for m in internal.messages] == ["user", "assistant"]
+        assert internal.messages[0].content == (
+            "Hi there\n\n[System note]\nBe terse.\n[/System note]"
+        )
+
+    def test_parse_request_system_field_and_in_messages_merge(self, adapter):
+        """System field and in-messages system content merge into one block,
+        with the canonical system field first and inlined parts appended."""
+        request = MessagesRequest(
+            model="claude-3-sonnet",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role="system", content="Be terse."),
+                AnthropicMessage(role="user", content="Hi"),
+            ],
+            system="You are a helpful assistant.",
+        )
+
+        internal = adapter.parse_request(request)
+
+        assert internal.messages[0].role == "system"
+        assert internal.messages[0].content == (
+            "You are a helpful assistant.\n\nBe terse."
+        )
+        assert internal.messages[1].role == "user"
+
+    def test_parse_request_multiple_in_messages_system(self, adapter):
+        """Leading and mid-conversation inline system entries are split."""
+        request = MessagesRequest(
+            model="claude-3-sonnet",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role="system", content="First."),
+                AnthropicMessage(role="user", content="Hi"),
+                AnthropicMessage(role="system", content="Second."),
+            ],
+        )
+
+        internal = adapter.parse_request(request)
+
+        # Leading inline system joins the canonical system block; the later
+        # one becomes a note on the user turn before it.
+        assert [m.role for m in internal.messages] == ["system", "user"]
+        assert internal.messages[0].content == "First."
+        assert internal.messages[1].content == (
+            "Hi\n\n[System note]\nSecond.\n[/System note]"
+        )
+
     # =========================================================================
     # parse_request Tests - Generation Parameters
     # =========================================================================
@@ -619,3 +684,104 @@ class TestAnthropicToolUseConversion:
         # Must use [Calling tool: ...] not [Tool call: ...]
         assert "[Calling tool: get_weather(" in content
         assert "[Tool call:" not in content
+
+
+
+
+class TestClientBudgetMarkerStripping:
+    """Tests for Claude Code `<total_tokens>` budget-marker stripping.
+
+    Claude Code appends a freshly decremented
+    `<total_tokens>N tokens left</total_tokens>` block to the system prompt
+    on every request, which mutates the prompt head and defeats prefix
+    caching. The markers are informational only and are stripped like the
+    billing header blocks.
+    """
+
+    def test_strip_from_system_string(self):
+        from omlx.api.anthropic_utils import convert_anthropic_to_internal
+
+        request = MessagesRequest(
+            model="minimax-m3-6bit",
+            max_tokens=64,
+            system=(
+                "You are a helpful assistant."
+                "\n\n<total_tokens>15000000 tokens left</total_tokens>"
+                "\n\n<total_tokens>14999436 tokens left</total_tokens>"
+            ),
+            messages=[AnthropicMessage(role="user", content="Hello")],
+        )
+
+        messages = convert_anthropic_to_internal(request)
+
+        assert messages[0]["role"] == "system"
+        assert messages[0]["content"] == "You are a helpful assistant."
+
+    def test_strip_from_system_blocks(self):
+        from omlx.api.anthropic_utils import _extract_system_text
+
+        text = _extract_system_text(
+            [
+                {"type": "text", "text": "Identity line."},
+                {
+                    "type": "text",
+                    "text": "Body.\n\n<total_tokens>123 tokens left</total_tokens>",
+                },
+            ]
+        )
+
+        assert text == "Identity line.\nBody."
+
+    def test_system_without_marker_is_untouched(self):
+        from omlx.api.anthropic_utils import _extract_system_text
+
+        text = "Plain system prompt.\nNo markers here."
+
+        assert _extract_system_text(text) == text
+
+    def test_strip_from_inline_system_message(self):
+        from omlx.api.anthropic_utils import convert_anthropic_to_internal
+
+        request = MessagesRequest(
+            model="minimax-m3-6bit",
+            max_tokens=64,
+            messages=[
+                AnthropicMessage(
+                    role="system",
+                    content=(
+                        "Inline system."
+                        "\n\n<total_tokens>42 tokens left</total_tokens>"
+                    ),
+                ),
+                AnthropicMessage(role="user", content="Hello"),
+            ],
+        )
+
+        messages = convert_anthropic_to_internal(request)
+
+        system_contents = [
+            m["content"] for m in messages if m["role"] == "system"
+        ]
+        assert any(c == "Inline system." for c in system_contents)
+        assert all("<total_tokens>" not in c for c in system_contents)
+
+    def test_marker_in_user_content_is_preserved(self):
+        from omlx.api.anthropic_utils import convert_anthropic_to_internal
+
+        request = MessagesRequest(
+            model="minimax-m3-6bit",
+            max_tokens=64,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=(
+                        "Quoting a log line: "
+                        "<total_tokens>7 tokens left</total_tokens>"
+                    ),
+                ),
+            ],
+        )
+
+        messages = convert_anthropic_to_internal(request)
+
+        assert "<total_tokens>7 tokens left</total_tokens>" in messages[-1]["content"]

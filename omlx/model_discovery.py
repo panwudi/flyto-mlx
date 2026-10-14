@@ -297,7 +297,7 @@ class DiscoveredModel:
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
     video_pipeline: str = ""  # "t2v" | "i2v" | "ti2v" for video models, else ""
-    image_pipeline: str = ""  # "t2i" | "edit" for image models, else ""
+    image_pipeline: str = ""  # "t2i" | "edit" | "inpaint" for image models, else ""
     image_alias: str = ""  # mflux ModelConfig alias (e.g. "z-image-turbo"), else ""
 
 
@@ -817,7 +817,7 @@ def is_image_model_dir(path: Path) -> bool:
 
 
 def read_image_model_kind(path: Path) -> tuple[str, str]:
-    """Classify an image model dir as ("t2i" | "edit", mflux ModelConfig alias).
+    """Classify an image model dir as ("t2i" | "edit" | "inpaint", mflux alias).
 
     mlx-gen saved-format dirs carry no class marker anywhere (component index
     metadata holds only quantization_level + mflux_version), so the directory
@@ -843,6 +843,14 @@ def read_image_model_kind(path: Path) -> tuple[str, str]:
         return "t2i", "z-image-turbo"
     if "z-image" in name:
         return "t2i", "z-image"
+    if "qwen" in name and "inpaint" in name:
+        # Mask-driven inpaint runs on the qwen-image BASE weights (no separate
+        # checkpoint); the dir/alias only selects the inpaint pipeline, so the
+        # mflux alias stays "qwen-image". Register by naming a dir/symlink to
+        # the base weights with "inpaint" in it. Phase 2 controlnet-inpaint is
+        # a distinct alias handled separately. Checked before the plain
+        # "qwen-image" t2i fallback. See docs/qwen-inpaint-engine-spec.md.
+        return "inpaint", "qwen-image"
     if "qwen-image" in name:
         return "t2i", "qwen-image"
     return "", ""

@@ -21,6 +21,7 @@ from omlx.api.utils import (
     extract_harmony_messages,
     extract_multimodal_content,
     extract_text_content,
+    merge_reasoning_effort_chat_template_kwargs,
 )
 from omlx.api.anthropic_utils import (
     convert_anthropic_to_internal,
@@ -50,6 +51,24 @@ from omlx.api.anthropic_models import (
     MessagesRequest,
     SystemContent,
 )
+
+
+class TestReasoningEffortChatTemplateKwargs:
+    def test_adds_top_level_reasoning_effort(self):
+        assert merge_reasoning_effort_chat_template_kwargs(None, "high") == {
+            "reasoning_effort": "high"
+        }
+
+    def test_explicit_template_kwarg_wins(self):
+        original = {"reasoning_effort": "low", "enable_thinking": True}
+
+        merged = merge_reasoning_effort_chat_template_kwargs(original, "high")
+
+        assert merged == original
+        assert merged is not original
+
+    def test_empty_inputs_return_none(self):
+        assert merge_reasoning_effort_chat_template_kwargs(None, None) is None
 
 
 class TestCleanOutputText:
@@ -1529,6 +1548,44 @@ class TestSSEEventFormatters:
         assert "event: message_start" in result
         assert "msg_123" in result
         assert "claude-3" in result
+
+    def test_create_message_start_event_prefix_cache_shape(self):
+        """With caching active, message_start uses the same disjoint shape as
+        message_delta, so a client that keeps message_start's input_tokens when
+        the delta sends 0 does not count the prompt twice."""
+        import json as _json
+
+        result = create_message_start_event(
+            "msg_123", "m", input_tokens=100, prefix_cache_enabled=True
+        )
+        usage = _json.loads(result.split("data: ", 1)[1])["message"]["usage"]
+        assert usage["input_tokens"] == 0
+        assert usage["cache_creation_input_tokens"] == 100
+        assert usage["cache_read_input_tokens"] == 0
+
+        # Merge the way Claude Code does (delta overrides only non-zero
+        # values) and check the context total equals the prompt.
+        delta = create_message_delta_event(
+            "end_turn", 5, input_tokens=100, cached_tokens=60,
+            prefix_cache_enabled=True,
+        )
+        d_usage = _json.loads(delta.split("data: ", 1)[1])["usage"]
+        merged = dict(usage)
+        for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"):
+            if d_usage.get(k):
+                merged[k] = d_usage[k]
+        assert (
+            merged["input_tokens"]
+            + merged["cache_creation_input_tokens"]
+            + merged["cache_read_input_tokens"]
+        ) == 100
+
+    def test_create_message_start_event_legacy_shape(self):
+        import json as _json
+
+        result = create_message_start_event("msg_123", "m", input_tokens=100)
+        usage = _json.loads(result.split("data: ", 1)[1])["message"]["usage"]
+        assert usage == {"input_tokens": 100, "output_tokens": 0}
 
     def test_create_content_block_start_event_text(self):
         """Test creating content_block_start event for text."""

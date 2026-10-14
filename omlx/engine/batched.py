@@ -252,6 +252,14 @@ class BatchedEngine(BaseEngine):
 
         self._model = apply_post_load_transforms(self._model, self._model_settings)
 
+        # Pin this model's MTP choice on the model itself; the process-wide
+        # flag is reset by every later load.
+        from ..patches.mlx_lm_mtp import stamp_model_mtp_active
+
+        stamp_model_mtp_active(
+            self._model, bool(getattr(self._model_settings, "mtp_enabled", False))
+        )
+
         # Materialize lazy buffers on the loader thread so per-engine
         # inference threads can read them (#1304).
         await loop.run_in_executor(
@@ -270,6 +278,17 @@ class BatchedEngine(BaseEngine):
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 logger.info(f"TurboQuant KV cache enabled: {tq_bits} bits")
 
+        # head_dim=256 long-context prefill (Qwen3.5/3.6/3.8) -> MLX's fused
+        # SDPA kernel. Installed after TurboQuant so quantized caches keep
+        # their own path. Strictly shape-gated; everything else passes
+        # through unchanged (upstream sdpa256_attention).
+        try:
+            from ..patches.sdpa256_attention import apply_sdpa256_attention_patch
+
+            apply_sdpa256_attention_patch()
+        except Exception:
+            logger.debug("sdpa256 attention patch not applied", exc_info=True)
+
         # Create engine config (copy to avoid mutating the shared instance)
         scheduler_config = (
             copy.copy(self._scheduler_config)
@@ -279,6 +298,9 @@ class BatchedEngine(BaseEngine):
         scheduler_config.model_name = (
             self._model_name
         )  # Ensure cache isolation per model
+        from ..scheduler import apply_model_concurrency_override
+
+        apply_model_concurrency_override(scheduler_config, self._model_settings)
         engine_config = EngineConfig(
             model_name=self._model_name,
             scheduler_config=scheduler_config,

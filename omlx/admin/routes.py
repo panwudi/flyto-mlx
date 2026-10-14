@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Admin panel routes for oMLX server configuration.
+"""Admin panel routes for Flyto MLX server configuration.
 
 This module provides HTTP routes for the admin panel including:
 - Login/logout with API key authentication
@@ -34,7 +34,6 @@ from pydantic import BaseModel, Field
 
 from ..model_profiles import EXCLUDED_FROM_PROFILES
 from ..settings import SubKeyEntry
-from ..utils.release_check import select_latest_stable_release
 from .auth import (
     REMEMBER_ME_MAX_AGE,
     SESSION_MAX_AGE,
@@ -46,9 +45,6 @@ from .auth import (
 )
 
 logger = logging.getLogger(__name__)
-
-PRESET_REMOTE_URL = "https://omlx.ai/assets/omlx_preset.json"
-
 
 # =============================================================================
 # Pydantic Models
@@ -171,6 +167,13 @@ class ModelSettingsRequest(BaseModel):
     # L/R speakers; "high" auto-upgrades to 3-pass energy_tripass (3x ASR).
     # Per-request diarize_backend always wins over this preference.
     default_diarize_quality: str | None = None
+    # Long-audio handling for decoder-only ASR. None = server default ("auto":
+    # transcribe once, re-transcribe chunked only if the output degenerates).
+    # "chunk" = always chunk proactively; "off" = single pass. Set on the ASR
+    # model. Per-request long_audio always wins.
+    default_long_audio: str | None = None
+    # Target chunk length (minutes) for default_long_audio="chunk". None = 15.
+    long_audio_chunk_minutes: float | None = None
     is_pinned: bool | None = None
     is_default: bool | None = None
     # Security: per-model opt-in for trust_remote_code (issue #926)
@@ -1905,6 +1908,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "dflash_in_memory_cache_max_bytes": settings.dflash_in_memory_cache_max_bytes,
                 "dflash_ssd_cache": settings.dflash_ssd_cache,
                 "mtp_enabled": settings.mtp_enabled,
+                "max_concurrent_requests": settings.max_concurrent_requests,
                 "vlm_mtp_enabled": settings.vlm_mtp_enabled,
                 "vlm_mtp_draft_model": settings.vlm_mtp_draft_model,
                 "vlm_mtp_draft_block_size": settings.vlm_mtp_draft_block_size,
@@ -1912,6 +1916,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "aligner_max_audio_seconds": settings.aligner_max_audio_seconds,
                 "default_aligner_overflow": settings.default_aligner_overflow,
                 "default_diarize_quality": settings.default_diarize_quality,
+                "default_long_audio": settings.default_long_audio,
+                "long_audio_chunk_minutes": settings.long_audio_chunk_minutes,
                 "is_pinned": settings.is_pinned,
                 "is_default": settings.is_default,
                 "trust_remote_code": settings.trust_remote_code,
@@ -2254,6 +2260,19 @@ async def update_model_settings(
                 ),
             )
         current_settings.default_diarize_quality = _q
+    if "default_long_audio" in sent:
+        current_settings.default_long_audio = (
+            request.default_long_audio
+            if request.default_long_audio in ("off", "chunk", "auto")
+            else None
+        )
+    if "long_audio_chunk_minutes" in sent:
+        current_settings.long_audio_chunk_minutes = (
+            request.long_audio_chunk_minutes
+            if request.long_audio_chunk_minutes
+            and request.long_audio_chunk_minutes > 0
+            else None
+        )
     if "dflash_draft_quant_enabled" in sent:
         current_settings.dflash_draft_quant_enabled = bool(request.dflash_draft_quant_enabled) if request.dflash_draft_quant_enabled is not None else None
     if "dflash_draft_quant_weight_bits" in sent:
@@ -2766,38 +2785,6 @@ async def delete_template(
     if not mgr.delete_template(name):
         raise HTTPException(status_code=404, detail=f"Template not found: {name}")
     return {"deleted": True, "name": name}
-
-
-# =============================================================================
-# Preset refresh (proxy to omlx.ai to avoid CORS)
-# =============================================================================
-
-
-@router.post("/api/presets/refresh")
-async def refresh_presets(is_admin: bool = Depends(require_admin)):
-    """Fetch the latest preset bundle from omlx.ai and return it.
-
-    The client uses this instead of fetching omlx.ai directly so we do not
-    depend on CORS headers on the remote host. Any failure is surfaced as 502
-    so the client can silently fall back to the bundled presets.
-    """
-    try:
-        resp = await asyncio.to_thread(
-            requests.get,
-            PRESET_REMOTE_URL,
-            timeout=10,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Fetch failed: {e}")
-    if resp.status_code != 200:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Remote returned {resp.status_code}",
-        )
-    try:
-        return resp.json()
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Invalid JSON: {e}")
 
 
 @router.get("/api/models/{model_id}/generation_config")
@@ -5509,8 +5496,7 @@ async def stream_benchmark(
     async def event_generator():
         # Replay-then-attach: see /api/bench/accuracy/{id}/stream for the
         # full rationale. The bench stream's terminal events are
-        # `upload_done` and `error` — `done` only marks the boundary
-        # between tests and upload.
+        # `done` and `error`. Local results complete the stream.
         seen = 0
         try:
             while True:
@@ -5585,7 +5571,6 @@ async def get_benchmark_results(
         "status": run.status,
         "results": run.results,
         "error": run.error_message if run.error_message else None,
-        "upload_state": run.upload_state,
     }
 
 
@@ -5593,12 +5578,10 @@ async def get_benchmark_results(
 async def get_device_info(
     is_admin: bool = Depends(require_admin),
 ):
-    """Get device hardware info and owner_hash for omlx.ai integration."""
+    """Get device hardware info for local benchmark results."""
     from ..utils.hardware import (
-        compute_owner_hash,
         get_chip_name,
         get_gpu_core_count,
-        get_io_platform_uuid,
         get_total_memory_gb,
         parse_chip_info,
     )
@@ -5608,29 +5591,17 @@ async def get_device_info(
     memory_gb = round(get_total_memory_gb())
     gpu_cores = get_gpu_core_count()
 
-    owner_hash = None
-    io_uuid = get_io_platform_uuid()
-    if io_uuid:
-        full_hash = compute_owner_hash(io_uuid, chip_name, gpu_cores, memory_gb)
-        owner_hash = full_hash[:-1]  # Strip verify character for URL
-
     return {
         "chip_name": chip_name,
         "chip_variant": chip_variant,
         "memory_gb": memory_gb,
         "gpu_cores": gpu_cores,
-        "owner_hash": owner_hash,
     }
 
 
 # =============================================================================
 # Update Check
 # =============================================================================
-
-_update_cache: dict[str, Any] | None = None
-_update_cache_time: float = 0.0
-_UPDATE_CACHE_TTL = 3600  # 1 hour
-
 
 @router.get("/api/update-check")
 async def check_update(
