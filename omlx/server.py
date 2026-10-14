@@ -567,7 +567,9 @@ async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
             exc.detail,
         )
     if _is_api_route(request):
-        content = _openai_error_body(exc.detail, exc.status_code)
+        content = _openai_error_body(
+            exc.detail, exc.status_code, code=getattr(exc, "code", None)
+        )
     else:
         content = {"detail": exc.detail}
     # Propagate any headers set on the exception (e.g. Retry-After on the 503
@@ -1330,6 +1332,14 @@ def scale_anthropic_tokens(token_count: int, model_id: str | None = None) -> int
     return int(token_count * cc.target_context_size / actual)
 
 
+class _ContextLengthExceededError(HTTPException):
+    # Clients compact only on overflow errors they recognize: this OpenAI
+    # code, "prompt is too long: N tokens > M", or "maximum context length".
+    # Claude Code 2.1.296 matches "prompt is too long" (lowercased) and reads
+    # the token gap from "prompt is too long ... N tokens > M".
+    code = "context_length_exceeded"
+
+
 def validate_context_window(
     num_prompt_tokens: int, model_id: str | None = None
 ) -> None:
@@ -1340,11 +1350,11 @@ def validate_context_window(
     """
     max_ctx = get_max_context_window(model_id)
     if max_ctx and num_prompt_tokens > max_ctx:
-        raise HTTPException(
+        raise _ContextLengthExceededError(
             status_code=400,
             detail=(
-                f"Prompt too long: {num_prompt_tokens} tokens exceeds "
-                f"max context window of {max_ctx} tokens"
+                f"Prompt is too long: {num_prompt_tokens} tokens > "
+                f"{max_ctx} maximum context length"
             ),
         )
 
