@@ -45,7 +45,6 @@
   "navbar.theme.dark_mode": "深色模式",
   "navbar.theme.light_mode": "浅色模式",
   "navbar.logout": "退出登录",
-  "navbar.go_to_github": "前往GitHub",
   "status.section_label": "仪表盘",
   "status.heading": "服务统计",
   "status.clear": "清除",

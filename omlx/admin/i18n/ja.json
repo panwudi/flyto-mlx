@@ -45,7 +45,6 @@
   "navbar.theme.dark_mode": "ダークモード",
   "navbar.theme.light_mode": "ライトモード",
   "navbar.logout": "ログアウト",
-  "navbar.go_to_github": "GitHubへ移動",
   "status.section_label": "ダッシュボード",
   "status.heading": "配信統計",
   "status.clear": "クリア",

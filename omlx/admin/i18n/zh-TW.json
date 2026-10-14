@@ -45,7 +45,6 @@
   "navbar.theme.dark_mode": "深色模式",
   "navbar.theme.light_mode": "淺色模式",
   "navbar.logout": "登出",
-  "navbar.go_to_github": "前往 GitHub",
   "status.section_label": "儀表板",
   "status.heading": "服務統計",
   "status.clear": "清除",
