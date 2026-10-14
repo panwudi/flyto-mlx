@@ -50,8 +50,9 @@ impl Client {
         match self.agent.get(&format!("{}/health", self.base)).call() {
             Ok(resp) => resp
                 .into_string()
-                .map(|body| body.contains("healthy"))
-                .unwrap_or(false),
+                .ok()
+                .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+                .is_some_and(|v| v.get("status").and_then(Value::as_str) == Some("healthy")),
             Err(_) => false,
         }
     }

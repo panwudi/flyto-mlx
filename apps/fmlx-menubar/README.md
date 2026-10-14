@@ -37,16 +37,30 @@ scripts/build.sh                      # -> build/Flyto MLX.app
 OMLX_BASE_PATH=/tmp/fmlx-test OMLX_PORT=8796 target/release/fmlx-menubar   # dev run, no login item
 ```
 
-Install on a machine (announce the restart first; it stops the server for
-about a minute):
+Install on m5max (announce the restart first; the server is down for about a
+minute):
 
 ```
-osascript -e 'quit app "Flyto MLX"'          # old app stops its server
-# wait until no "omlx.cli serve --base-path ~/.fmlx" process is left
-ditto "build/Flyto MLX.app" "/Applications/Flyto MLX.app.new"
-rm -rf "/Applications/Flyto MLX.app" && mv "/Applications/Flyto MLX.app.new" "/Applications/Flyto MLX.app"
+# 1. Retire the old watchdog: it SIGKILLs the app whenever /health fails,
+#    including during a deliberate restart, and orphans the server.
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.flyto.mlx.watchdog.plist
+mv ~/Library/LaunchAgents/com.flyto.mlx.watchdog.plist ~/Library/LaunchAgents/com.flyto.mlx.watchdog.plist.disabled
+
+# 2. Swap the bundle, keeping the old one for rollback. Quitting the old app
+#    may leave its server running (the Swift shell only stops its own child);
+#    that is fine, the new app adopts it.
+osascript -e 'quit app "Flyto MLX"'
+mv "/Applications/Flyto MLX.app" "/Applications/Flyto MLX (swift backup).app"
+ditto "build/Flyto MLX.app" "/Applications/Flyto MLX.app"
 open -a "/Applications/Flyto MLX.app"
+
+# 3. For a clean restart (for example to reset the memory ceiling), SIGTERM
+#    the serve PID: the app sees it go, waits for the PID to be gone, then
+#    starts a new server.
+kill -TERM <serve pid>
 ```
+
+Rollback: quit the app, move the backup bundle back, `open -a` it.
 
 ---
 
@@ -72,4 +86,6 @@ base path 解析方式和日志位置. Swift 版先留在仓库里, 等这一版
 `assets/app-icon.svg` (app 图标, 和管理界面的 favicon 一致). 事件日志:
 `~/Library/Application Support/oMLX/logs/menubar.log`, 服务日志在同目录 `server.log`.
 
-构建, 测试和安装的命令见上面英文部分. 安装会让服务停一分钟左右, 动手前先通知使用的人.
+构建, 测试和安装的命令见上面英文部分. 安装要点: 先停用旧看门狗 (它在服务不健康时强杀 app, 正常重启时也会误伤);
+旧 app 改名留作回退; 新 app 会接管还在跑的服务; 需要干净重启时对服务进程发 SIGTERM, app 会等旧进程彻底退出再起新的.
+安装会让服务停一分钟左右, 动手前先通知使用的人.

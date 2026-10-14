@@ -37,6 +37,9 @@ const STABLE_AFTER: Duration = Duration::from_secs(60);
 /// Set from the SIGTERM / SIGINT / SIGHUP handler.
 pub static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Set once the supervisor has stopped the server and left its loop.
+pub static SUPERVISOR_DONE: AtomicBool = AtomicBool::new(false);
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Phase {
     Stopped,
@@ -179,6 +182,7 @@ impl Supervisor {
             self.tick();
             self.publish();
         }
+        SUPERVISOR_DONE.store(true, Ordering::SeqCst);
         (self.emit)(Out::Exit);
     }
 

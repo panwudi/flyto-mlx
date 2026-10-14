@@ -30,12 +30,15 @@ use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS, EventLoopWindowT
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
-use supervisor::{Cmd, Out, Phase, Snapshot, Supervisor, QUIT_REQUESTED};
+use supervisor::{Cmd, Out, Phase, Snapshot, Supervisor, QUIT_REQUESTED, SUPERVISOR_DONE};
 
 enum UserEvent {
     Out(Out),
     Menu(MenuId),
     CheckVisible { recreated: bool },
+    /// Header text to show right after a click, before the supervisor's
+    /// next snapshot arrives.
+    Pending(String),
 }
 
 struct Ui {
@@ -212,21 +215,38 @@ fn busy_count(last: &Option<Snapshot>) -> u64 {
         .unwrap_or(0)
 }
 
-/// Send `cmd`, after a confirmation dialog when requests are in flight.
-fn confirm_then(tx: &Sender<Cmd>, busy: u64, action: String, cmd: Cmd) {
+/// Show `pending` in the header and send `cmd`; when requests are in flight,
+/// ask first (the header changes only after the user confirms).
+fn confirm_then(
+    tx: &Sender<Cmd>,
+    proxy: &EventLoopProxy<UserEvent>,
+    busy: u64,
+    action: String,
+    pending: String,
+    cmd: Cmd,
+) {
     if busy == 0 {
+        let _ = proxy.send_event(UserEvent::Pending(pending));
         let _ = tx.send(cmd);
         return;
     }
     let tx = tx.clone();
+    let proxy = proxy.clone();
     thread::spawn(move || {
         if dialogs::confirm(&text::confirm_busy(&action, busy)) {
+            let _ = proxy.send_event(UserEvent::Pending(pending));
             let _ = tx.send(cmd);
         }
     });
 }
 
-fn handle_menu(id: &MenuId, ui: &mut Ui, tx: &Sender<Cmd>, last: &Option<Snapshot>) {
+fn handle_menu(
+    id: &MenuId,
+    ui: &mut Ui,
+    tx: &Sender<Cmd>,
+    proxy: &EventLoopProxy<UserEvent>,
+    last: &Option<Snapshot>,
+) {
     let port = last.as_ref().map(|s| s.port).unwrap_or(config::DEFAULT_PORT);
     let busy = busy_count(last);
     if id == ui.start.id() {
@@ -242,11 +262,11 @@ fn handle_menu(id: &MenuId, ui: &mut Ui, tx: &Sender<Cmd>, last: &Option<Snapsho
         }));
         let _ = tx.send(Cmd::Start);
     } else if id == ui.stop.id() {
-        confirm_then(tx, busy, text::action_stop(), Cmd::Stop);
+        confirm_then(tx, proxy, busy, text::action_stop(), text::pending_stop(), Cmd::Stop);
     } else if id == ui.restart.id() {
-        confirm_then(tx, busy, text::action_restart(), Cmd::Restart);
+        confirm_then(tx, proxy, busy, text::action_restart(), text::pending_restart(), Cmd::Restart);
     } else if id == ui.force.id() {
-        confirm_then(tx, busy, text::action_restart(), Cmd::ForceRestart);
+        confirm_then(tx, proxy, busy, text::action_restart(), text::pending_force(), Cmd::ForceRestart);
     } else if id == ui.admin.id() {
         open_url(port, "/admin");
     } else if id == ui.chat.id() {
@@ -255,11 +275,13 @@ fn handle_menu(id: &MenuId, ui: &mut Ui, tx: &Sender<Cmd>, last: &Option<Snapsho
         let _ = Command::new("/usr/bin/open").args(["-a", "Console"]).arg(config::server_log_path()).spawn();
     } else if id == ui.port.id() {
         let tx = tx.clone();
+        let proxy = proxy.clone();
         thread::spawn(move || {
             let Some(raw) = dialogs::prompt(&text::port_prompt(port), &port.to_string()) else { return };
             match raw.trim().parse::<u16>() {
                 Ok(p) if p > 0 => {
                     if p != port {
+                        let _ = proxy.send_event(UserEvent::Pending(text::pending_port(p)));
                         let _ = tx.send(Cmd::SetPort(p));
                     }
                 }
@@ -276,7 +298,7 @@ fn handle_menu(id: &MenuId, ui: &mut Ui, tx: &Sender<Cmd>, last: &Option<Snapsho
     } else if id == ui.about.id() {
         thread::spawn(|| dialogs::alert(&text::about_body(env!("CARGO_PKG_VERSION"))));
     } else if id == ui.quit.id() {
-        confirm_then(tx, busy, text::action_quit(), Cmd::Quit);
+        confirm_then(tx, proxy, busy, text::action_quit(), text::pending_quit(), Cmd::Quit);
     }
 }
 
@@ -287,7 +309,7 @@ fn register_login_item_once() {
     let in_bundle = std::env::current_exe()
         .map(|p| p.to_string_lossy().contains(".app/Contents/MacOS/"))
         .unwrap_or(false);
-    if !in_bundle {
+    if !in_bundle || std::env::var_os("FMLX_MENUBAR_NO_LOGIN_ITEM").is_some() {
         return;
     }
     let marker = config::app_support_dir().join("menubar-login-item-initialised");
@@ -406,7 +428,7 @@ fn main() {
             },
             Event::UserEvent(UserEvent::Menu(id)) => {
                 if let Some(u) = ui.as_mut() {
-                    handle_menu(&id, u, &tx, &last);
+                    handle_menu(&id, u, &tx, &proxy, &last);
                 }
             }
             Event::UserEvent(UserEvent::CheckVisible { recreated }) => {
@@ -432,6 +454,27 @@ fn main() {
                         let _ = p.send_event(UserEvent::CheckVisible { recreated: true });
                     });
                 }
+            }
+            Event::UserEvent(UserEvent::Pending(header)) => {
+                if let Some(u) = ui.as_mut() {
+                    u.header.set_text(header);
+                }
+            }
+            Event::LoopDestroyed => {
+                // Reached via NSApp terminate (osascript "quit app", logout)
+                // as well as our own exit. Stop the server first unless the
+                // supervisor already did; bounded so logout is not held up
+                // forever (a server that got SIGTERM finishes on its own, and
+                // the next launch adopts or waits for it).
+                if !SUPERVISOR_DONE.load(Ordering::SeqCst) {
+                    log::line("terminate requested, stopping the server first");
+                    let _ = tx.send(Cmd::Quit);
+                    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                    while !SUPERVISOR_DONE.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                        thread::sleep(Duration::from_millis(200));
+                    }
+                }
+                log::line("event loop destroyed");
             }
             _ => {}
         }

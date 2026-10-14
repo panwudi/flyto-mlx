@@ -186,6 +186,11 @@ pub fn confirm_busy(action: &str, active: u64) -> String {
 pub fn action_restart() -> String { pick("重启", "restart") }
 pub fn action_stop() -> String { pick("停止", "stop") }
 pub fn action_quit() -> String { pick("退出", "quit") }
+pub fn pending_stop() -> String { pick("● 正在停止…", "● Stopping…") }
+pub fn pending_restart() -> String { pick("● 正在重启…", "● Restarting…") }
+pub fn pending_force() -> String { pick("● 正在强制结束并重启…", "● Killing and restarting…") }
+pub fn pending_port(port: u16) -> String { pick(&format!("● 正在切换到端口 {port}…"), &format!("● Switching to port {port}…")) }
+pub fn pending_quit() -> String { pick("● 正在停止服务, 然后退出…", "● Stopping the server, then quitting…") }
 pub fn ok() -> String { pick("确定", "OK") }
 pub fn cancel() -> String { pick("取消", "Cancel") }
 pub fn port_prompt(current: u16) -> String {
