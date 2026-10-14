@@ -45,7 +45,6 @@
   "navbar.theme.dark_mode": "다크 모드",
   "navbar.theme.light_mode": "라이트 모드",
   "navbar.logout": "로그아웃",
-  "navbar.go_to_github": "GitHub으로 이동",
   "status.section_label": "대시보드",
   "status.heading": "서빙 통계",
   "status.clear": "초기화",

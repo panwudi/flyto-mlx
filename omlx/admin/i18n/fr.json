@@ -45,7 +45,6 @@
   "navbar.theme.dark_mode": "Mode sombre",
   "navbar.theme.light_mode": "Mode clair",
   "navbar.logout": "Déconnexion",
-  "navbar.go_to_github": "Aller à GitHub",
   "status.section_label": "Tableau de bord",
   "status.heading": "Statistiques de service",
   "status.clear": "Effacer",

@@ -45,7 +45,6 @@
   "navbar.theme.dark_mode": "Modo Oscuro",
   "navbar.theme.light_mode": "Modo Claro",
   "navbar.logout": "Cerrar sesión",
-  "navbar.go_to_github": "Ir a GitHub",
   "status.section_label": "Panel",
   "status.heading": "Estadísticas de Servicio",
   "status.clear": "Limpiar",

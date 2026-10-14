@@ -45,7 +45,6 @@
   "navbar.theme.dark_mode": "Темная тема",
   "navbar.theme.light_mode": "Светлая тема",
   "navbar.logout": "Выйти",
-  "navbar.go_to_github": "Перейти на GitHub",
   "status.section_label": "Панель",
   "status.heading": "Статистика сервера",
   "status.clear": "Очистить",

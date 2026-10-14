@@ -46,7 +46,7 @@
         <label class="flyto-theme"><i data-lucide="sun-moon" class="w-4 h-4"></i><select aria-label="{{ t('shell.theme') }}" x-model="theme" @change="setTheme($event.target.value)">
             <option value="auto">{{ t('navbar.theme.auto') }}</option><option value="light">{{ t('navbar.theme.light_mode') }}</option><option value="dark">{{ t('navbar.theme.dark_mode') }}</option>
         </select></label>
-        <a href="https://github.com/panwudi/flyto-mlx" target="_blank" rel="noopener noreferrer" class="flyto-version" title="{{ t('navbar.go_to_github') }}"><span>Flyto MLX v{{ version }}</span><i data-lucide="github" class="w-4 h-4"></i></a>
+        <p class="flyto-version"><span>Flyto MLX v{{ version }}</span></p>
         <a href="/admin/logout" class="flyto-nav-item"><i data-lucide="log-out" class="w-4 h-4"></i>{{ t('navbar.logout') }}</a>
     </div>
 </aside>
