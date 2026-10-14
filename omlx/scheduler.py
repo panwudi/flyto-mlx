@@ -1212,6 +1212,12 @@ class Scheduler:
                     extra_keys=extra_keys,
                     extra_key_token_start=extra_key_token_start,
                     extra_key_ranges=extra_key_ranges,
+                    # Intermediate snapshots are only passed when
+                    # _get_boundary_store_override merged the boundary
+                    # snapshot taken at len(token_sequence_to_store) into
+                    # cache_to_store. Without it the live state sits at the
+                    # end of prompt + output, past the last stored block.
+                    live_state_at_end=intermediate_snapshots is not None,
                 )
             if block_table is None and self.paged_cache_manager is not None:
                 block_table = self.paged_cache_manager.get_block_table(request_id)

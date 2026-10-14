@@ -339,6 +339,7 @@ class BlockAwarePrefixCache(CacheManager):
         extra_keys: tuple[Any, ...] | None = None,
         extra_key_token_start: int | None = None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None = None,
+        live_state_at_end: bool = False,
     ) -> BlockTable | None:
         """
         Store computed cache for future reuse.
@@ -359,6 +360,11 @@ class BlockAwarePrefixCache(CacheManager):
             boundary_snapshots: Optional mapping of token_count -> extracted cache
                 states for intermediate block boundaries. Used to store per-block
                 ArraysCache state instead of placeholders in hybrid models.
+            live_state_at_end: True when cache_data's non-sliceable layers
+                (GDN / rotating / pooling state) were captured exactly at
+                ``len(tokens)``, e.g. a boundary snapshot merged in by the
+                scheduler. When False, the last block stores a placeholder
+                for those layers unless a boundary snapshot covers it.
 
         Returns:
             BlockTable for the stored cache, or None on failure
@@ -422,9 +428,9 @@ class BlockAwarePrefixCache(CacheManager):
         # Allocate only full blocks (skip partial trailing block).
         # get_computed_blocks() matches full blocks only (floor division),
         # so partial block data is never used during cache lookup.
-        # Skipping partial blocks also ensures is_last_block points to
-        # the last full block, which is critical for non-sliceable caches
-        # (ArraysCache/RotatingKVCache) that use last-block-only storage.
+        # is_last_block therefore points to the last FULL block, which the
+        # live non-sliceable state (ArraysCache/RotatingKVCache) may have
+        # already moved past; see live_state_at_end.
         num_new_blocks = len(new_tokens) // self.block_size
         trailing_partial_tokens = len(new_tokens) % self.block_size
         self._last_partial_tokens_skipped = trailing_partial_tokens
@@ -552,13 +558,11 @@ class BlockAwarePrefixCache(CacheManager):
                 #   1. A boundary snapshot exists for this block — snapshots
                 #      are self-contained, so the live-cache seq_len gate
                 #      does not apply.
-                #   2. is_last_block is True — _extract_block_tensor_slice's
-                #      last-block branch uses cache_data's full state for
-                #      non-sliceable types (RotatingKVCache last window,
-                #      CacheList has_valid_state path) and needs no
-                #      sliceable seq_len. For sliceable hybrid models the
-                #      step-1 path already returns the full prefill length,
-                #      so the gate would not fire here anyway.
+                #   2. is_last_block is True — for sliceable hybrid models
+                #      the step-1 path already returns the full prefill
+                #      length, so the gate would not fire here anyway.
+                #      Non-sliceable layers on the last block need a
+                #      snapshot or a verified live_state_at_end.
                 if (
                     snapshot_cache_data is None
                     and not is_last_block
@@ -583,6 +587,11 @@ class BlockAwarePrefixCache(CacheManager):
                     model_cache_config,
                     is_last_block=is_last_block,
                     snapshot_cache_data=snapshot_cache_data,
+                    live_state_at_true_end=(
+                        is_last_block
+                        and live_state_at_end
+                        and existing_tokens + end_idx == len(tokens)
+                    ),
                 )
 
                 if block_kv_data and block.block_hash:
@@ -803,6 +812,7 @@ class BlockAwarePrefixCache(CacheManager):
         model_cache_config: ModelCacheConfig | None = None,
         is_last_block: bool = False,
         snapshot_cache_data: list[dict[str, Any]] | None = None,
+        live_state_at_true_end: bool = False,
     ) -> list[tuple[Any, Any]] | None:
         """
         Extract tensor slices for a single block from cache data.
@@ -811,12 +821,20 @@ class BlockAwarePrefixCache(CacheManager):
         with type-aware slicing. For non-sliceable types like ArraysCache,
         returns the full state.
 
-        For RotatingKVCache layers specifically:
-        - Last block: stores the full RotatingKVCache state (keys, values)
-        - Non-last blocks: stores a placeholder (mx.zeros((1,)), mx.zeros((1,)))
-          to preserve layer count while minimizing storage
-        - Boundary snapshot: if a snapshot was captured at this block's boundary,
-          the snapshot state is used instead of a placeholder
+        For RotatingKVCache and other non-sliceable (recurrent / summary
+        state) layers:
+        - Boundary snapshot: if a snapshot was captured at this block's
+          boundary, the snapshot state is used
+        - Last block with live_state_at_true_end: the live cache_data state
+          is used as the boundary state
+        - Otherwise a placeholder (mx.zeros((1,)), mx.zeros((1,))) is
+          stored, even on the last block. A block is only "last" among the
+          FULL blocks being stored, and the live end-of-request state can
+          sit past it (a skipped trailing partial block, or generated
+          output that a reasoning request does not store). Storing that
+          state as this block's boundary would make a restore ingest those
+          tokens twice, silently. Losing reuse of one block is better than
+          corrupting it (upstream 8986da14).
 
         During restore, a partial prefix match that ends on a placeholder block
         first attempts walk-back truncation to the latest block with valid
@@ -829,11 +847,16 @@ class BlockAwarePrefixCache(CacheManager):
             end_idx: End token index in the sequence
             model_cache_config: Optional model cache configuration with per-layer
                 type information
-            is_last_block: If True, this is the last block being stored. For
-                RotatingKVCache layers, only the last block stores full state.
+            is_last_block: If True, this is the last full block being stored.
+                Not sufficient by itself to store live state for non-sliceable
+                layers (see live_state_at_true_end).
             snapshot_cache_data: Optional boundary snapshot cache data for this
                 block. When provided, non-sliceable layers use the snapshot state
                 instead of a placeholder.
+            live_state_at_true_end: The caller's assertion that cache_data's
+                non-sliceable state was taken exactly at the end of the last
+                block. Only then may the last block store live state without
+                a snapshot.
 
         Returns:
             List of (keys_slice, values_slice) for each layer, or None on failure
@@ -933,10 +956,16 @@ class BlockAwarePrefixCache(CacheManager):
                     )
                 elif cache_type_name == "RotatingKVCache":
                     # RotatingKVCache: last-block-only or boundary-snapshot strategy
-                    has_valid_state = is_last_block or (
+                    # A live end-of-request state is only valid for the last
+                    # block when the caller verified it sits exactly at this
+                    # block's end (live_state_at_true_end). Otherwise the live
+                    # state may already have ingested tokens past the boundary
+                    # and a restore would ingest them twice.
+                    has_valid_state = (
                         snapshot_cache_data is not None
                         and layer_idx < len(snapshot_cache_data)
-                    )
+                        and "state" in snapshot_cache_data[layer_idx]
+                    ) or (is_last_block and live_state_at_true_end)
                     if has_valid_state:
                         # Use snapshot state if available, otherwise use main state
                         if (
@@ -1046,10 +1075,16 @@ class BlockAwarePrefixCache(CacheManager):
                         # just the first two, so PoolingCache's third element
                         # `pooled` survives the round-trip. Dropping it was
                         # the V4 cross-session corruption root cause.
-                        has_valid_state = is_last_block or (
+                        # A live end-of-request state is only valid for the last
+                        # block when the caller verified it sits exactly at this
+                        # block's end (live_state_at_true_end). Otherwise the live
+                        # state may already have ingested tokens past the boundary
+                        # and a restore would ingest them twice.
+                        has_valid_state = (
                             snapshot_cache_data is not None
                             and layer_idx < len(snapshot_cache_data)
-                        )
+                            and "state" in snapshot_cache_data[layer_idx]
+                        ) or (is_last_block and live_state_at_true_end)
                         if has_valid_state:
                             # Use snapshot if available
                             if (
@@ -1090,10 +1125,16 @@ class BlockAwarePrefixCache(CacheManager):
                     # the state at that point in the sequence. Without a snapshot,
                     # non-last blocks get a placeholder so partial matches are
                     # detected and rejected during reconstruction.
-                    has_valid_state = is_last_block or (
+                    # A live end-of-request state is only valid for the last
+                    # block when the caller verified it sits exactly at this
+                    # block's end (live_state_at_true_end). Otherwise the live
+                    # state may already have ingested tokens past the boundary
+                    # and a restore would ingest them twice.
+                    has_valid_state = (
                         snapshot_cache_data is not None
                         and layer_idx < len(snapshot_cache_data)
-                    )
+                        and "state" in snapshot_cache_data[layer_idx]
+                    ) or (is_last_block and live_state_at_true_end)
                     if has_valid_state:
                         # Use snapshot state if available, otherwise main state
                         if (
