@@ -86,22 +86,23 @@ destructive / shared-state operation" rule for this repo only.
 ## Machines
 
 - The Flyto MLX server runs only on **m5max** at `~/Code/omlx`, launched by
-  `/Applications/Flyto MLX.app` -- a thin Swift menubar shell whose source lives
-  in this repo at `apps/omlx-mac` (bundle dir/MachO still named `oMLX`). The
-  shell embeds no Python; it shells out to the host venv
-  `~/Code/omlx/.venv/bin/python -m omlx.cli serve` (see `PythonRuntime.swift`),
+  `/Applications/Flyto MLX.app` -- a Rust menubar app whose source lives in this
+  repo at `apps/fmlx-menubar` (it replaced the Swift shell in `apps/omlx-mac`,
+  which stays in the tree for rollback until it is removed). The app embeds no
+  Python; it runs the host venv `~/Code/omlx/.venv/bin/python -m omlx.cli serve`,
   so editing a `.py` in the worktree + restarting the server applies instantly.
+  It adopts a healthy server already on the port, and judges liveness by PID:
+  never start a second server while the old one for `~/.fmlx` is still exiting.
   The local clone dir is named `omlx`; it is this `flyto-mlx` repo.
 - **m2max is a dev machine only.** Its server, app, cluster router and models
   were removed on 2026-10-10 (it had been down since late September with no
   traffic). Keep `~/Code/omlx` + `.venv` there for development and tests; do
   not deploy to it. The m5max cluster router (`:9000`) now has m5max as its
   only backend.
-- Rebuilding the menubar shell: `apps/omlx-mac/Scripts/build.sh` (needs Xcode;
-  emits a few-MB `build/Stage/oMLX.app`, version tracked from `omlx/_version.py`).
-  Deploy by replacing `/Applications/Flyto MLX.app` (`ditto` + `codesign --force
-  --sign -` + `xattr -dr com.apple.quarantine`), then relaunch. Base-path default
-  is `apps/omlx-mac/Sources/Config/AppConfig.swift` `defaultBasePath()`.
+- Rebuilding the menubar app: `apps/fmlx-menubar/scripts/build.sh` (needs only
+  the Rust toolchain; emits a ~2 MB `build/Flyto MLX.app`, version from
+  `omlx/_version.py`). Install steps are in `apps/fmlx-menubar/README.md`;
+  announce the restart to the owner first.
 - `omlx serve` binds `settings.server.host` at startup; settings live at
   `~/.fmlx/settings.json` (a legacy `~/.omlx -> ~/.fmlx` compat symlink is kept
   so old absolute paths still resolve). A config change needs a genuine

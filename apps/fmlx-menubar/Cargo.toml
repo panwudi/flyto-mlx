@@ -1,0 +1,23 @@
+[package]
+name = "fmlx-menubar"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Flyto MLX menubar app: starts, adopts and supervises the fmlx server"
+
+[dependencies]
+tao = "0.37"
+tray-icon = "0.26"
+ureq = { version = "2.12", default-features = false }
+serde_json = { version = "1", features = ["preserve_order"] }
+resvg = { version = "0.48", default-features = false }
+libc = "0.2"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSView", "NSResponder", "NSWindow", "NSGraphics"] }
+objc2-service-management = "0.3"
+
+[profile.release]
+lto = true
+strip = true
+opt-level = "s"
