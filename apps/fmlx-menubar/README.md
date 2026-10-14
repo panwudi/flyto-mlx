@@ -50,7 +50,7 @@ mv ~/Library/LaunchAgents/com.flyto.mlx.watchdog.plist ~/Library/LaunchAgents/co
 #    may leave its server running (the Swift shell only stops its own child);
 #    that is fine, the new app adopts it.
 osascript -e 'quit app "Flyto MLX"'
-mv "/Applications/Flyto MLX.app" "/Applications/Flyto MLX (swift backup).app"
+mkdir -p ~/fmlx-app-backup && mv "/Applications/Flyto MLX.app" ~/fmlx-app-backup/   # outside /Applications: two bundles with one id confuse LaunchServices
 ditto "build/Flyto MLX.app" "/Applications/Flyto MLX.app"
 open -a "/Applications/Flyto MLX.app"
 
