@@ -1271,22 +1271,27 @@ class Scheduler:
                     logger.warning(
                         "Async store_cache for %s raised: %s", request_id, exc
                     )
-            # Run batch_generator.remove on the inference thread.
-            try:
-                _safe_sync_stream(self._stream)
-                self._remove_uid_from_active_batch(uid)
-                if hasattr(self.model, "unregister_rope_delta"):
-                    self.model.unregister_rope_delta(uid)
-            except Exception as e:
-                logger.warning(
-                    "Deferred batch_generator.remove(uid=%s) failed: %s",
-                    uid,
-                    e,
-                )
-            # Cleanup uid maps now that the slot is reclaimable.
-            if uid in self.uid_to_request_id:
+            # fail_all_requests / cache-error recovery drop the batch
+            # generator, and the next one reuses uids from 0. A remove
+            # deferred from before the reset would then evict and unmap the
+            # NEW request on that uid, which never finishes. Touch the uid
+            # only while this request still owns it (upstream 4f5c6ce7).
+            if self.uid_to_request_id.get(uid) == request_id:
+                # Run batch_generator.remove on the inference thread.
+                try:
+                    _safe_sync_stream(self._stream)
+                    self._remove_uid_from_active_batch(uid)
+                    if hasattr(self.model, "unregister_rope_delta"):
+                        self.model.unregister_rope_delta(uid)
+                except Exception as e:
+                    logger.warning(
+                        "Deferred batch_generator.remove(uid=%s) failed: %s",
+                        uid,
+                        e,
+                    )
+                # Cleanup uid maps now that the slot is reclaimable.
                 del self.uid_to_request_id[uid]
-            if request_id in self.request_id_to_uid:
+            if self.request_id_to_uid.get(request_id) == uid:
                 del self.request_id_to_uid[request_id]
             self._inflight_store_futures.pop(request_id, None)
             # Boundary snapshots were kept on disk for the worker; safe to
