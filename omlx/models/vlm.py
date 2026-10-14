@@ -30,6 +30,21 @@ from ..patches.qwen3_5_attention import force_text_only_rope
 logger = logging.getLogger(__name__)
 
 
+def _window_position_ids(starts: mx.array, batch_size: int, seq_len: int) -> mx.array:
+    """mRoPE position_ids for a decode window starting at per-row offsets.
+
+    Row r covers ``starts[r] .. starts[r] + seq_len - 1``. Broadcasting the
+    start across the whole window (the old shape) rotated every position of
+    a multi-token window (MTP verify, re-prefill after an MTP join) at the
+    first position, so the keys written for accepted rows were wrong. At
+    single-token decode both forms are equal (upstream 5be99248).
+    """
+    starts = starts.reshape(-1)[:batch_size]
+    steps = mx.arange(seq_len, dtype=starts.dtype)
+    positions = starts[:, None] + steps[None, :]
+    return mx.broadcast_to(positions[None, :, :], (3, batch_size, seq_len))
+
+
 class VLMModelAdapter(nn.Module):
     """
     Adapter wrapping a VLM's language_model for BatchGenerator compatibility.
@@ -251,10 +266,7 @@ class VLMModelAdapter(nn.Module):
                 deltas = self._batch_rope_deltas
                 if (offsets is not None and isinstance(offsets, mx.array)
                         and deltas.size == B):
-                    positions = offsets + deltas
-                    position_ids = mx.broadcast_to(
-                        positions[None, :, None], (3, B, L)
-                    )
+                    position_ids = _window_position_ids(offsets + deltas, B, L)
                     # Decode never adds new image tokens; the broadcast
                     # collapses the 3 mRoPE sections to identical values,
                     # so the patched Qwen3_5Attention can skip its per-layer
@@ -275,9 +287,7 @@ class VLMModelAdapter(nn.Module):
                         break
                 if offsets is not None:
                     B, L = input_ids.shape
-                    position_ids = mx.broadcast_to(
-                        offsets[None, :, None], (3, B, L)
-                    )
+                    position_ids = _window_position_ids(offsets, B, L)
                     with force_text_only_rope():
                         result = self._language_model(
                             input_ids, cache=cache, position_ids=position_ids, **kwargs

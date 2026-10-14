@@ -426,6 +426,41 @@ class TestPerRequestMRoPEDecode:
         assert pos_ids[0, 0, 0].item() == 50.0
         assert pos_ids[0, 1, 0].item() == 80.0
 
+    @pytest.mark.parametrize("with_deltas", [True, False])
+    def test_mrope_multi_token_window_advances_positions(self, with_deltas):
+        """Each row of an mRoPE window must advance from its start.
+
+        Multi-token windows (MTP verify, re-prefill after an MTP join) used
+        to broadcast each row's start across the whole window, rotating
+        every position at the first one and corrupting the keys the verify
+        writes back (upstream 5be99248). Covers both the batch-deltas branch
+        and the offsets-only branch.
+        """
+        import mlx.core as mx
+
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_mrope_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+        if with_deltas:
+            adapter.set_batch_rope_deltas(mx.array([-50.0, 0.0]))
+            expected = [(50, 51), (80, 81)]
+        else:
+            expected = [(100, 101), (80, 81)]
+
+        input_ids = mx.zeros((2, 2), dtype=mx.int32)
+        cache_layer = MagicMock()
+        cache_layer.offset = mx.array([100, 80])
+
+        adapter(input_ids, cache=[cache_layer])
+
+        pos_ids = vlm.language_model.call_args[1]["position_ids"]
+        assert pos_ids.shape == (3, 2, 2)
+        for section in range(3):
+            for row, (p0, p1) in enumerate(expected):
+                assert pos_ids[section, row, 0].item() == p0
+                assert pos_ids[section, row, 1].item() == p1
+
     def test_get_last_rope_deltas(self):
         """get_last_rope_deltas extracts value from language model."""
         import mlx.core as mx
