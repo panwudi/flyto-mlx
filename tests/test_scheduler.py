@@ -1116,6 +1116,68 @@ class TestSchedulerBoundarySnapshots:
         assert kwargs["model_cache_config"] == "boundary-config"
         assert "req-partial" not in scheduler._boundary_cache_snapshots
 
+    def test_store_cache_fully_evaluates_kv_on_owner_thread(
+        self, mock_model, mock_tokenizer
+    ):
+        """The KV arrays handed to the store worker must be concrete.
+
+        The engine stream is thread-local, so a lazy array left for the
+        worker aborts it ("There is no Stream(gpu, N) in current thread").
+        _cleanup_finished must block on mx.eval, not mx.async_eval
+        (upstream 74d71687).
+        """
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+
+        request = Request(
+            request_id="req-eval",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1, 2, 3, 4]
+        request.num_prompt_tokens = 4
+        request.output_token_ids = [5, 6, 7, 8]
+        request._extracted_cache = [{"state": "final-cache"}]
+        scheduler.running["req-eval"] = request
+        scheduler.requests["req-eval"] = request
+
+        arrays = [object(), object()]
+        with patch.object(
+            scheduler, "_collect_arrays_from_extracted_cache", return_value=arrays
+        ), patch.object(scheduler_module.mx, "eval") as eval_, patch.object(
+            scheduler_module.mx, "async_eval"
+        ) as async_eval:
+            scheduler._cleanup_finished({"req-eval"})
+
+        async_eval.assert_not_called()
+        assert any(c.args == tuple(arrays) for c in eval_.call_args_list)
+
+    @pytest.mark.parametrize("store_saves", [None, False])
+    def test_in_memory_boundary_snapshot_is_evaluated_at_capture(
+        self, mock_model, mock_tokenizer, store_saves
+    ):
+        """In-memory snapshots (no SSD store, or a failed save) are sliced
+        later on the worker thread, so they are evaluated at capture."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        if store_saves is None:
+            scheduler._boundary_snapshot_store = None
+        else:
+            scheduler._boundary_snapshot_store = MagicMock()
+            scheduler._boundary_snapshot_store.save.return_value = store_saves
+
+        snapshot = [MagicMock()]
+        with patch.object(
+            scheduler, "_cache_list_needs_boundary_snapshot", return_value=True
+        ), patch.object(scheduler, "_eval_snapshot_cache") as eval_snap:
+            scheduler._on_prefill_boundary_snapshot("req-snap", snapshot, 4)
+
+        eval_snap.assert_called_once_with(snapshot)
+        assert scheduler._boundary_cache_snapshots["req-snap"][4] is snapshot
+
     def test_boundary_snapshot_synchronizes_generation_stream(
         self, mock_model, mock_tokenizer
     ):
