@@ -926,6 +926,10 @@ flyto 自己的改动 (Anthropic 主路径): 只有开头的内联系统消息�
   但状态已经读进了生成内容. 所以改为由调用方声明 live_state_at_end, 只有走边界
   快照覆盖路径时才置位, 其余一律存占位, 复用时回退到最后一个有真快照的块.
   Claude Code 实测看到的 "每轮命中 16384, 尾部约 2K 重算" 正好是会触发它的形态.
+- flyto 自己补的一处: 预填边界快照的内存回退 (没有快照存储, 或写队列满) 原来存
+  的是活的缓存对象, 预填继续原地更新它们, 存缓存时读到的是后面边界的状态. 有了
+  `9407468f` 这条路才走得到 (20 万提示约 100 个快照, 写队列上限 128). 改为拍下时
+  提取并复制状态容器.
 - `df7fa9eb` 超长报错改为 "Prompt is too long: N tokens > M maximum context
   length" 并带 code=context_length_exceeded. Claude Code 2.1.296 只认小写后含
   "prompt is too long" 的错误 (已在其二进制里核实), 原措辞导致超限会话永不自动
@@ -956,6 +960,22 @@ flyto 自己的改动 (Anthropic 主路径): 只有开头的内联系统消息�
 耗时, 内存峰值和 SSD 缓存占用 (每块从只存 KV 约 40MB 变成再加 60MB GDN 状态) 的
 影响; Qwen3.8 开关 MTP 的输出一致性; sdpa256 在
 M5 (NAX) 上的实际峰值和速度.
+
+部署 m5max 时必须做:
+
+- 清掉现有前缀缓存 (SSD 分页缓存目录, 边界快照目录, 重启进程清热缓存). 旧代码
+  已经存下的坏块不会被修好: 去重时不重写已有块, 回退时也会接受它. 不清的话新
+  代码照样恢复坏块, 对比实验也会被污染. 代价是每个会话第一轮冷预填一次.
+- xgrammar 单独装 `xgrammar==0.2.8` (连带 `apache-tvm-ffi>=0.1.11`), 不要整体
+  `uv sync`, 上次重建漂了 mcp 和 torch. 0.2.8 的 `libxgrammar_bindings.dylib`
+  路径和 rpath 与 0.2.1 相同, Formula 的 post_install 不用改.
+
+m5max 上的判据: 不要用 "走缓存和不走缓存整段贪心输出逐字一致", 分块边界不同加上
+sdpa256 换了内核, 位级差异会让长输出分叉. 改比恢复出的 GDN 状态与冷算到同一边界
+的状态的最大差, 或首 token logits 的 top-k 和最大差, 并用修复前的构建做对照.
+MTP 开关同理比前若干 token 的 logprob. 日志里长提示应出现 `Using boundary cache
+snapshot for`, 不应出现 `Boundary snapshot write queue full`. 热缓存按字节限额,
+每块变大只会降低命中块数, 不会涨内存.
 
 刻意没引, 留作下一批 ("值得" 一档):
 
