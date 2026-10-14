@@ -1,386 +1,52 @@
-    <nav class="w-full py-5 px-6 md:px-12 border-b border-neutral-100 bg-white sticky top-0 z-50">
-        <div class="max-w-7xl mx-auto flex items-center relative">
-            <!-- Logo -->
-            <div class="flex items-center gap-2">
-                <a href="/admin/dashboard" class="flex items-center gap-2">
-                    <img x-show="activeTheme === 'light'" src="/admin/static/navbar-logo-light.svg" alt="Flyto MLX" class="w-9 h-9">
-                    <img x-show="activeTheme === 'dark'" src="/admin/static/navbar-logo-dark.svg" alt="Flyto MLX" class="w-9 h-9" x-cloak>
-                </a>
-                <div class="flex flex-col gap-0">
-                    <a href="/admin/dashboard" class="font-bold tracking-tight text-xl leading-none">Flyto MLX</a>
-                    <a :href="updateAvailable && releaseUrl ? releaseUrl : 'https://github.com/jundot/omlx'" target="_blank"
-                       class="relative text-[10px] text-neutral-500 dark:text-neutral-400 leading-none hover:text-neutral-700 dark:hover:text-neutral-300"
-                       @mouseenter="versionHover = true" @mouseleave="versionHover = false">
-                        v{{ version }}
-                        <span x-show="updateAvailable" x-cloak
-                              class="inline-block w-1.5 h-1.5 bg-green-500 rounded-full ml-0.5 align-middle"></span>
-                        <span x-show="versionHover" x-cloak
-                              class="absolute left-1/2 -translate-x-1/2 top-full mt-1 px-2 py-1 text-[10px] text-white bg-neutral-800 rounded whitespace-nowrap z-50"
-                              x-text="updateAvailable && latestVersion
-                                  ? window.t('navbar.update_available').replace('{version}', latestVersion)
-                                  : window.t('navbar.go_to_github')"></span>
-                    </a>
-                </div>
-            </div>
-
-            <!-- Mobile hamburger button -->
-            <button @click="mobileMenuOpen = !mobileMenuOpen"
-                    class="lg:hidden p-2 rounded-lg text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 transition-all">
-                <i x-show="!mobileMenuOpen" data-lucide="menu" class="w-5 h-5"></i>
-                <i x-show="mobileMenuOpen" data-lucide="x" class="w-5 h-5" x-cloak></i>
-            </button>
-
-            <!-- Center Navigation -->
-            <div class="hidden lg:flex items-center gap-1 bg-neutral-100 rounded-full p-1 absolute left-1/2 -translate-x-1/2">
-                <button
-                    @click="setMainTab('status')"
-                    :class="mainTab === 'status'
-                        ? 'bg-white text-neutral-900 shadow-sm'
-                        : 'text-neutral-600 hover:text-neutral-900'"
-                    class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5"
-                >
-                    <i data-lucide="bar-chart-3" class="w-4 h-4"></i>
-                    {{ t('navbar.tab.status') }}
-                </button>
-                <div class="relative" @mouseenter="modelsDropdown = true" @mouseleave="modelsDropdown = false">
-                    <button
-                        @click="setMainTab('models')"
-                        :class="mainTab === 'models'
-                            ? 'bg-white text-neutral-900 shadow-sm'
-                            : 'text-neutral-600 hover:text-neutral-900'"
-                        class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5"
-                    >
-                        <i data-lucide="hard-drive-download" class="w-4 h-4"></i>
-                        {{ t('navbar.tab.models') }}
-                    </button>
-                    <!-- Download count badge -->
-                    <span x-show="hfTasks.filter(t => t.status === 'downloading' || t.status === 'pending').length > 0"
-                          x-text="hfTasks.filter(t => t.status === 'downloading' || t.status === 'pending').length"
-                          class="absolute -top-1 -right-1 w-4 h-4 bg-blue-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center pointer-events-none"
-                          x-cloak></span>
-                    <!-- Dropdown menu -->
-                    <div
-                        x-show="modelsDropdown"
-                        x-transition:enter="transition ease-out duration-150"
-                        x-transition:enter-start="opacity-0 translate-y-1"
-                        x-transition:enter-end="opacity-100 translate-y-0"
-                        x-transition:leave="transition ease-in duration-100"
-                        x-transition:leave-start="opacity-100 translate-y-0"
-                        x-transition:leave-end="opacity-0 translate-y-1"
-                        class="absolute left-1/2 -translate-x-1/2 mt-1.5 w-44 bg-white rounded-xl shadow-lg border border-neutral-200 py-1.5 z-[60]"
-                        x-cloak
-                    >
-                        <button
-                            @click="setModelsTab('manager'); modelsDropdown = false;"
-                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
-                            :class="mainTab === 'models' && modelsTab === 'manager'
-                                ? 'text-neutral-900 bg-neutral-100'
-                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
-                        >
-                            <i data-lucide="hard-drive" class="w-3.5 h-3.5"></i>
-                            {{ t('navbar.dropdown.manager') }}
-                        </button>
-                        <button
-                            @click="setModelsTab('downloader'); modelsDropdown = false;"
-                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
-                            :class="mainTab === 'models' && modelsTab === 'downloader'
-                                ? 'text-neutral-900 bg-neutral-100'
-                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
-                        >
-                            <i data-lucide="cloud-download" class="w-3.5 h-3.5"></i>
-                            {{ t('navbar.dropdown.downloader') }}
-                        </button>
-                        <button
-                            @click="setModelsTab('quantizer'); modelsDropdown = false;"
-                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
-                            :class="mainTab === 'models' && modelsTab === 'quantizer'
-                                ? 'text-neutral-900 bg-neutral-100'
-                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
-                        >
-                            <i data-lucide="sparkles" class="w-3.5 h-3.5"></i>
-                            {{ t('navbar.dropdown.quantizer') }}
-                        </button>
-                        <button
-                            @click="setModelsTab('uploader'); modelsDropdown = false;"
-                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
-                            :class="mainTab === 'models' && modelsTab === 'uploader'
-                                ? 'text-neutral-900 bg-neutral-100'
-                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
-                        >
-                            <i data-lucide="cloud-upload" class="w-3.5 h-3.5"></i>
-                            {{ t('navbar.dropdown.uploader') }}
-                        </button>
-                    </div>
-                </div>
-                <div class="relative" @mouseenter="settingsDropdown = true" @mouseleave="settingsDropdown = false">
-                    <button
-                        @click="setMainTab('settings')"
-                        :class="mainTab === 'settings'
-                            ? 'bg-white text-neutral-900 shadow-sm'
-                            : 'text-neutral-600 hover:text-neutral-900'"
-                        class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5"
-                    >
-                        <i data-lucide="settings" class="w-4 h-4"></i>
-                        {{ t('navbar.tab.settings') }}
-                        <i data-lucide="chevron-down" class="w-3 h-3 ml-0.5 opacity-50 hidden"></i>
-                    </button>
-                    <div
-                        x-show="settingsDropdown"
-                        x-transition:enter="transition ease-out duration-150"
-                        x-transition:enter-start="opacity-0 translate-y-1"
-                        x-transition:enter-end="opacity-100 translate-y-0"
-                        x-transition:leave="transition ease-in duration-100"
-                        x-transition:leave-start="opacity-100 translate-y-0"
-                        x-transition:leave-end="opacity-0 translate-y-1"
-                        class="absolute left-1/2 -translate-x-1/2 mt-1.5 w-44 bg-white rounded-xl shadow-lg border border-neutral-200 py-1.5 z-[60]"
-                        x-cloak
-                    >
-                        <button
-                            @click="setSettingsTab('global'); settingsDropdown = false"
-                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
-                            :class="mainTab === 'settings' && activeTab === 'global'
-                                ? 'text-neutral-900 bg-neutral-100'
-                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
-                        >
-                            <i data-lucide="globe" class="w-3.5 h-3.5"></i>
-                            {{ t('navbar.dropdown.global_settings') }}
-                        </button>
-                        <button
-                            @click="setSettingsTab('models'); settingsDropdown = false"
-                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
-                            :class="mainTab === 'settings' && activeTab === 'models'
-                                ? 'text-neutral-900 bg-neutral-100'
-                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
-                        >
-                            <i data-lucide="cpu" class="w-3.5 h-3.5"></i>
-                            {{ t('navbar.dropdown.model_settings') }}
-                        </button>
-                    </div>
-                </div>
-                <button
-                    @click="setMainTab('logs')"
-                    :class="mainTab === 'logs'
-                        ? 'bg-white text-neutral-900 shadow-sm'
-                        : 'text-neutral-600 hover:text-neutral-900'"
-                    class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5"
-                >
-                    <i data-lucide="scroll-text" class="w-4 h-4"></i>
-                    {{ t('navbar.tab.logs') }}
-                </button>
-                <button
-                    @click="setMainTab('cluster')"
-                    :class="mainTab === 'cluster'
-                        ? 'bg-white text-neutral-900 shadow-sm'
-                        : 'text-neutral-600 hover:text-neutral-900'"
-                    class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5"
-                >
-                    <i data-lucide="network" class="w-4 h-4"></i>
-                    {{ t('navbar.tab.cluster') }}
-                </button>
-                <div class="relative" @mouseenter="benchDropdown = true" @mouseleave="benchDropdown = false">
-                    <button
-                        @click="setMainTab('bench')"
-                        :class="mainTab === 'bench'
-                            ? 'bg-white text-neutral-900 shadow-sm'
-                            : 'text-neutral-600 hover:text-neutral-900'"
-                        class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5"
-                    >
-                        <i data-lucide="gauge" class="w-4 h-4"></i>
-                        {{ t('navbar.tab.bench') }}
-                    </button>
-                    <div
-                        x-show="benchDropdown"
-                        x-transition:enter="transition ease-out duration-150"
-                        x-transition:enter-start="opacity-0 translate-y-1"
-                        x-transition:enter-end="opacity-100 translate-y-0"
-                        x-transition:leave="transition ease-in duration-100"
-                        x-transition:leave-start="opacity-100 translate-y-0"
-                        x-transition:leave-end="opacity-0 translate-y-1"
-                        class="absolute left-1/2 -translate-x-1/2 mt-1.5 w-44 bg-white rounded-xl shadow-lg border border-neutral-200 py-1.5 z-[60]"
-                        x-cloak
-                    >
-                        <button
-                            @click="setBenchTab('throughput'); benchDropdown = false;"
-                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
-                            :class="mainTab === 'bench' && benchTab === 'throughput'
-                                ? 'text-neutral-900 bg-neutral-100'
-                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
-                        >
-                            <i data-lucide="zap" class="w-3.5 h-3.5"></i>
-                            {{ t('navbar.dropdown.performance') }}
-                        </button>
-                        <button
-                            @click="setBenchTab('accuracy'); benchDropdown = false;"
-                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
-                            :class="mainTab === 'bench' && benchTab === 'accuracy'
-                                ? 'text-neutral-900 bg-neutral-100'
-                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
-                        >
-                            <i data-lucide="target" class="w-3.5 h-3.5"></i>
-                            {{ t('navbar.dropdown.accuracy') }}
-                        </button>
-                    </div>
-                </div>
-                <a
-                    href="/admin/chat"
-                    class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5 text-neutral-600 hover:text-neutral-900"
-                >
-                    <i data-lucide="message-circle" class="w-4 h-4"></i>
-                    {{ t('navbar.tab.chat') }}
-                </a>
-            </div>
-
-            <!-- Right: Theme Select + Logout -->
-            <div class="hidden lg:flex items-center gap-2 ml-auto">
-                <!-- Theme Select -->
-                <div class="relative" @mouseenter="themeDropdown = true" @mouseleave="themeDropdown = false">
-                    <button class="p-2 rounded-full transition-all duration-200 cursor-pointer"
-                            :class="activeTheme === 'dark'
-                                ? 'text-amber-400 hover:bg-neutral-700'
-                                : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'"
-                            :title="theme === 'auto' ? window.t('navbar.theme.auto') : theme === 'light' ? window.t('navbar.theme.light_mode') : window.t('navbar.theme.dark_mode')">
-                        <i data-lucide="sun-moon" class="w-4 h-4" x-show="theme === 'auto'"></i>
-                        <i data-lucide="sun" class="w-4 h-4" x-show="theme === 'light'"></i>
-                        <i data-lucide="moon" class="w-4 h-4" x-show="theme === 'dark'"></i>
-                    </button>
-                    <div
-                        x-show="themeDropdown"
-                        x-transition:enter="transition ease-out duration-150"
-                        x-transition:enter-start="opacity-0 translate-y-1"
-                        x-transition:enter-end="opacity-100 translate-y-0"
-                        x-transition:leave="transition ease-in duration-100"
-                        x-transition:leave-start="opacity-100 translate-y-0"
-                        x-transition:leave-end="opacity-0 translate-y-1"
-                        class="absolute right-0 mt-1.5 w-40 bg-white rounded-xl shadow-lg border border-neutral-200 py-1.5 z-[60]"
-                        x-cloak
-                    >
-                        <button
-                            @click="setTheme('auto'); themeDropdown = false"
-                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
-                            :class="theme === 'auto'
-                                ? 'text-neutral-900 bg-neutral-100'
-                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
-                        >
-                            <i data-lucide="sun-moon" class="w-3.5 h-3.5"></i>
-                            {{ t('navbar.theme.auto') }}
-                        </button>
-                        <button
-                            @click="setTheme('light'); themeDropdown = false"
-                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
-                            :class="theme === 'light'
-                                ? 'text-neutral-900 bg-neutral-100'
-                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
-                        >
-                            <i data-lucide="sun" class="w-3.5 h-3.5"></i>
-                            {{ t('navbar.theme.light_mode') }}
-                        </button>
-                        <button
-                            @click="setTheme('dark'); themeDropdown = false"
-                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
-                            :class="theme === 'dark'
-                                ? 'text-neutral-900 bg-neutral-100'
-                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
-                        >
-                            <i data-lucide="moon" class="w-3.5 h-3.5"></i>
-                            {{ t('navbar.theme.dark_mode') }}
-                        </button>
-                    </div>
-                </div>
-
-                <!-- Logout Button -->
-                <button
-                    @click="logout"
-                    class="inline-flex items-center px-4 py-2 text-sm font-medium text-neutral-600
-                           hover:text-neutral-900 hover:bg-neutral-100 rounded-full transition-all duration-200"
-                >
-                    <i data-lucide="log-out" class="w-4 h-4 mr-2"></i>
-                    {{ t('navbar.logout') }}
-                </button>
-            </div>
+<div class="flyto-mobile-bar">
+    <a href="/admin/dashboard" class="flyto-brand"><img src="/admin/static/favicon.svg" alt="" width="32" height="32">Flyto MLX</a>
+    <button class="flyto-icon-button" @click="mobileMenuOpen = !mobileMenuOpen" :aria-expanded="mobileMenuOpen" aria-controls="admin-navigation" aria-label="{{ t('shell.navigation') }}">
+        <i data-lucide="menu" class="w-5 h-5" x-show="!mobileMenuOpen"></i>
+        <i data-lucide="x" class="w-5 h-5" x-show="mobileMenuOpen" x-cloak></i>
+    </button>
+</div>
+<div class="flyto-nav-overlay" x-show="mobileMenuOpen" x-cloak @click="mobileMenuOpen = false"></div>
+<aside id="admin-navigation" class="flyto-sidebar" :class="{ 'is-open': mobileMenuOpen }" @keydown.escape.window="mobileMenuOpen = false">
+    <a href="/admin/dashboard" class="flyto-brand"><img src="/admin/static/favicon.svg" alt="" width="36" height="36"><span>Flyto MLX<small>{{ t('shell.workspace') }}</small></span></a>
+    <nav aria-label="{{ t('shell.navigation') }}" class="flyto-navigation">
+        <p class="flyto-nav-group">{{ t('shell.serving') }}</p>
+        {% for tab, icon, label in [('status', 'activity', 'navbar.tab.status'), ('models', 'boxes', 'navbar.tab.models')] %}
+        <button class="flyto-nav-item" @click="setMainTab('{{ tab }}'); mobileMenuOpen = false" :class="{ 'is-active': mainTab === '{{ tab }}' }" :aria-current="mainTab === '{{ tab }}' ? 'page' : null">
+            <i data-lucide="{{ icon }}" class="w-5 h-5"></i>{{ t(label) }}
+            {% if tab == 'models' %}<span class="flyto-count" x-show="hfTasks.some(t => ['pending', 'downloading'].includes(t.status))" x-text="hfTasks.filter(t => ['pending', 'downloading'].includes(t.status)).length" x-cloak></span>{% endif %}
+        </button>
+        {% endfor %}
+        <div class="flyto-subnav" x-show="mainTab === 'models'" x-cloak>
+            {% for tab, label in [('manager', 'navbar.dropdown.manager'), ('downloader', 'navbar.dropdown.downloader'), ('quantizer', 'navbar.dropdown.quantizer'), ('uploader', 'navbar.dropdown.uploader')] %}
+            <button @click="setModelsTab('{{ tab }}'); mobileMenuOpen = false" :class="{ 'is-active': modelsTab === '{{ tab }}' }">{{ t(label) }}</button>
+            {% endfor %}
         </div>
-
-        <!-- Mobile menu -->
-        <div x-show="mobileMenuOpen" x-cloak
-             x-transition:enter="transition ease-out duration-200"
-             x-transition:enter-start="opacity-0 -translate-y-2"
-             x-transition:enter-end="opacity-100 translate-y-0"
-             x-transition:leave="transition ease-in duration-150"
-             x-transition:leave-start="opacity-100 translate-y-0"
-             x-transition:leave-end="opacity-0 -translate-y-2"
-             class="lg:hidden border-t border-neutral-100 px-4 pt-3 pb-2">
-            <div class="max-w-7xl mx-auto space-y-1">
-                <button @click="setMainTab('status'); mobileMenuOpen = false"
-                        :class="mainTab === 'status' ? 'bg-neutral-100 text-neutral-900' : 'text-neutral-600'"
-                        class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2">
-                    <i data-lucide="bar-chart-3" class="w-4 h-4"></i>
-                    {{ t('navbar.tab.status') }}
-                </button>
-                <button @click="setMainTab('models'); mobileMenuOpen = false"
-                        :class="mainTab === 'models' ? 'bg-neutral-100 text-neutral-900' : 'text-neutral-600'"
-                        class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2">
-                    <i data-lucide="hard-drive-download" class="w-4 h-4"></i>
-                    {{ t('navbar.tab.models') }}
-                    <span x-show="hfTasks.filter(t => t.status === 'downloading' || t.status === 'pending').length > 0"
-                          x-text="hfTasks.filter(t => t.status === 'downloading' || t.status === 'pending').length"
-                          class="w-4 h-4 bg-blue-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center"
-                          x-cloak></span>
-                </button>
-                <button @click="setMainTab('settings'); mobileMenuOpen = false"
-                        :class="mainTab === 'settings' ? 'bg-neutral-100 text-neutral-900' : 'text-neutral-600'"
-                        class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2">
-                    <i data-lucide="settings" class="w-4 h-4"></i>
-                    {{ t('navbar.tab.settings') }}
-                </button>
-                <button @click="setMainTab('logs'); mobileMenuOpen = false"
-                        :class="mainTab === 'logs' ? 'bg-neutral-100 text-neutral-900' : 'text-neutral-600'"
-                        class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2">
-                    <i data-lucide="scroll-text" class="w-4 h-4"></i>
-                    {{ t('navbar.tab.logs') }}
-                </button>
-                <button @click="setMainTab('bench'); mobileMenuOpen = false"
-                        :class="mainTab === 'bench' ? 'bg-neutral-100 text-neutral-900' : 'text-neutral-600'"
-                        class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2">
-                    <i data-lucide="gauge" class="w-4 h-4"></i>
-                    {{ t('navbar.tab.bench') }}
-                </button>
-                <button @click="setMainTab('cluster'); mobileMenuOpen = false"
-                        :class="mainTab === 'cluster' ? 'bg-neutral-100 text-neutral-900' : 'text-neutral-600'"
-                        class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2">
-                    <i data-lucide="network" class="w-4 h-4"></i>
-                    {{ t('navbar.tab.cluster') }}
-                </button>
-                <a href="/admin/chat"
-                   class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2 text-neutral-600 hover:text-neutral-900">
-                    <i data-lucide="message-circle" class="w-4 h-4"></i>
-                    {{ t('navbar.tab.chat') }}
-                </a>
-                <div class="border-t border-neutral-100 pt-2 mt-2 flex items-center justify-between px-2">
-                    <div class="flex items-center gap-1">
-                        <button @click="setTheme('auto')"
-                                class="p-2 rounded-full transition-all duration-200"
-                                :class="theme === 'auto' ? 'text-amber-400 bg-neutral-100' : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'"
-                                :title="window.t('navbar.theme.auto')">
-                            <i data-lucide="sun-moon" class="w-4 h-4"></i>
-                        </button>
-                        <button @click="setTheme('light')"
-                                class="p-2 rounded-full transition-all duration-200"
-                                :class="theme === 'light' ? 'text-amber-400 bg-neutral-100' : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'"
-                                :title="window.t('navbar.theme.light_mode')">
-                            <i data-lucide="sun" class="w-4 h-4"></i>
-                        </button>
-                        <button @click="setTheme('dark')"
-                                class="p-2 rounded-full transition-all duration-200"
-                                :class="theme === 'dark' ? 'text-amber-400 bg-neutral-100' : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'"
-                                :title="window.t('navbar.theme.dark_mode')">
-                            <i data-lucide="moon" class="w-4 h-4"></i>
-                        </button>
-                    </div>
-                    <button @click="logout"
-                            class="inline-flex items-center px-4 py-2 text-sm font-medium text-neutral-600 hover:text-neutral-900 rounded-full transition-all">
-                        <i data-lucide="log-out" class="w-4 h-4 mr-2"></i>
-                        {{ t('navbar.logout') }}
-                    </button>
-                </div>
-            </div>
+        <a href="/admin/chat" class="flyto-nav-item"><i data-lucide="messages-square" class="w-5 h-5"></i>{{ t('navbar.tab.chat') }}<i data-lucide="arrow-up-right" class="w-4 h-4 ml-auto"></i></a>
+        <p class="flyto-nav-group">{{ t('shell.manage') }}</p>
+        {% for tab, icon, label in [('settings', 'sliders-horizontal', 'navbar.tab.settings'), ('logs', 'terminal', 'navbar.tab.logs'), ('bench', 'gauge', 'navbar.tab.bench')] %}
+        <button class="flyto-nav-item" @click="setMainTab('{{ tab }}'); mobileMenuOpen = false" :class="{ 'is-active': mainTab === '{{ tab }}' }" :aria-current="mainTab === '{{ tab }}' ? 'page' : null">
+            <i data-lucide="{{ icon }}" class="w-5 h-5"></i>{{ t(label) }}
+        </button>
+        {% if tab == 'settings' %}
+        <div class="flyto-subnav" x-show="mainTab === 'settings'" x-cloak>
+            {% for subtab, label in [('global', 'navbar.dropdown.global_settings'), ('models', 'navbar.dropdown.model_settings')] %}
+            <button @click="setSettingsTab('{{ subtab }}'); mobileMenuOpen = false" :class="{ 'is-active': activeTab === '{{ subtab }}' }">{{ t(label) }}</button>
+            {% endfor %}
         </div>
+        {% elif tab == 'bench' %}
+        <div class="flyto-subnav" x-show="mainTab === 'bench'" x-cloak>
+            {% for subtab, label in [('throughput', 'navbar.dropdown.performance'), ('accuracy', 'navbar.dropdown.accuracy')] %}
+            <button @click="setBenchTab('{{ subtab }}'); mobileMenuOpen = false" :class="{ 'is-active': benchTab === '{{ subtab }}' }">{{ t(label) }}</button>
+            {% endfor %}
+        </div>
+        {% endif %}
+        {% endfor %}
     </nav>
+    <div class="flyto-sidebar-footer">
+        <label class="flyto-theme"><i data-lucide="sun-moon" class="w-4 h-4"></i><select aria-label="{{ t('shell.theme') }}" x-model="theme" @change="setTheme($event.target.value)">
+            <option value="auto">{{ t('navbar.theme.auto') }}</option><option value="light">{{ t('navbar.theme.light_mode') }}</option><option value="dark">{{ t('navbar.theme.dark_mode') }}</option>
+        </select></label>
+        <a href="https://github.com/panwudi/flyto-mlx" target="_blank" rel="noopener noreferrer" class="flyto-version" title="{{ t('navbar.go_to_github') }}"><span>Flyto MLX v{{ version }}</span><i data-lucide="github" class="w-4 h-4"></i></a>
+        <a href="/admin/logout" class="flyto-nav-item"><i data-lucide="log-out" class="w-4 h-4"></i>{{ t('navbar.logout') }}</a>
+    </div>
+</aside>
