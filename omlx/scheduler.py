@@ -703,6 +703,41 @@ class SchedulerOutput:
     has_work: bool = False
 
 
+def _freeze_state_containers(obj: Any) -> Any:
+    """Copy the list / tuple / dict structure of an extracted cache state.
+
+    MLX arrays are immutable, but cache objects update their state
+    containers in place (ArraysCache keeps its arrays in a list it writes
+    into), so an extracted state that shares those containers keeps
+    changing as prefill continues.
+    """
+    if isinstance(obj, list):
+        return [_freeze_state_containers(x) for x in obj]
+    if isinstance(obj, tuple):
+        return tuple(_freeze_state_containers(x) for x in obj)
+    if isinstance(obj, dict):
+        return {k: _freeze_state_containers(v) for k, v in obj.items()}
+    return obj
+
+
+class _PreExtractedSnapshot:
+    """A boundary snapshot already extracted (and frozen) at capture time.
+
+    Prefill hands _on_prefill_boundary_snapshot the LIVE prompt-cache
+    objects. The SSD store serializes them immediately, but the in-memory
+    fallback used to keep the objects themselves, and by the time the store
+    read them they held the state of a later boundary: the same
+    "state past the block" corruption 8986da14 fixes for the last block.
+    Scheduler._extract_cache_states passes this through unchanged.
+    """
+
+    __slots__ = ("extracted", "model_cache_config")
+
+    def __init__(self, extracted: list, model_cache_config: Any) -> None:
+        self.extracted = extracted
+        self.model_cache_config = model_cache_config
+
+
 class _BoundarySnapshotProvider:
     """Dict-like lazy loader for boundary snapshots.
 
@@ -3253,6 +3288,20 @@ class Scheduler:
             with mx.stream(self._stream):
                 mx.eval(*leaves)
 
+    def _freeze_prefill_snapshot(
+        self, snapshot_cache: list[Any]
+    ) -> "_PreExtractedSnapshot":
+        """Extract, freeze and evaluate a prefill snapshot for in-memory use.
+
+        The layers are the live prompt-cache objects that prefill keeps
+        updating, so keep a copy of their state at this boundary instead.
+        Evaluated here because the store worker reads it off-thread.
+        """
+        extracted, config = self._extract_cache_states(snapshot_cache)
+        frozen = _PreExtractedSnapshot(_freeze_state_containers(extracted), config)
+        self._eval_snapshot_cache(frozen)
+        return frozen
+
     def _on_prefill_boundary_snapshot(
         self,
         request_id: str,
@@ -3297,13 +3346,13 @@ class Scheduler:
             if saved:
                 self._boundary_cache_snapshots[request_id][token_count] = None
             else:
-                # In-memory fallback: the store worker slices this snapshot
-                # off-thread later, so make it concrete on this thread now.
-                self._eval_snapshot_cache(snapshot_cache)
-                self._boundary_cache_snapshots[request_id][token_count] = snapshot_cache
+                self._boundary_cache_snapshots[request_id][token_count] = (
+                    self._freeze_prefill_snapshot(snapshot_cache)
+                )
         else:
-            self._eval_snapshot_cache(snapshot_cache)
-            self._boundary_cache_snapshots[request_id][token_count] = snapshot_cache
+            self._boundary_cache_snapshots[request_id][token_count] = (
+                self._freeze_prefill_snapshot(snapshot_cache)
+            )
 
         self._boundary_snapshot_required = True
         logger.debug(
@@ -3762,6 +3811,8 @@ class Scheduler:
             - List of dicts with {state, meta_state, class_name, cache_type}
             - ModelCacheConfig with per-layer type information (or None)
         """
+        if isinstance(raw_cache, _PreExtractedSnapshot):
+            return raw_cache.extracted, raw_cache.model_cache_config
         if not raw_cache:
             return [], None
 

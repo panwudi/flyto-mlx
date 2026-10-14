@@ -1155,11 +1155,19 @@ class TestSchedulerBoundarySnapshots:
         assert any(c.args == tuple(arrays) for c in eval_.call_args_list)
 
     @pytest.mark.parametrize("store_saves", [None, False])
-    def test_in_memory_boundary_snapshot_is_evaluated_at_capture(
+    def test_in_memory_prefill_snapshot_is_frozen_at_capture(
         self, mock_model, mock_tokenizer, store_saves
     ):
-        """In-memory snapshots (no SSD store, or a failed save) are sliced
-        later on the worker thread, so they are evaluated at capture."""
+        """In-memory prefill snapshots (no SSD store, or a failed save such
+        as a full write queue) must keep the state AT the boundary.
+
+        Prefill passes the live prompt-cache objects, which keep updating
+        in place (ArraysCache writes into its own list). Keeping the objects
+        would store the state of a later boundary. The snapshot must also be
+        evaluated on this thread, since the store worker reads it off-thread.
+        """
+        from mlx_lm.models.cache import ArraysCache
+
         config = SchedulerConfig(paged_cache_block_size=4)
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
         scheduler.block_aware_cache = MagicMock()
@@ -1169,14 +1177,23 @@ class TestSchedulerBoundarySnapshots:
             scheduler._boundary_snapshot_store = MagicMock()
             scheduler._boundary_snapshot_store.save.return_value = store_saves
 
-        snapshot = [MagicMock()]
-        with patch.object(
-            scheduler, "_cache_list_needs_boundary_snapshot", return_value=True
-        ), patch.object(scheduler, "_eval_snapshot_cache") as eval_snap:
-            scheduler._on_prefill_boundary_snapshot("req-snap", snapshot, 4)
+        live = ArraysCache(size=2)
+        live[0] = mx.zeros((1, 3, 4))
+        live[1] = mx.zeros((1, 2, 4, 4))
 
-        eval_snap.assert_called_once_with(snapshot)
-        assert scheduler._boundary_cache_snapshots["req-snap"][4] is snapshot
+        with patch.object(scheduler, "_eval_snapshot_cache") as eval_snap:
+            scheduler._on_prefill_boundary_snapshot("req-snap", [live], 4)
+        eval_snap.assert_called_once()
+
+        # Prefill moves on and updates the same cache object in place.
+        live[0] = mx.ones((1, 3, 4))
+        live[1] = mx.ones((1, 2, 4, 4))
+
+        stored = scheduler._boundary_cache_snapshots["req-snap"][4]
+        extracted, _ = scheduler._extract_cache_states(stored)
+        conv, ssm = extracted[0]["state"][:2]
+        assert mx.all(conv == 0).item()
+        assert mx.all(ssm == 0).item()
 
     def test_boundary_snapshot_synchronizes_generation_stream(
         self, mock_model, mock_tokenizer
@@ -1283,7 +1300,9 @@ class TestSchedulerBoundarySnapshots:
         )
 
         assert 4 in scheduler._boundary_cache_snapshots[request.request_id]
-        assert scheduler._boundary_cache_snapshots[request.request_id][4] == snapshot_cache
+        # Stored as a state frozen at capture, not the live cache objects.
+        stored = scheduler._boundary_cache_snapshots[request.request_id][4]
+        assert isinstance(stored, scheduler_module._PreExtractedSnapshot)
         assert scheduler._boundary_snapshot_required is True
 
     def test_prefill_boundary_snapshot_ignores_non_boundary_token_count(
