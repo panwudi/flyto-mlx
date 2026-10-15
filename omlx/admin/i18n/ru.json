@@ -1042,5 +1042,16 @@
   "shell.throughput": "Недавняя скорость вывода",
   "shell.throughput_hint": "Завершённые запросы за последние 60 секунд",
   "shell.action_done": "Действие выполнено",
-  "shell.copy_failed": "Не удалось скопировать. Выделите текст и скопируйте его вручную."
+  "shell.copy_failed": "Не удалось скопировать. Выделите текст и скопируйте его вручную.",
+  "modal.model_settings.type_embedding": "Embedding",
+  "modal.model_settings.type_reranker": "Reranker",
+  "modal.model_settings.type_audio_stt": "Audio STT",
+  "modal.model_settings.type_audio_tts": "Audio TTS",
+  "modal.model_settings.type_audio_sts": "Audio STS",
+  "modal.model_settings.type_video": "Video",
+  "modal.model_settings.type_video_upscaler": "Video Upscaler",
+  "modal.model_settings.type_image": "Image",
+  "modal.model_settings.paper_link": "Paper",
+  "modal.model_settings.dflash_impl_credit": "MLX impl by bstnxbt",
+  "models.oq.compare.proprietary": "Proprietary"
 }
