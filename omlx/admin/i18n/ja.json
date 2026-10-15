@@ -1042,5 +1042,16 @@
   "shell.throughput": "最近の出力速度",
   "shell.throughput_hint": "直近 60 秒に完了したリクエスト",
   "shell.action_done": "操作が完了しました",
-  "shell.copy_failed": "コピーできませんでした. テキストを選択して手動でコピーしてください."
+  "shell.copy_failed": "コピーできませんでした. テキストを選択して手動でコピーしてください.",
+  "modal.model_settings.type_embedding": "Embedding",
+  "modal.model_settings.type_reranker": "Reranker",
+  "modal.model_settings.type_audio_stt": "Audio STT",
+  "modal.model_settings.type_audio_tts": "Audio TTS",
+  "modal.model_settings.type_audio_sts": "Audio STS",
+  "modal.model_settings.type_video": "Video",
+  "modal.model_settings.type_video_upscaler": "Video Upscaler",
+  "modal.model_settings.type_image": "Image",
+  "modal.model_settings.paper_link": "Paper",
+  "modal.model_settings.dflash_impl_credit": "MLX impl by bstnxbt",
+  "models.oq.compare.proprietary": "Proprietary"
 }

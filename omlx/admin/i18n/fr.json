@@ -1042,5 +1042,16 @@
   "shell.throughput": "Débit récent",
   "shell.throughput_hint": "Requêtes terminées, 60 dernières secondes",
   "shell.action_done": "Action terminée",
-  "shell.copy_failed": "Copie impossible. Sélectionnez le texte et copiez-le manuellement."
+  "shell.copy_failed": "Copie impossible. Sélectionnez le texte et copiez-le manuellement.",
+  "modal.model_settings.type_embedding": "Embedding",
+  "modal.model_settings.type_reranker": "Reranker",
+  "modal.model_settings.type_audio_stt": "Audio STT",
+  "modal.model_settings.type_audio_tts": "Audio TTS",
+  "modal.model_settings.type_audio_sts": "Audio STS",
+  "modal.model_settings.type_video": "Video",
+  "modal.model_settings.type_video_upscaler": "Video Upscaler",
+  "modal.model_settings.type_image": "Image",
+  "modal.model_settings.paper_link": "Paper",
+  "modal.model_settings.dflash_impl_credit": "MLX impl by bstnxbt",
+  "models.oq.compare.proprietary": "Proprietary"
 }
