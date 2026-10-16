@@ -1053,5 +1053,8 @@
   "modal.model_settings.type_image": "Image",
   "modal.model_settings.paper_link": "Paper",
   "modal.model_settings.dflash_impl_credit": "MLX impl by bstnxbt",
-  "models.oq.compare.proprietary": "Proprietary"
+  "models.oq.compare.proprietary": "Proprietary",
+  "settings.conflict.message": "이 페이지를 연 뒤 다른 곳에서 설정이 변경되어 표시된 값이 오래되었습니다. 지금 저장하면 그 변경이 되돌려집니다.",
+  "settings.conflict.reload": "최신 설정 불러오기",
+  "settings.conflict.overwrite": "이 페이지의 값으로 저장"
 }

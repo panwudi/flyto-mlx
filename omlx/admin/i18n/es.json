@@ -1053,5 +1053,8 @@
   "modal.model_settings.type_image": "Image",
   "modal.model_settings.paper_link": "Paper",
   "modal.model_settings.dflash_impl_credit": "MLX impl by bstnxbt",
-  "models.oq.compare.proprietary": "Proprietary"
+  "models.oq.compare.proprietary": "Proprietary",
+  "settings.conflict.message": "La configuración se cambió en otro lugar después de abrir esta página, así que los valores mostrados están desactualizados. Guardar ahora desharía ese cambio.",
+  "settings.conflict.reload": "Cargar la configuración actual",
+  "settings.conflict.overwrite": "Guardar los valores de esta página"
 }

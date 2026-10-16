@@ -24,6 +24,22 @@
             <!-- Global Settings Tab -->
             <div x-show="activeTab === 'global'" x-cloak>
                 <div>
+                    <!-- Stale page: settings changed elsewhere since this page loaded -->
+                    <div x-show="settingsConflict" x-cloak
+                         class="sticky top-0 z-20 mb-6 flex flex-col sm:flex-row sm:items-center gap-3 px-4 py-3 rounded-lg border border-amber-200 bg-amber-50 text-amber-800 text-sm">
+                        <i data-lucide="alert-triangle" class="w-4 h-4 shrink-0"></i>
+                        <span class="flex-1">{{ t('settings.conflict.message') }}</span>
+                        <div class="flex gap-2 shrink-0">
+                            <button type="button" @click="discardEditsAndReloadSettings()"
+                                    class="px-3 py-1.5 rounded-md bg-neutral-900 text-white text-xs font-medium hover:bg-neutral-800">
+                                {{ t('settings.conflict.reload') }}
+                            </button>
+                            <button type="button" @click="saveGlobalSettings(true)" :disabled="saving"
+                                    class="px-3 py-1.5 rounded-md border border-amber-300 text-xs font-medium hover:bg-amber-100 disabled:opacity-50">
+                                {{ t('settings.conflict.overwrite') }}
+                            </button>
+                        </div>
+                    </div>
                     <!-- Header -->
                     <div class="mb-8">
                         <h2 class="text-xs font-bold text-fg-tertiary mb-2">{{ t('settings.global.section_label') }}</h2>
@@ -986,7 +1002,7 @@
                             </div>
                         </div>
                         <button
-                            @click="saveGlobalSettings"
+                            @click="saveGlobalSettings()"
                             :disabled="saving"
                             class="px-8 py-3 bg-neutral-900 text-white text-sm font-semibold
                                    rounded-full hover:bg-neutral-800 focus:outline-none focus:ring-2

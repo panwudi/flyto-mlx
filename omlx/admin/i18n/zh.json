@@ -1053,5 +1053,8 @@
   "modal.model_settings.type_image": "图像",
   "modal.model_settings.paper_link": "论文",
   "modal.model_settings.dflash_impl_credit": "MLX 实现: bstnxbt",
-  "models.oq.compare.proprietary": "专有格式"
+  "models.oq.compare.proprietary": "专有格式",
+  "settings.conflict.message": "配置在这个页面打开之后被别处改过, 页面上显示的是旧值. 现在保存会把别处的修改改回去.",
+  "settings.conflict.reload": "载入最新配置",
+  "settings.conflict.overwrite": "仍用本页的值保存"
 }

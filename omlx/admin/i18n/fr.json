@@ -1053,5 +1053,8 @@
   "modal.model_settings.type_image": "Image",
   "modal.model_settings.paper_link": "Paper",
   "modal.model_settings.dflash_impl_credit": "MLX impl by bstnxbt",
-  "models.oq.compare.proprietary": "Proprietary"
+  "models.oq.compare.proprietary": "Proprietary",
+  "settings.conflict.message": "Les paramètres ont été modifiés ailleurs après l'ouverture de cette page : les valeurs affichées sont périmées. Enregistrer maintenant annulerait cette modification.",
+  "settings.conflict.reload": "Charger les paramètres actuels",
+  "settings.conflict.overwrite": "Enregistrer quand même les valeurs de cette page"
 }
