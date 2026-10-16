@@ -175,6 +175,14 @@
             saveSuccess: false,
             saveMessage: '',
             saveError: '',
+            // Settings freshness: what the server returned on the last load
+            // (minus the live `system` block) and what the form held right
+            // after it, so a stale page neither shows old values nor writes
+            // them back over a change made elsewhere.
+            settingsServerSnapshot: '',
+            settingsFormSnapshot: '',
+            settingsLoadedAt: 0,
+            settingsConflict: false,
 
             // Model settings modal
             showModelSettingsModal: false,
@@ -541,6 +549,9 @@
                     if (this.mainTab === 'bench' && this.benchTab === 'throughput') {
                         this.loadBenchState();
                     }
+                    if (this.mainTab === 'settings') {
+                        this.refreshGlobalSettingsIfStale();
+                    }
                 });
 
                 this.$watch('hfMlxOnly', () => {
@@ -618,6 +629,9 @@
                     this.stopHFRefresh();
                     this.stopMSRefresh();
                     this.stopOQRefresh();
+                }
+                if (value === 'settings') {
+                    await this.refreshGlobalSettingsIfStale();
                 }
                 if (value === 'bench') {
                     if (!this.benchDeviceInfo) await this.loadBenchDeviceInfo();
@@ -745,6 +759,11 @@
                             this.globalSettings.cache.hot_cache_max_size,
                             this.globalSettings.system.total_memory_bytes
                         );
+
+                        this.settingsServerSnapshot = this.settingsFingerprint(data);
+                        this.settingsFormSnapshot = this.settingsFingerprint(this.globalSettings);
+                        this.settingsLoadedAt = Date.now();
+                        this.settingsConflict = false;
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -753,7 +772,50 @@
                 }
             },
 
-            async saveGlobalSettings() {
+            // JSON of a settings object without the live `system` block
+            // (free memory etc. changes on every read).
+            settingsFingerprint(obj) {
+                const { system, ...rest } = obj || {};
+                return JSON.stringify(rest);
+            },
+
+            settingsHaveUnsavedEdits() {
+                return this.settingsFormSnapshot !== ''
+                    && this.settingsFingerprint(this.globalSettings) !== this.settingsFormSnapshot;
+            },
+
+            // True when the server's settings differ from what this page
+            // loaded, i.e. someone changed them elsewhere since.
+            async serverSettingsChanged() {
+                if (!this.settingsServerSnapshot) return false;
+                try {
+                    const response = await fetch('/admin/api/global-settings', { cache: 'no-store' });
+                    if (!response.ok) return false;
+                    const data = await response.json();
+                    return this.settingsFingerprint(data) !== this.settingsServerSnapshot;
+                } catch (err) {
+                    return false;
+                }
+            },
+
+            // Called when the settings tab is shown or the browser tab comes
+            // back into view. Without edits in progress, just reload; with
+            // edits, keep them and flag the conflict instead of discarding.
+            async refreshGlobalSettingsIfStale() {
+                if (Date.now() - this.settingsLoadedAt < 2000) return;
+                if (!this.settingsHaveUnsavedEdits()) {
+                    await this.loadGlobalSettings();
+                } else if (await this.serverSettingsChanged()) {
+                    this.settingsConflict = true;
+                }
+            },
+
+            async discardEditsAndReloadSettings() {
+                await this.loadGlobalSettings();
+                this.saveError = '';
+            },
+
+            async saveGlobalSettings(overwrite = false) {
                 this.saving = true;
                 this.saveSuccess = false;
                 this.saveError = '';
@@ -788,6 +850,15 @@
                         return;
                     }
                 }
+
+                // Every field is sent, so saving a page loaded before someone
+                // else's change would silently revert it. Ask first.
+                if (overwrite !== true && await this.serverSettingsChanged()) {
+                    this.settingsConflict = true;
+                    this.saving = false;
+                    return;
+                }
+                this.settingsConflict = false;
 
                 try {
                     const response = await fetch('/admin/api/global-settings', {
@@ -854,6 +925,8 @@
                         const data = await response.json();
                         this.saveSuccess = true;
                         this.saveMessage = data.message || window.t('js.success.settings_saved');
+                        // Re-read so the page shows what the server now holds
+                        await this.loadGlobalSettings();
                         // Refresh stats and model list (cache changes unload models)
                         await this.loadStats();
                         await this.loadModels();

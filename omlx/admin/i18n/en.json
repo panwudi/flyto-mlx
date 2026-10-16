@@ -1053,5 +1053,8 @@
   "modal.model_settings.type_image": "Image",
   "modal.model_settings.paper_link": "Paper",
   "modal.model_settings.dflash_impl_credit": "MLX impl by bstnxbt",
-  "models.oq.compare.proprietary": "Proprietary"
+  "models.oq.compare.proprietary": "Proprietary",
+  "settings.conflict.message": "These settings were changed elsewhere after this page loaded, so the values shown are out of date. Saving now would undo that change.",
+  "settings.conflict.reload": "Load latest settings",
+  "settings.conflict.overwrite": "Save this page's values anyway"
 }

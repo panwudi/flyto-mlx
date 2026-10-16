@@ -1053,5 +1053,8 @@
   "modal.model_settings.type_image": "Image",
   "modal.model_settings.paper_link": "Paper",
   "modal.model_settings.dflash_impl_credit": "MLX impl by bstnxbt",
-  "models.oq.compare.proprietary": "Proprietary"
+  "models.oq.compare.proprietary": "Proprietary",
+  "settings.conflict.message": "このページを開いた後に設定が別の場所で変更されたため、表示中の値は古くなっています。このまま保存するとその変更が元に戻ります。",
+  "settings.conflict.reload": "最新の設定を読み込む",
+  "settings.conflict.overwrite": "このページの値で保存する"
 }

@@ -1053,5 +1053,8 @@
   "modal.model_settings.type_image": "圖像",
   "modal.model_settings.paper_link": "論文",
   "modal.model_settings.dflash_impl_credit": "MLX 實作: bstnxbt",
-  "models.oq.compare.proprietary": "專有格式"
+  "models.oq.compare.proprietary": "專有格式",
+  "settings.conflict.message": "設定在這個頁面開啟之後被別處改過, 頁面上顯示的是舊值. 現在儲存會把別處的修改改回去.",
+  "settings.conflict.reload": "載入最新設定",
+  "settings.conflict.overwrite": "仍用本頁的值儲存"
 }

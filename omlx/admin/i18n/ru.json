@@ -1053,5 +1053,8 @@
   "modal.model_settings.type_image": "Image",
   "modal.model_settings.paper_link": "Paper",
   "modal.model_settings.dflash_impl_credit": "MLX impl by bstnxbt",
-  "models.oq.compare.proprietary": "Proprietary"
+  "models.oq.compare.proprietary": "Proprietary",
+  "settings.conflict.message": "Настройки были изменены в другом месте после открытия этой страницы, поэтому показанные значения устарели. Сохранение сейчас отменит то изменение.",
+  "settings.conflict.reload": "Загрузить актуальные настройки",
+  "settings.conflict.overwrite": "Всё равно сохранить значения со страницы"
 }
