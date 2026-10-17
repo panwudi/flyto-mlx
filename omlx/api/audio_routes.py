@@ -133,6 +133,17 @@ def _get_settings_manager():
     return getattr(_server_state, "settings_manager", None)
 
 
+def _collapse_result_text(res: dict, collapse) -> None:
+    """Fold decoder repeats in a transcribe result's text fields (before the
+    aligner runs, so word timestamps are aligned to the folded text). Segments
+    that already carry words are left alone: their text and words must agree."""
+    if res.get("text"):
+        res["text"] = collapse(res["text"])
+    for seg in res.get("segments") or []:
+        if seg.get("text") and not seg.get("words"):
+            seg["text"] = collapse(seg["text"])
+
+
 def _audio_duration_seconds(audio_path: str) -> Optional[float]:
     """Return an audio file's duration in seconds, or None if unmeasurable.
 
@@ -222,6 +233,62 @@ def _stitch_aligner_windows(windows: list) -> list:
     return merged
 
 
+async def _guarded_window_text(asr_engine, path: str, seg, sr: int,
+                               asr_kwargs: dict) -> str:
+    """Reference transcript for one aligner window, under the repeat guard.
+
+    A window of a per-channel file is often mostly silence, and qwen3-asr
+    repeats its last sentence through it (a 344 s call came back with one
+    3,732-character line from this path). Decode is capped by the window
+    duration; a degenerate result is redone over the window's voiced spans
+    only; leftover back-to-back repeats are folded. The aligner then places
+    the text on the window's own audio, so timing is unaffected.
+    """
+    import os
+    import tempfile
+
+    import soundfile as sf
+
+    from omlx.engine.audio_chunk import (
+        DEFAULT_DECODE_TOKENS,
+        collapse_repeats,
+        looks_degenerate,
+        output_token_cap,
+        voiced_spans,
+    )
+
+    def _capped(dur: float) -> dict:
+        kw = dict(asr_kwargs)
+        cap = output_token_cap(dur)
+        if (kw.get("max_tokens") or DEFAULT_DECODE_TOKENS) > cap:
+            kw["max_tokens"] = cap
+        return kw
+
+    dur = len(seg) / sr if sr else 0.0
+    res = await asr_engine.transcribe(path, **_capped(dur))
+    text = (res.get("text") or "").strip()
+    if not looks_degenerate(text, dur, _LONG_AUDIO_GUARD_UNIQUENESS):
+        return collapse_repeats(text)
+    parts: list = []
+    for (si, ei) in voiced_spans(seg, sr):
+        tf = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+        tf.close()
+        try:
+            sf.write(tf.name, seg[si:ei], sr, subtype="FLOAT")
+            r = await asr_engine.transcribe(tf.name, **_capped((ei - si) / sr))
+            t = collapse_repeats((r.get("text") or "").strip())
+            if t:
+                parts.append(t)
+        finally:
+            try:
+                os.unlink(tf.name)
+            except OSError:
+                pass
+    logger.info("repeat guard: aligner window (%.1fs) degenerated (%d chars); "
+                "re-transcribed by voiced span", dur, len(text))
+    return "".join(parts)
+
+
 async def _chunk_align(asr_engine, aligner_engine, audio_path: str, *,
                        language, max_tokens, window_s: float) -> list:
     """Align audio longer than the forced aligner's single-segment limit.
@@ -267,8 +334,9 @@ async def _chunk_align(asr_engine, aligner_engine, audio_path: str, *,
             asr_kwargs: dict = {"language": language}
             if max_tokens is not None:
                 asr_kwargs["max_tokens"] = max_tokens
-            asr_res = await asr_engine.transcribe(tf.name, **asr_kwargs)
-            win_text = (asr_res.get("text") or "").strip()
+            win_text = await _guarded_window_text(
+                asr_engine, tf.name, seg, sr, asr_kwargs
+            )
             if not win_text:
                 continue
             align_res = await aligner_engine.transcribe(
@@ -1472,6 +1540,100 @@ async def create_transcription(
             )
             return concat_chunk_results(leaves, total_s, language)
 
+        async def _transcribe_voiced_spans(audio_path: str) -> dict:
+            """Re-transcribe a pass that degenerated, one voiced span at a
+            time: silent stretches are never sent to the model (they are what
+            makes qwen3-asr repeat its last sentence), each span's decode is
+            capped by its duration, a span that still loops is bisected at
+            silence, and leftover back-to-back repeats are folded. Timestamps
+            are offset by each span's start sample, so they stay on the
+            original timeline to the sample."""
+            import soundfile as _sf
+            from omlx.engine.audio_chunk import (
+                DEFAULT_DECODE_TOKENS,
+                bisect_at_silence,
+                collapse_repeats,
+                concat_chunk_results,
+                looks_degenerate,
+                offset_result_times,
+                output_token_cap,
+                voiced_spans,
+            )
+            audio, sr = _sf.read(audio_path, dtype="float32")
+            mono_buf = audio.mean(axis=1) if getattr(audio, "ndim", 1) == 2 else audio
+            total_s = len(mono_buf) / sr if sr else 0.0
+
+            async def _do_span(seg_audio, seg_start_s: float, depth: int) -> list:
+                seg_dur = len(seg_audio) / sr if sr else 0.0
+                kw = dict(transcribe_kwargs)
+                cap = output_token_cap(seg_dur)
+                if (kw.get("max_tokens") or DEFAULT_DECODE_TOKENS) > cap:
+                    kw["max_tokens"] = cap
+                tf = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+                tf.close()
+                try:
+                    _sf.write(tf.name, seg_audio, sr, subtype="FLOAT")
+                    res = await engine.transcribe(tf.name, **kw)
+                    if (
+                        looks_degenerate(res.get("text") or "", seg_dur,
+                                         _LONG_AUDIO_GUARD_UNIQUENESS)
+                        and seg_dur > 4.0
+                        and depth < _LONG_AUDIO_MAX_RESPLIT_DEPTH
+                    ):
+                        cut = bisect_at_silence(seg_audio, sr)
+                        if cut and 0.0 < cut < seg_dur:
+                            ci = int(cut * sr)
+                            return (
+                                await _do_span(seg_audio[:ci], seg_start_s, depth + 1)
+                                + await _do_span(seg_audio[ci:], seg_start_s + ci / sr, depth + 1)
+                            )
+                    _collapse_result_text(res, collapse_repeats)
+                    await _maybe_align_inplace(res, tf.name)
+                    offset_result_times(res, seg_start_s)
+                    return [res]
+                finally:
+                    try:
+                        os.unlink(tf.name)
+                    except OSError:
+                        pass
+
+            leaves: list = []
+            spans = voiced_spans(mono_buf, sr)
+            for (si, ei) in spans:
+                leaves.extend(await _do_span(mono_buf[si:ei], si / sr, 0))
+            logger.info(
+                "repeat guard: %s (%.1fs) re-transcribed as %d voiced span(s)",
+                os.path.basename(audio_path), total_s, len(spans),
+            )
+            return concat_chunk_results(leaves, total_s, language)
+
+        async def _guarded_pass(audio_path: str) -> dict:
+            """One ASR pass with the short-audio repeat guard: decode capped by
+            the audio duration; a degenerate result (repeat loop, or more text
+            than the audio can hold) is redone span by span. A clean pass is
+            returned exactly as before (plus the aligner run)."""
+            from omlx.engine.audio_chunk import (
+                DEFAULT_DECODE_TOKENS,
+                looks_degenerate,
+                output_token_cap,
+            )
+            dur = _audio_duration_seconds(audio_path) or 0.0
+            kw = dict(transcribe_kwargs)
+            if dur > 0:
+                cap = output_token_cap(dur)
+                if (kw.get("max_tokens") or DEFAULT_DECODE_TOKENS) > cap:
+                    kw["max_tokens"] = cap
+            res = await engine.transcribe(audio_path, **kw)
+            if looks_degenerate(res.get("text") or "", dur, _LONG_AUDIO_GUARD_UNIQUENESS):
+                logger.info(
+                    "repeat guard: %s (%.1fs) degenerated (%d chars); "
+                    "re-transcribing by voiced span",
+                    os.path.basename(audio_path), dur, len(res.get("text") or ""),
+                )
+                return await _transcribe_voiced_spans(audio_path)
+            await _maybe_align_inplace(res, audio_path)
+            return res
+
         if energy_tripass_requested:
             # 3-pass: L only, R only, mix (mix = tmp_path). Serial — the
             # underlying MLX engine is single-threaded so asyncio.gather
@@ -1479,12 +1641,12 @@ async def create_transcription(
             # bookkeeping. 3x ASR latency is the documented cost. Each pass
             # gets its own aligner companion run so per-pass words[] is
             # populated for the merge.
-            result_L = await engine.transcribe(tripass_L_path, **transcribe_kwargs)
-            await _maybe_align_inplace(result_L, tripass_L_path)
-            result_R = await engine.transcribe(tripass_R_path, **transcribe_kwargs)
-            await _maybe_align_inplace(result_R, tripass_R_path)
-            result_mix = await engine.transcribe(tmp_path, **transcribe_kwargs)
-            await _maybe_align_inplace(result_mix, tmp_path)
+            # Each pass runs under the short-audio repeat guard: a per-channel
+            # file is mostly silence (the other leg is talking), which is
+            # exactly what sends qwen3-asr into a repeat loop.
+            result_L = await _guarded_pass(tripass_L_path)
+            result_R = await _guarded_pass(tripass_R_path)
+            result_mix = await _guarded_pass(tmp_path)
             from omlx.engine.diarize import tripass_merge
             result = tripass_merge(
                 stereo_audio_for_diarize, stereo_sr_for_diarize,
@@ -1518,6 +1680,24 @@ async def create_transcription(
                     _auto_rechunk = True
             if _auto_rechunk:
                 result = await _transcribe_long_audio(tmp_path)
+            elif effective_long_audio != "off" and not is_aligner:
+                # Short-audio repeat guard: the long-audio guard above only
+                # engages past _LONG_AUDIO_MIN_RESPLIT_S, but a short call can
+                # loop too (energy mode decodes a mono mix with long one-sided
+                # silences). Only a degenerate pass is redone; a clean one is
+                # untouched.
+                from omlx.engine.audio_chunk import looks_degenerate as _degen
+                if _degen(result.get("text") or "",
+                          _audio_duration_seconds(tmp_path) or 0.0,
+                          _LONG_AUDIO_GUARD_UNIQUENESS):
+                    logger.info(
+                        "repeat guard: single pass degenerated (%d chars); "
+                        "re-transcribing by voiced span",
+                        len(result.get("text") or ""),
+                    )
+                    result = await _transcribe_voiced_spans(tmp_path)
+                else:
+                    await _maybe_align_inplace(result, tmp_path)
             else:
                 await _maybe_align_inplace(result, tmp_path)
 

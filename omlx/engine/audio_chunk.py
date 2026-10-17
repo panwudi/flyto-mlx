@@ -28,6 +28,7 @@ pauses). Zero deps beyond numpy, in the same style as diarize.py.
 from __future__ import annotations
 
 import math
+import re
 
 import numpy as np
 
@@ -290,3 +291,128 @@ def bisect_at_silence(
         if 0.1 * total < cut < 0.9 * total:
             return cut
     return mid
+
+
+# ---------------------------------------------------------------------------
+# Short-audio repeat-loop guard (per-channel passes)
+# ---------------------------------------------------------------------------
+#
+# The long-audio guard above only engages past _LONG_AUDIO_MIN_RESPLIT_S and
+# never on the energy_tripass per-channel passes. Those passes are where a
+# short call breaks: one channel of a 2-leg recording is mostly silence (the
+# other party is talking), and qwen3-asr fed a long silent stretch after a
+# sentence repeats that sentence until max_tokens -- a 43 s call came back
+# as 12,841 characters of one line (flytoCall, 2026-10-17). The model has no
+# notion of silence, so the fix keeps silence away from it: cut the buffer
+# into voiced spans, never send a silent span, cap each span's output by its
+# duration, and fold any repeat that still slips through.
+
+# Generous ceilings for real speech: fast Mandarin runs ~5-6 chars/s, so
+# 10 chars/s (detector) and 15 tokens/s (decode cap) are ~2x headroom.
+MAX_CHARS_PER_S = 10.0
+CAP_TOKENS_PER_S = 15.0
+CAP_TOKENS_FLOOR = 64
+# mlx-audio STT generate() default; the cap only ever lowers the budget.
+DEFAULT_DECODE_TOKENS = 8192
+
+
+def output_token_cap(duration_s: float) -> int:
+    """Decode-length cap for ``duration_s`` of audio (see CAP_TOKENS_PER_S).
+
+    A repeat loop otherwise runs to the model default (8192 tokens), which
+    is both the garbage and most of the latency of a broken pass.
+    """
+    return int(math.ceil(max(0.0, duration_s) * CAP_TOKENS_PER_S)) + CAP_TOKENS_FLOOR
+
+
+def looks_degenerate(text: str, duration_s: float, guard: float = 0.5) -> bool:
+    """True when ``text`` is a repeat loop or too long to be real speech.
+
+    Two independent signals: 12-gram uniqueness below ``guard`` (the same
+    detector and threshold the long-audio guard uses), or more characters
+    than ``duration_s`` of speech can hold.
+    """
+    text = text or ""
+    if ngram_uniqueness(text) < guard:
+        return True
+    return duration_s > 0 and len(text) > duration_s * MAX_CHARS_PER_S + 40
+
+
+def voiced_spans(
+    mono: np.ndarray,
+    sr: int,
+    min_silence_s: float = 2.0,
+    rel_threshold: float = 0.12,
+    abs_floor: float = 0.002,
+    pad_s: float = 0.2,
+    min_span_s: float = 0.15,
+) -> list[tuple[int, int]]:
+    """Voiced regions of ``mono`` as ``(start_sample, end_sample)`` pairs.
+
+    A frame is voiced when its RMS reaches both ``rel_threshold`` times the
+    loud reference (90th percentile) and ``abs_floor`` -- the absolute floor
+    keeps a channel that is all line noise (the other leg never spoke) from
+    calling its own noise "speech". Voiced runs closer than ``min_silence_s``
+    merge (a turn pause is not a cut; only the long one-sided silence that
+    seeds the loop is), each span is padded by
+    ``pad_s`` so word edges are kept, and slivers under ``min_span_s`` are
+    dropped. Boundaries are sample indices, so callers offset timestamps by
+    ``start_sample / sr`` exactly -- the cut adds no timing error.
+    """
+    mono = np.asarray(mono, dtype=np.float64).ravel()
+    n = mono.shape[0]
+    if n == 0 or not sr:
+        return []
+    rms, hop = _frame_rms(mono, sr)
+    ref = float(np.percentile(rms, 90)) if rms.shape[0] else 0.0
+    thr = max(ref * rel_threshold, abs_floor)
+    voiced = rms >= thr
+    frame = max(1, int(sr * 30.0 / 1000.0))
+    runs: list[list[int]] = []
+    start = -1
+    for i, v in enumerate(voiced):
+        if v and start < 0:
+            start = i
+        elif not v and start >= 0:
+            runs.append([start * hop, (i - 1) * hop + frame])
+            start = -1
+    if start >= 0:
+        runs.append([start * hop, (len(voiced) - 1) * hop + frame])
+    if not runs:
+        return []
+    gap = int(min_silence_s * sr)
+    merged = [runs[0]]
+    for s, e in runs[1:]:
+        if s - merged[-1][1] < gap:
+            merged[-1][1] = e
+        else:
+            merged.append([s, e])
+    pad = int(pad_s * sr)
+    out: list[tuple[int, int]] = []
+    for s, e in merged:
+        s, e = max(0, s - pad), min(n, e + pad)
+        if out and s <= out[-1][1]:
+            out[-1] = (out[-1][0], e)
+            continue
+        if e - s >= int(min_span_s * sr):
+            out.append((s, e))
+    return out
+
+
+_LONG_UNIT_REPEAT = re.compile(r"(.{4,30}?)\1{2,}", re.S)
+_SHORT_UNIT_REPEAT = re.compile(r"(.{1,3}?)\1{7,}", re.S)
+
+
+def collapse_repeats(text: str) -> str:
+    """Fold back-to-back repeats a decoder loop leaves behind.
+
+    A unit of 4-30 chars repeated 3+ times in a row, or of 1-3 chars
+    repeated 8+ times, becomes one copy. Real speech keeps "对对对" and a
+    phrase said twice; a loop's hundredfold line does not survive.
+    """
+    if not text:
+        return text
+    # Short units first: "对一" x30 must fold to "对一", not to the
+    # 4-char "对一对一" the long-unit pass would keep.
+    text = _SHORT_UNIT_REPEAT.sub(r"\1", text)
+    return _LONG_UNIT_REPEAT.sub(r"\1", text)
