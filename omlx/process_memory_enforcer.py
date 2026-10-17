@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Any
 import mlx.core as mx
 import psutil
 
+from .cache.paged_ssd_cache import PagedSSDCacheManager
 from .utils.proc_memory import get_phys_footprint, resident_usage_bytes
 
 if TYPE_CHECKING:
@@ -62,6 +63,12 @@ _SMALL_SYSTEM_THRESHOLD = 16 * 1024**3
 # eviction instead of stacking. Floored by prefill_transient_margin_bytes so it
 # never drops below a single request's forward-gate spike margin.
 _ADMISSION_HEADROOM_CEILING_FRACTION = 0.20
+
+# The SSD cache's in-memory hot tier only uses memory nobody else needs: the
+# poll sheds it to this far below the soft mark, and lets its limit grow back
+# one step per tick while resident memory stays two steps below that.
+_HOT_CACHE_SHED_PAD_BYTES = 1 * 1024**3
+_HOT_CACHE_RELAX_STEP_BYTES = 1 * 1024**3
 
 # Tier map: static reserve (>= 16 GB systems). `custom` shares the
 # `balanced` reserve so the static cap stays sane regardless of what
@@ -742,6 +749,16 @@ class ProcessMemoryEnforcer:
         current, active, phys, cache = resident_usage_bytes()
         ok = (current + self._prefill_transient_margin_bytes) <= ceiling
         if not ok:
+            # Hot cache blocks are a cache, a refused request is a failure:
+            # give them up first, including ones not yet written to SSD.
+            need = current + self._prefill_transient_margin_bytes - ceiling
+            freed, _ = self.shed_hot_caches(
+                need, drop_dirty=True, reason="admission"
+            )
+            if freed:
+                current, active, phys, cache = resident_usage_bytes()
+                ok = (current + self._prefill_transient_margin_bytes) <= ceiling
+        if not ok:
             logger.warning(
                 "[memadmit] resident %s (active %s, phys %s, mlx free pool %s, "
                 "recent peak %s) + margin %s > ceiling %s",
@@ -931,6 +948,74 @@ class ProcessMemoryEnforcer:
             if adjust is not None:
                 adjust(self._pressure_level)
 
+    def _hot_cache_managers(self) -> list[PagedSSDCacheManager]:
+        """SSD cache managers with a hot tier, one per loaded model."""
+        managers = []
+        for entry in self._engine_pool._entries.values():
+            scheduler = self._resolve_scheduler(entry)
+            mgr = getattr(scheduler, "paged_ssd_cache_manager", None)
+            if isinstance(mgr, PagedSSDCacheManager) and mgr._hot_cache_enabled:
+                managers.append(mgr)
+        return managers
+
+    def shed_hot_caches(
+        self, bytes_needed: int, *, drop_dirty: bool, reason: str
+    ) -> tuple[int, int]:
+        """Shed hot cache memory across all loaded models, largest first.
+
+        See ``PagedSSDCacheManager.shed_hot_cache``. Returns
+        ``(freed_now, queued_for_ssd)`` in bytes.
+        """
+        if bytes_needed <= 0:
+            return 0, 0
+        managers = sorted(
+            self._hot_cache_managers(),
+            key=lambda m: m.hot_cache_size_bytes,
+            reverse=True,
+        )
+        freed = queued = 0
+        for mgr in managers:
+            remaining = bytes_needed - freed - queued
+            if remaining <= 0:
+                break
+            f, q = mgr.shed_hot_cache(remaining, drop_dirty=drop_dirty)
+            freed += f
+            queued += q
+        if freed or queued:
+            logger.info(
+                "[hotcache] %s: shed %s now + %s queued for SSD (needed %s), "
+                "hot cache left %s",
+                reason, _format_gb(freed), _format_gb(queued),
+                _format_gb(bytes_needed),
+                _format_gb(sum(m.hot_cache_size_bytes for m in managers)),
+            )
+        return freed, queued
+
+    def _balance_hot_caches(self, soft: int) -> None:
+        """Keep the hot caches out of the soft band.
+
+        Soft pressure pauses admission and drops the store-cache cap to 1,
+        so a cache filling up must not be what puts us there. Above the
+        mark, shed (writing dirty blocks to SSD first, nothing is lost);
+        well below it, let the limits grow back.
+        """
+        if soft <= 0:
+            return
+        managers = self._hot_cache_managers()
+        if not managers:
+            return
+        resident = resident_usage_bytes()[0]
+        target = soft - _HOT_CACHE_SHED_PAD_BYTES
+        if resident > target:
+            # Blocks already queued for SSD are leaving; don't shed twice.
+            pending = sum(m.pending_eviction_bytes for m in managers)
+            self.shed_hot_caches(
+                resident - target - pending, drop_dirty=False, reason="pressure"
+            )
+        elif resident + 2 * _HOT_CACHE_RELAX_STEP_BYTES <= target:
+            for mgr in managers:
+                mgr.relax_hot_cache_limit(_HOT_CACHE_RELAX_STEP_BYTES)
+
     async def stop(self) -> None:
         """Stop the background enforcement loop."""
         self._running = False
@@ -990,11 +1075,12 @@ class ProcessMemoryEnforcer:
             self._pressure_level = "ok"
             return
 
+        soft = int(ceiling * self._soft_threshold)
+        hard = int(ceiling * self._hard_threshold)
+        self._balance_hot_caches(soft)
         current = self._current_usage_bytes()
         self._usage_window.append(current)
         self._recent_peak_bytes = max(self._usage_window) if self._usage_window else current
-        soft = int(ceiling * self._soft_threshold)
-        hard = int(ceiling * self._hard_threshold)
         prev_level = self._pressure_level
 
         if current < soft:
