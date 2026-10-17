@@ -206,3 +206,65 @@ class TestBisectAtSilence:
         mono = _speech(10.0)
         cut = bisect_at_silence(mono, SR)
         assert cut == pytest.approx(5.0, abs=0.05)
+
+
+# ---------------------------------------------------------------------------
+# Short-audio repeat guard (per-channel passes, flytoCall 2026-10-17)
+# ---------------------------------------------------------------------------
+
+from omlx.engine.audio_chunk import (  # noqa: E402
+    collapse_repeats,
+    looks_degenerate,
+    output_token_cap,
+    voiced_spans,
+)
+
+
+def _tone(sr, seconds, amp=0.3, freq=440.0):
+    t = np.arange(int(sr * seconds)) / sr
+    return (amp * np.sin(2 * np.pi * freq * t)).astype(np.float32)
+
+
+def test_voiced_spans_skip_long_silence_and_keep_sample_offsets():
+    sr = 8000
+    buf = np.concatenate([
+        np.zeros(sr * 1, dtype=np.float32), _tone(sr, 2.0),
+        np.zeros(sr * 10, dtype=np.float32), _tone(sr, 1.5),
+        np.zeros(sr * 3, dtype=np.float32),
+    ])
+    spans = voiced_spans(buf, sr, pad_s=0.0)
+    assert len(spans) == 2
+    (s1, e1), (s2, e2) = spans
+    # Boundaries land within one 30 ms frame of the true edges, in samples.
+    assert abs(s1 - 1 * sr) <= 240 and abs(e1 - 3 * sr) <= 240
+    assert abs(s2 - 13 * sr) <= 240 and abs(e2 - int(14.5 * sr)) <= 240
+
+
+def test_voiced_spans_merge_short_pauses_and_ignore_line_noise():
+    sr = 8000
+    buf = np.concatenate([_tone(sr, 1.0), np.zeros(sr, dtype=np.float32), _tone(sr, 1.0)])
+    assert len(voiced_spans(buf, sr)) == 1  # 1 s pause < 2 s min_silence
+    noise = (np.random.default_rng(0).standard_normal(sr * 5) * 0.0005).astype(np.float32)
+    assert voiced_spans(noise, sr) == []  # below the absolute floor
+    assert voiced_spans(np.zeros(0, dtype=np.float32), sr) == []
+
+
+def test_looks_degenerate_flags_loops_and_overlong_text():
+    loop = "了解因为皮肤最主要的就是你创" * 400
+    assert looks_degenerate(loop, 43.6)
+    assert looks_degenerate("今天天气不错我们聊一下仓储的价格" * 3 + "。" * 600, 10.0)
+    assert not looks_degenerate("喂你好我是飞驼云仓的请问您现在方便吗", 5.0)
+    assert not looks_degenerate("", 5.0)
+
+
+def test_collapse_repeats_folds_loops_but_keeps_normal_speech():
+    assert collapse_repeats("好的" + "了解因为皮肤" * 50 + "再见") == "好的了解因为皮肤再见"
+    assert collapse_repeats("对一" * 30) == "对一"
+    assert collapse_repeats("对对对, 可以的") == "对对对, 可以的"
+    assert collapse_repeats("你好你好") == "你好你好"
+
+
+def test_output_token_cap_scales_with_duration():
+    assert output_token_cap(0) == 64
+    assert output_token_cap(43.6) == int(np.ceil(43.6 * 15)) + 64
+    assert output_token_cap(10) < output_token_cap(100)
