@@ -666,6 +666,11 @@ class PagedSSDCacheManager(CacheManager):
         self._hot_cache: OrderedDict[bytes, dict] = OrderedDict()
         self._hot_cache_total_bytes: int = 0
         self._hot_cache_lock = threading.Lock()
+        # Effective size limit, <= _hot_cache_max_bytes. Lowered by
+        # shed_hot_cache() under memory pressure so the next store does not
+        # refill straight back to the configured size; raised again by
+        # relax_hot_cache_limit() once the pressure is gone.
+        self._hot_cache_limit_bytes = hot_cache_max_bytes
 
         # Initialize directory structure and scan existing files
         # Skip in hot_cache_only mode: no SSD I/O, so no directories needed.
@@ -678,6 +683,9 @@ class PagedSSDCacheManager(CacheManager):
         # Track which block hashes are queued for background write
         self._pending_write_hashes: set = set()
         self._pending_write_hashes_lock = threading.Lock()
+        # Bytes of evicted hot cache entries still waiting in the write
+        # queue: they left the hot cache but stay resident until written.
+        self._pending_eviction_bytes: dict[bytes, int] = {}
         self._writer_shutdown = threading.Event()
         # Writer thread is only needed when writing to SSD.
         self._writer_thread = None
@@ -740,7 +748,7 @@ class PagedSSDCacheManager(CacheManager):
 
             # Evict LRU entries until we have room
             while (
-                self._hot_cache_total_bytes + entry_size > self._hot_cache_max_bytes
+                self._hot_cache_total_bytes + entry_size > self._hot_cache_limit_bytes
                 and self._hot_cache
             ):
                 evicted_hash, evicted = self._hot_cache.popitem(last=False)
@@ -792,6 +800,10 @@ class PagedSSDCacheManager(CacheManager):
                 self._write_queue.put(item, timeout=0.5)
             else:
                 self._write_queue.put_nowait(item)
+            with self._pending_write_hashes_lock:
+                self._pending_eviction_bytes[block_hash] = sum(
+                    len(raw) for raw, _, _ in tensors_raw.values()
+                )
             logger.debug(
                 f"Evicted hot cache block to SSD write queue: "
                 f"{block_hash.hex()[:16]}..."
@@ -821,6 +833,99 @@ class PagedSSDCacheManager(CacheManager):
             old = self._hot_cache.pop(block_hash, None)
             if old:
                 self._hot_cache_total_bytes -= self._hot_cache_entry_size(old)
+
+    @property
+    def pending_eviction_bytes(self) -> int:
+        """Bytes evicted from the hot cache that are not yet on SSD."""
+        with self._pending_write_hashes_lock:
+            return sum(self._pending_eviction_bytes.values())
+
+    def shed_hot_cache(self, bytes_needed: int, *, drop_dirty: bool) -> tuple[int, int]:
+        """Give hot cache memory back under memory pressure.
+
+        Covers ``bytes_needed`` from, in order:
+
+        - Entries already on SSD (oldest first): dropped, their memory is
+          free at once.
+        - Entries that exist only in the hot cache (write-back, oldest
+          first): dropped when ``drop_dirty`` is True, losing that prefix
+          block. Otherwise they are queued for an SSD write while the write
+          queue has room, and their memory is free once the writer is done.
+
+        The effective size limit is lowered to what is left, so the next
+        store does not refill the cache; ``relax_hot_cache_limit`` raises it
+        again.
+
+        Returns ``(freed_now, queued)`` in bytes.
+        """
+        if not self._hot_cache_enabled or bytes_needed <= 0:
+            return 0, 0
+        freed = 0
+        queued = 0
+        to_write: list = []
+        with self._hot_cache_lock:
+            clean: list = []
+            dirty: list = []
+            for block_hash, entry in self._hot_cache.items():
+                if "arrays" in entry:
+                    # mx.array entries must be released on the inference
+                    # thread; leave them alone.
+                    continue
+                if self._index.contains(block_hash):
+                    clean.append(block_hash)
+                else:
+                    dirty.append(block_hash)
+            can_write = not self._hot_cache_only
+            order = [(h, True) for h in clean] + [(h, False) for h in dirty]
+            for block_hash, on_ssd in order:
+                if freed + queued >= bytes_needed:
+                    break
+                entry = self._hot_cache[block_hash]
+                size = self._hot_cache_entry_size(entry)
+                if on_ssd or drop_dirty:
+                    freed += size
+                elif (
+                    can_write
+                    and self._write_queue.qsize() + len(to_write)
+                    < self._write_queue.maxsize
+                ):
+                    queued += size
+                    to_write.append((block_hash, entry))
+                else:
+                    continue
+                del self._hot_cache[block_hash]
+                self._hot_cache_total_bytes -= size
+                self._stats["hot_cache_evictions"] += 1
+            self._hot_cache_limit_bytes = min(
+                self._hot_cache_limit_bytes, self._hot_cache_total_bytes
+            )
+        for block_hash, entry in to_write:
+            if not self._enqueue_ssd_write(block_hash, entry):
+                # The queue filled up meanwhile; the entry was dropped.
+                size = self._hot_cache_entry_size(entry)
+                queued -= size
+                freed += size
+        return freed, queued
+
+    def relax_hot_cache_limit(self, step_bytes: int) -> int:
+        """Raise the effective size limit by up to ``step_bytes`` toward
+        the configured size. Returns the new limit."""
+        with self._hot_cache_lock:
+            self._hot_cache_limit_bytes = min(
+                self._hot_cache_max_bytes,
+                self._hot_cache_limit_bytes + max(0, step_bytes),
+            )
+            return self._hot_cache_limit_bytes
+
+    @property
+    def hot_cache_size_bytes(self) -> int:
+        with self._hot_cache_lock:
+            return self._hot_cache_total_bytes
+
+    @property
+    def hot_cache_limit_bytes(self) -> int:
+        with self._hot_cache_lock:
+            return self._hot_cache_limit_bytes
 
     def _promote_to_hot_cache(
         self,
@@ -1073,6 +1178,10 @@ class PagedSSDCacheManager(CacheManager):
                 # Remove from pending write tracking
                 with self._pending_write_hashes_lock:
                     self._pending_write_hashes.discard(block_hash)
+                    self._pending_eviction_bytes.pop(block_hash, None)
+                # Drop the references to the written bytes now: otherwise
+                # they stay resident while the loop idles in get().
+                item = tensors_raw = None
                 # When hot cache is disabled, remove temporary read buffer entry
                 if not self._hot_cache_enabled:
                     self._hot_cache_remove(block_hash)

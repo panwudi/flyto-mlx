@@ -1958,6 +1958,33 @@ class Scheduler:
                     self._memory_hard_limit_bytes / 1024**3,
                 )
                 return
+            # Last resort before refusing: this model's hot cache blocks,
+            # including ones not yet on SSD. Losing a cached prefix costs a
+            # recompute later; a refusal fails the request now.
+            ssd = getattr(self, "paged_ssd_cache_manager", None)
+            if ssd is not None:
+                freed, _ = ssd.shed_hot_cache(
+                    resident + predicted_transient - self._memory_hard_limit_bytes,
+                    drop_dirty=True,
+                )
+                if freed:
+                    resident, active, phys, cache = resident_usage_bytes()
+                    if (
+                        resident + predicted_transient
+                        <= self._memory_hard_limit_bytes
+                    ):
+                        logger.info(
+                            "[memgate:%s] rid=%s shed %.3fGB of hot cache; "
+                            "resident %.3fGB + transient %.3fGB now fits "
+                            "cap %.3fGB, proceeding",
+                            loop_label,
+                            request_id,
+                            freed / 1024**3,
+                            resident / 1024**3,
+                            predicted_transient / 1024**3,
+                            self._memory_hard_limit_bytes / 1024**3,
+                        )
+                        return
             current = resident
             predicted_peak = current + predicted_transient
             logger.warning(
