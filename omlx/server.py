@@ -169,6 +169,7 @@ from .exceptions import (
     ModelNotFoundError,
     ModelTooLargeError,
     ModelTypeNotLoadableError,
+    RequestAbortedError,
     SchedulerQueueFullError,
 )
 from .model_discovery import format_size
@@ -640,6 +641,30 @@ async def scheduler_queue_full_handler(
         f"Scheduler waiting queue full ({exc.current_depth}/{exc.max_depth}). "
         f"Try again shortly."
     )
+    if _is_api_route(request):
+        content = _openai_error_body(detail, 503)
+    else:
+        content = {"detail": detail}
+    return JSONResponse(
+        status_code=503,
+        content=content,
+        headers={"Retry-After": "1"},
+    )
+
+
+@app.exception_handler(RequestAbortedError)
+async def request_aborted_handler(
+    request: FastAPIRequest, exc: RequestAbortedError
+):
+    """A request torn down before it ran (its model was unloaded) is
+    retryable: 503 + Retry-After instead of a 500."""
+    logger.warning(
+        "%s %s → 503: %s",
+        request.method,
+        request.url.path,
+        exc,
+    )
+    detail = str(exc)
     if _is_api_route(request):
         content = _openai_error_body(detail, 503)
     else:

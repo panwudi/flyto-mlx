@@ -1208,3 +1208,32 @@ class TestEngineCoreAddRequestCancellation:
                 assert "r-error" not in engine._output_collectors
             finally:
                 engine.close()
+
+
+class TestGenerateTornDown:
+    """A request torn down between add_request and the wait (its model was
+    unloaded for another) must surface as a retryable 503, not a 500."""
+
+    @pytest.mark.asyncio
+    async def test_missing_event_is_retryable(self, mock_model, mock_tokenizer):
+        from omlx import server
+        from omlx.exceptions import RequestAbortedError
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            try:
+                with patch.object(
+                    engine, "add_request", AsyncMock(return_value="rid-1")
+                ):
+                    with pytest.raises(RequestAbortedError) as exc:
+                        await engine.generate(prompt="hi")
+            finally:
+                engine.close()
+
+        req = MagicMock()
+        req.url.path = "/v1/messages"
+        req.method = "POST"
+        resp = await server.request_aborted_handler(req, exc.value)
+        assert resp.status_code == 503
+        assert resp.headers.get("Retry-After") == "1"
