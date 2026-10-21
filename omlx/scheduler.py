@@ -860,6 +860,13 @@ class Scheduler:
         # Populated when chunked_prefill=True and prompt exceeds prefill_step_size.
         self.prefilling: deque[Request] = deque()
         self._prefill_states: dict[str, _PrefillState] = {}
+        # perf_counter() time before which no further prefill chunk runs
+        # while requests are decoding. A chunk of a long prompt on a dense
+        # model takes seconds; with one chunk per step, decode got one token
+        # per chunk (0.4 tok/s next to a 180K prefill). Decode now gets as
+        # much wall time as the last chunks took. Wall time rather than time
+        # spent in decode calls, so the prefill always resumes.
+        self._prefill_resume_at: float = 0.0
         self.requests: dict[str, Request] = {}  # All requests by ID
         self.finished_req_ids: set[str] = set()  # Recently finished
 
@@ -6356,8 +6363,13 @@ class Scheduler:
             # are inserted into BatchGenerator before the decode step.
             chunked_scheduled: list[Request] = []
             chunked_rejected: list[RequestOutput] = []
-            if self.prefilling:
+            if self.prefilling and (
+                not self.running or time.perf_counter() >= self._prefill_resume_at
+            ):
+                t_prefill = time.perf_counter()
                 self._advance_chunked_prefills(chunked_scheduled, chunked_rejected)
+                now = time.perf_counter()
+                self._prefill_resume_at = now + (now - t_prefill)
 
             # Schedule waiting requests
             scheduled, rejected = self._schedule_waiting()

@@ -22,6 +22,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple, Union
 
 import mlx.core as mx
 
+from .exceptions import RequestAbortedError
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .scheduler import (
     Scheduler,
@@ -639,7 +640,13 @@ class EngineCore:
         # This avoids the waiting_consumer tracking overhead
         event = self._finished_events.get(request_id)
         if event is None:
-            raise RuntimeError(f"No event for request {request_id}")
+            # Torn down between add_request and here, e.g. the engine pool
+            # unloaded this model for another one. Retryable, not a 500.
+            raise RequestAbortedError(
+                "Request aborted before it ran: the model was unloaded. "
+                "Retry shortly.",
+                request_id=request_id,
+            )
 
         try:
             # Wait for the request to finish

@@ -649,3 +649,47 @@ class TestScheduleWaitingChunkedFork:
             assert "Memory limit" in out.error
         finally:
             tracker.clear()
+
+
+# ---------------------------------------------------------------------------
+# Decode time share while a long prefill runs
+# ---------------------------------------------------------------------------
+
+class TestDecodeTimeShare:
+    """A prefill chunk that takes seconds must not hold decode to one step
+    per chunk: decode gets as much wall time as the chunk took."""
+
+    def _run(self, steps: int, running: bool):
+        scheduler = _make_scheduler()
+        clock = [100.0]
+
+        def chunk(scheduled, rejected):
+            clock[0] += 2.0  # a 2 s prefill chunk
+            calls["prefill"] += 1
+
+        def decode():
+            clock[0] += 0.1  # a 0.1 s decode step
+            calls["decode"] += 1
+            return iter([])
+
+        calls = {"prefill": 0, "decode": 0}
+        scheduler.prefilling.append(_make_request("long", 100))
+        if running:
+            scheduler.running["short"] = _make_request("short", 10)
+        scheduler.batch_generator.next_generated.side_effect = decode
+        with patch.object(
+            scheduler, "_advance_chunked_prefills", side_effect=chunk
+        ), patch("omlx.scheduler.time.perf_counter", side_effect=lambda: clock[0]):
+            for _ in range(steps):
+                scheduler.step()
+        return calls
+
+    def test_decode_gets_equal_wall_time(self):
+        calls = self._run(steps=63, running=True)
+        # Each 2 s chunk is followed by about 2 s of 0.1 s decode steps.
+        assert calls["prefill"] == 3
+        assert calls["decode"] == 63
+
+    def test_prefill_runs_every_step_without_decoders(self):
+        calls = self._run(steps=10, running=False)
+        assert calls["prefill"] == 10
