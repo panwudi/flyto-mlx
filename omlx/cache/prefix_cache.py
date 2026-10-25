@@ -1482,9 +1482,13 @@ class BlockAwarePrefixCache(CacheManager):
                     self.paged_ssd_cache.load_block_with_metadata(block.block_hash)
                 )
                 if block_data is None:
-                    logger.debug(
-                        f"Failed to load block {block_id} from tiered cache, "
-                        f"using {valid_block_count} valid blocks"
+                    # The prefix index said this block exists, so a failed
+                    # load always cuts a cached prefix short: worth a line
+                    # in the log, with the hash to trace it.
+                    logger.warning(
+                        f"Failed to load block {block_id} "
+                        f"({block.block_hash.hex()[:16] if block.block_hash else '-'}) "
+                        f"from tiered cache, using {valid_block_count} valid blocks"
                     )
                     # Remove failed block from hash cache to prevent future false hits
                     if block.block_hash is not None:

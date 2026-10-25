@@ -168,6 +168,19 @@ class TestAdmissionGate:
         assert not ok
         assert mgr.hot_cache_size_bytes == 0
 
+    def test_keeping_unsaved_blocks_queues_them_instead(self, mgr):
+        """drop_dirty=False: the gate's first try loses no cached prefix."""
+        _save(mgr, "a")
+        enforcer = _enforcer([mgr], ceiling=1050, margin=100)
+        with patch(
+            "omlx.process_memory_enforcer.resident_usage_bytes",
+            side_effect=_resident(1000, [mgr]),
+        ):
+            ok, _, _ = enforcer.prefill_admission_ok(drop_dirty=False)
+        assert not ok
+        mgr.close()  # waits for the queued write
+        assert mgr.load_block(_key("a")) is not None
+
 
 class TestPressureBalance:
     def test_sheds_to_ssd_above_soft_and_relaxes_below(self, mgr):
@@ -229,8 +242,51 @@ class TestPrefillForwardGate:
         for name in ("a", "b", "c", "d"):
             _save(mgr, name)
         s = _gate_scheduler(mgr, cap=1100 + 2 * BLOCK, margin=100)
-        self._run(s, mgr)
+        with patch("omlx.scheduler._HOT_CACHE_GATE_PAD_BYTES", 0):
+            self._run(s, mgr)
         assert mgr.hot_cache_size_bytes == 2 * BLOCK
+
+    def test_sheds_a_pad_beyond_the_shortfall(self, mgr):
+        # Shedding exactly the shortfall leaves the re-measure on the
+        # edge of the cap, where a little phys noise refuses the chunk.
+        for name in ("a", "b", "c", "d"):
+            _save(mgr, name)
+        s = _gate_scheduler(mgr, cap=1100 + 3 * BLOCK, margin=100)
+        with patch("omlx.scheduler._HOT_CACHE_GATE_PAD_BYTES", BLOCK):
+            self._run(s, mgr)
+        assert mgr.hot_cache_size_bytes == 2 * BLOCK
+
+    def test_sheds_another_models_hot_cache(self, tmp_path):
+        # This model's hot cache is empty; the room is held by another
+        # resident model's. The enforcer's cross-model shed frees it.
+        own = PagedSSDCacheManager(
+            cache_dir=tmp_path / "own", max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=BLOCK * 10,
+        )
+        other = PagedSSDCacheManager(
+            cache_dir=tmp_path / "other", max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=BLOCK * 10,
+        )
+        try:
+            for name in ("a", "b", "c", "d"):
+                _save(other, name)
+            enforcer = _enforcer([own, other], ceiling=0, margin=0)
+            s = _gate_scheduler(own, cap=1100 + 2 * BLOCK, margin=100)
+            s._shed_all_hot_caches = enforcer.shed_hot_caches
+            read = _resident(1000, [own, other])
+            with patch("omlx.scheduler.mx") as mock_mx, patch(
+                "omlx.scheduler.get_phys_footprint", side_effect=lambda: read()[2]
+            ), patch(
+                "omlx.scheduler.resident_usage_bytes", side_effect=read
+            ), patch("omlx.scheduler._sync_and_clear_cache"), patch(
+                "omlx.scheduler._HOT_CACHE_GATE_PAD_BYTES", 0
+            ):
+                mock_mx.get_active_memory.return_value = 0
+                s._prefill_forward_gate(256, request_id="r", loop_label="test")
+            assert other.hot_cache_size_bytes == 2 * BLOCK
+        finally:
+            own.close()
+            other.close()
 
     def test_refuses_without_hot_cache(self):
         s = _gate_scheduler(None, cap=1050, margin=100)

@@ -873,6 +873,121 @@ class TestWorkingHeadroomAdmission:
         assert pool._entries["model-b"].engine is None
         mock_a.stop.assert_not_called()
 
+    class _HotCacheEnforcer:
+        """Stands in for ProcessMemoryEnforcer.shed_hot_caches."""
+
+        def __init__(self, hot):
+            self.hot = hot
+            self.calls = []
+
+        def shed_hot_caches(self, bytes_needed, *, drop_dirty, reason):
+            self.calls.append((bytes_needed, drop_dirty, reason))
+            freed = min(self.hot, bytes_needed)
+            self.hot -= freed
+            return freed, 0
+
+        def _propagate_memory_limit(self):
+            pass
+
+    def _busy_a_pool(self, pool, monkeypatch, hot):
+        """model-a resident and busy, with ``hot`` bytes of hot cache."""
+        enforcer = self._HotCacheEnforcer(hot)
+        pool._process_memory_enforcer = enforcer
+        pool._get_working_headroom = lambda: 500
+        monkeypatch.setattr(
+            "omlx.engine_pool.get_phys_footprint",
+            lambda: pool._current_model_memory + enforcer.hot,
+        )
+        mock_a = MagicMock()
+        mock_a.start = AsyncMock()
+        mock_a.stop = AsyncMock()
+        mock_a.has_active_requests.return_value = True
+        mock_b = MagicMock()
+        mock_b.start = AsyncMock()
+        mock_b.has_active_requests.return_value = False
+        return enforcer, mock_a, mock_b
+
+    @pytest.mark.asyncio
+    async def test_hot_cache_shed_makes_room_for_load(
+        self, headroom_pool, monkeypatch
+    ):
+        """The busy model's hot cache is what keeps the second model out
+        (1000 weights + 1000 hot + 1000 + 500 headroom > 3000): shed it and
+        load, instead of returning 503 until the busy model goes idle."""
+        pool = headroom_pool
+        enforcer, mock_a, mock_b = self._busy_a_pool(pool, monkeypatch, 1000)
+
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=self._engine_factory(mock_a, mock_b),
+        ):
+            enforcer.hot = 0  # model-a loads alone first
+            await pool.get_engine("model-a")
+            enforcer.hot = 1000
+            await pool.get_engine("model-b")
+
+        assert len(enforcer.calls) == 1
+        _, drop_dirty, reason = enforcer.calls[0]
+        assert not drop_dirty and reason == "load model-b"
+        assert pool._entries["model-b"].engine is not None
+        mock_a.stop.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_load_still_refused_when_shed_is_not_enough(
+        self, headroom_pool, monkeypatch
+    ):
+        pool = headroom_pool
+        enforcer, mock_a, mock_b = self._busy_a_pool(pool, monkeypatch, 0)
+
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=self._engine_factory(mock_a, mock_b),
+        ):
+            await pool.get_engine("model-a")
+            pool._get_working_headroom = lambda: 1500  # 1000+1000+1500 > 3000
+            enforcer.hot = 200
+            with pytest.raises(InsufficientMemoryError):
+                await pool.get_engine("model-b")
+
+        # Kept unsaved blocks first, then dropped them; did not spin.
+        assert [c[1] for c in enforcer.calls] == [False, True]
+        assert enforcer.hot == 0
+        assert pool._entries["model-b"].engine is None
+
+    @pytest.mark.asyncio
+    async def test_load_waits_for_queued_writes_instead_of_dropping(
+        self, headroom_pool, monkeypatch
+    ):
+        """Unsaved hot cache blocks are queued for SSD and the load waits
+        for the writer to free them; dropping them would cost the busy
+        session a long re-prefill (m5max 2026-10-24 02:01)."""
+        pool = headroom_pool
+        enforcer, mock_a, mock_b = self._busy_a_pool(pool, monkeypatch, 0)
+
+        def shed(bytes_needed, *, drop_dirty, reason):
+            enforcer.calls.append((bytes_needed, drop_dirty, reason))
+            # All dirty: nothing freed now, all of it queued for writing.
+            return 0, enforcer.hot
+
+        enforcer.shed_hot_caches = shed
+        monkeypatch.setattr("omlx.engine_pool._HOT_CACHE_LOAD_POLL_S", 0.01)
+        real_sleep = asyncio.sleep
+
+        async def writer_progress(delay):
+            enforcer.hot = max(0, enforcer.hot - 400)  # the writer catches up
+            await real_sleep(0)
+
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=self._engine_factory(mock_a, mock_b),
+        ), patch("omlx.engine_pool.asyncio.sleep", writer_progress):
+            await pool.get_engine("model-a")
+            enforcer.hot = 1000
+            await pool.get_engine("model-b")
+
+        assert [c[1] for c in enforcer.calls] == [False]
+        assert pool._entries["model-b"].engine is not None
+
     @pytest.mark.asyncio
     async def test_single_model_alone_loads_despite_thin_headroom(
         self, headroom_pool

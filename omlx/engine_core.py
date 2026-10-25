@@ -392,6 +392,12 @@ class EngineCore:
         Returns:
             The request ID
         """
+        # aclose() shuts the scheduler down off the event loop, so a handler
+        # holding this engine can get here mid-unload. The engine loop is
+        # gone; a request queued now would never finish.
+        if getattr(self, "_closed", False):
+            raise RuntimeError("Engine is unloading; retry the request")
+
         if request_id is None:
             request_id = str(uuid.uuid4())
 
@@ -770,7 +776,26 @@ class EngineCore:
         """
         if self._closed:
             return
+        self._shutdown_scheduler()
+        self._finish_close()
 
+    async def aclose(self) -> None:
+        """close() without blocking the event loop.
+
+        Scheduler shutdown waits for in-flight cache stores and for the SSD
+        writer to flush the hot cache, which took 11s on m5max when a model
+        was evicted to make room for another. Run on the event loop, that
+        stalled every other model's streams and the health check for the
+        whole time. The collectors hold asyncio events, so they are still
+        cleared on the loop.
+        """
+        if self._closed:
+            return
+        await asyncio.to_thread(self._shutdown_scheduler)
+        self._finish_close()
+
+    def _shutdown_scheduler(self) -> None:
+        """The blocking half of close(); safe to run off the event loop."""
         # Release model ownership BEFORE setting _closed
         # (_release_model checks not self._closed)
         if self._owns_model:
@@ -825,6 +850,7 @@ class EngineCore:
                 _immortal_mlx_streams.append(self._mlx_stream)
             self._mlx_executor = None
 
+    def _finish_close(self) -> None:
         # Clear output collectors
         for collector in self._output_collectors.values():
             collector.clear()

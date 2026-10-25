@@ -1608,11 +1608,11 @@ class TestStopSafety:
 
     @pytest.mark.asyncio
     async def test_stop_completes_when_close_raises(self):
-        """stop() should complete even if engine.close() raises an exception."""
+        """stop() should complete even if engine.aclose() raises an exception."""
         engine = _make_loaded_engine()
 
         mock_inner_engine = MagicMock()
-        mock_inner_engine.close.side_effect = RuntimeError("close failed")
+        mock_inner_engine.aclose = AsyncMock(side_effect=RuntimeError("close failed"))
         engine._engine.stop = AsyncMock()
         engine._engine.engine = mock_inner_engine
 
@@ -1637,15 +1637,16 @@ class TestStopSafety:
 
     @pytest.mark.asyncio
     async def test_stop_calls_close_on_success(self):
-        """stop() calls engine.close() when no exception occurs."""
+        """stop() awaits engine.aclose() when no exception occurs."""
         engine = _make_loaded_engine()
         mock_inner_engine = MagicMock()
+        mock_inner_engine.aclose = AsyncMock()
         engine._engine.stop = AsyncMock()
         engine._engine.engine = mock_inner_engine
 
         await engine.stop()
 
-        mock_inner_engine.close.assert_called_once()
+        mock_inner_engine.aclose.assert_awaited_once()
 
 
 class TestFilterVLMLoadWeights:

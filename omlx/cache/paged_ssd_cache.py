@@ -39,6 +39,10 @@ from .stats import PagedSSDCacheStats
 
 logger = logging.getLogger(__name__)
 
+# How stale a block file's mtime may get before a hit writes the access time
+# back to it. Bounds the syscalls to one per block per interval.
+_ACCESS_PERSIST_INTERVAL_S = 60.0
+
 # Check for MLX
 try:
     import mlx.core as mx
@@ -504,11 +508,23 @@ class PagedSSDCacheIndex:
         Args:
             block_hash: Block content hash.
         """
+        persist_path = None
         with self._lock:
             if block_hash in self._index:
-                self._index[block_hash].touch()
+                meta = self._index[block_hash]
+                if time.time() - meta.last_access >= _ACCESS_PERSIST_INTERVAL_S:
+                    persist_path = meta.file_path
+                meta.touch()
                 self._lru.move_to_end(block_hash)
-                self._lru[block_hash] = self._index[block_hash].last_access
+                self._lru[block_hash] = meta.last_access
+        if persist_path is not None:
+            # The file mtime is the access time a later scan restores (a
+            # model reload rebuilds the index). Without this, a block hit on
+            # every turn since it was written looks as old as its write time.
+            try:
+                os.utime(persist_path)
+            except OSError:
+                pass
 
     def get_lru_entries(self, count: int) -> list[PagedSSDBlockMetadata]:
         """
@@ -686,6 +702,12 @@ class PagedSSDCacheManager(CacheManager):
         # Bytes of evicted hot cache entries still waiting in the write
         # queue: they left the hot cache but stay resident until written.
         self._pending_eviction_bytes: dict[bytes, int] = {}
+        # Evicted hot cache entries until their file is written. A block
+        # is in the index from the moment it is queued, so a read in that
+        # window must be served from here: treating the absent file as
+        # lost would drop the index entry, and the writer would then
+        # delete the file it just wrote.
+        self._pending_entries: dict[bytes, dict] = {}
         self._writer_shutdown = threading.Event()
         # Writer thread is only needed when writing to SSD.
         self._writer_thread = None
@@ -736,32 +758,67 @@ class PagedSSDCacheManager(CacheManager):
     def _hot_cache_put(self, block_hash: bytes, entry: dict) -> None:
         """Add entry to hot cache, evicting LRU entries if capacity exceeded.
 
-        Evicted entries are flushed to SSD via the background writer thread.
+        An evicted entry already on SSD (indexed, or queued for its write) is
+        just dropped from memory. An unsaved one is queued for the background
+        writer. When the write queue has no room the unsaved entry stays in
+        the hot cache, over the limit, instead of being lost; a later put or
+        shed retries it. Queueing every evicted block used to rewrite blocks
+        already on SSD, fill the queue, and then drop blocks, removing even
+        on-disk ones from the index (2026-10-24 10:00: a 220K-token session
+        lost 64 of 108 blocks and re-prefilled 132K tokens).
         """
         entry_size = self._hot_cache_entry_size(entry)
-        evicted_entries: list = []
+        to_write: list = []
         with self._hot_cache_lock:
             # Remove old entry if updating
             if block_hash in self._hot_cache:
                 old = self._hot_cache.pop(block_hash)
                 self._hot_cache_total_bytes -= self._hot_cache_entry_size(old)
 
-            # Evict LRU entries until we have room
-            while (
-                self._hot_cache_total_bytes + entry_size > self._hot_cache_limit_bytes
-                and self._hot_cache
-            ):
-                evicted_hash, evicted = self._hot_cache.popitem(last=False)
-                self._hot_cache_total_bytes -= self._hot_cache_entry_size(evicted)
+            room = self._write_queue.maxsize - self._write_queue.qsize()
+            can_write = not self._hot_cache_only
+            remaining = self._hot_cache_total_bytes
+            victims: list = []
+            for evicted_hash, evicted in self._hot_cache.items():
+                if remaining + entry_size <= self._hot_cache_limit_bytes:
+                    break
+                unsaved = (
+                    can_write
+                    and evicted.get("block_metadata") is not None
+                    and bool(evicted.get("tensors_raw"))
+                    and not self._index.contains(evicted_hash)
+                )
+                if unsaved:
+                    if room <= 0:
+                        continue
+                    room -= 1
+                    to_write.append((evicted_hash, evicted))
+                victims.append(evicted_hash)
+                remaining -= self._hot_cache_entry_size(evicted)
+            for evicted_hash in victims:
+                del self._hot_cache[evicted_hash]
                 self._stats["hot_cache_evictions"] += 1
-                evicted_entries.append((evicted_hash, evicted))
+            self._hot_cache_total_bytes = remaining
 
             self._hot_cache[block_hash] = entry
             self._hot_cache_total_bytes += entry_size
 
         # Flush evicted entries to SSD outside the hot cache lock
-        for evicted_hash, evicted in evicted_entries:
-            self._enqueue_ssd_write(evicted_hash, evicted)
+        for evicted_hash, evicted in to_write:
+            if not self._enqueue_ssd_write(evicted_hash, evicted):
+                self._hot_cache_keep(evicted_hash, evicted)
+
+    def _hot_cache_keep(self, block_hash: bytes, entry: dict) -> None:
+        """Put back an unsaved entry that could not be queued for its write.
+
+        It goes in as the oldest entry, so the next eviction tries it first.
+        """
+        with self._hot_cache_lock:
+            if block_hash in self._hot_cache:
+                return
+            self._hot_cache[block_hash] = entry
+            self._hot_cache.move_to_end(block_hash, last=False)
+            self._hot_cache_total_bytes += self._hot_cache_entry_size(entry)
 
     def _enqueue_ssd_write(
         self, block_hash: bytes, entry: dict, *, blocking: bool = False,
@@ -787,13 +844,18 @@ class PagedSSDCacheManager(CacheManager):
             return False
         metadata = entry["file_metadata"]
 
+        # Readable before the index points at the not-yet-written file.
+        with self._pending_write_hashes_lock:
+            self._pending_write_hashes.add(block_hash)
+            self._pending_entries[block_hash] = entry
+
         # Add to SSD index now that block is being written to SSD
+        added = False
         if not self._index.contains(block_hash):
             self._enforce_size_limit_for_new_block()
             self._index.add(blk_meta)
+            added = True
 
-        with self._pending_write_hashes_lock:
-            self._pending_write_hashes.add(block_hash)
         try:
             item = (block_hash, tensors_raw, metadata, file_path)
             if blocking:
@@ -811,12 +873,16 @@ class PagedSSDCacheManager(CacheManager):
             return True
         except queue.Full:
             logger.warning(
-                f"SSD write queue full, dropping evicted block "
+                f"SSD write queue full, could not queue block "
                 f"{block_hash.hex()[:16]}"
             )
-            self._index.remove(block_hash)
+            # Only undo our own index entry: one that was there before
+            # points at a file already on SSD (or a write already queued).
+            if added:
+                self._index.remove(block_hash)
             with self._pending_write_hashes_lock:
                 self._pending_write_hashes.discard(block_hash)
+                self._pending_entries.pop(block_hash, None)
             return False
 
     def _hot_cache_get(self, block_hash: bytes) -> dict | None:
@@ -826,6 +892,14 @@ class PagedSSDCacheManager(CacheManager):
                 self._hot_cache.move_to_end(block_hash)
                 return self._hot_cache[block_hash]
             return None
+
+    def _in_memory_entry(self, block_hash: bytes) -> dict | None:
+        """Hot cache entry, or an evicted one still waiting to be written."""
+        entry = self._hot_cache_get(block_hash)
+        if entry is not None:
+            return entry
+        with self._pending_write_hashes_lock:
+            return self._pending_entries.get(block_hash)
 
     def _hot_cache_remove(self, block_hash: bytes) -> None:
         """Remove entry from hot cache if present."""
@@ -901,10 +975,10 @@ class PagedSSDCacheManager(CacheManager):
             )
         for block_hash, entry in to_write:
             if not self._enqueue_ssd_write(block_hash, entry):
-                # The queue filled up meanwhile; the entry was dropped.
-                size = self._hot_cache_entry_size(entry)
-                queued -= size
-                freed += size
+                # The queue filled up meanwhile; keep the entry rather than
+                # lose it.
+                queued -= self._hot_cache_entry_size(entry)
+                self._hot_cache_keep(block_hash, entry)
         return freed, queued
 
     def relax_hot_cache_limit(self, step_bytes: int) -> int:
@@ -987,6 +1061,7 @@ class PagedSSDCacheManager(CacheManager):
         indexed = 0
         errors = 0
 
+        found: list[PagedSSDBlockMetadata] = []
         for subdir in self.SUBDIR_CHARS:
             subdir_path = self._cache_dir / subdir
             if not subdir_path.exists():
@@ -997,11 +1072,19 @@ class PagedSSDCacheManager(CacheManager):
                 try:
                     metadata = self._read_file_metadata(file_path)
                     if metadata:
-                        self._index.add(metadata)
-                        indexed += 1
+                        found.append(metadata)
                 except Exception as e:
                     logger.warning(f"Failed to read {file_path}: {e}")
                     errors += 1
+
+        # The LRU is insertion-ordered, so add oldest first. In directory
+        # order, eviction after a rescan removed effectively random blocks,
+        # often the head of a live session's chain, which loses every block
+        # after it.
+        found.sort(key=lambda m: m.last_access)
+        for metadata in found:
+            self._index.add(metadata)
+            indexed += 1
 
         logger.info(
             f"SSD cache scan complete: scanned={scanned}, indexed={indexed}, "
@@ -1179,6 +1262,7 @@ class PagedSSDCacheManager(CacheManager):
                 with self._pending_write_hashes_lock:
                     self._pending_write_hashes.discard(block_hash)
                     self._pending_eviction_bytes.pop(block_hash, None)
+                    self._pending_entries.pop(block_hash, None)
                 # Drop the references to the written bytes now: otherwise
                 # they stay resident while the loop idles in get().
                 item = tensors_raw = None
@@ -1727,7 +1811,7 @@ class PagedSSDCacheManager(CacheManager):
             return None
 
         # Check hot cache first (in-memory, no I/O)
-        entry = self._hot_cache_get(block_hash)
+        entry = self._in_memory_entry(block_hash)
         if entry is not None:
             # Entries from _promote_to_hot_cache() store mx.array objects directly
             # (safe — they come from SSD loads, not active inference).
@@ -1859,7 +1943,7 @@ class PagedSSDCacheManager(CacheManager):
             return None, None
 
         # Check hot cache first (in-memory, no I/O)
-        entry = self._hot_cache_get(block_hash)
+        entry = self._in_memory_entry(block_hash)
         if entry is not None:
             blk_meta = entry["block_metadata"]
             arrays = entry.get("arrays") or self._arrays_from_tensors_raw(

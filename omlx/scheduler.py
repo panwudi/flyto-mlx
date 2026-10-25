@@ -285,6 +285,11 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# The prefill gate sheds this much hot cache beyond the shortfall, so the
+# re-measure is not tripped by a few hundred MB of phys noise or by another
+# model's prefill growing meanwhile.
+_HOT_CACHE_GATE_PAD_BYTES = 1 * 1024**3
+
 
 class _PrefillAbortedError(Exception):
     """Raised when prefill is interrupted by a pending abort."""
@@ -909,6 +914,9 @@ class Scheduler:
         # worst-case single-step current jump on m5max (see MemorySettings
         # .prefill_transient_margin_gb). 0 until the enforcer propagates it.
         self._prefill_transient_margin_bytes: int = 0
+        # Cross-model hot cache shed (ProcessMemoryEnforcer.shed_hot_caches),
+        # set by the enforcer; None falls back to this model's own cache.
+        self._shed_all_hot_caches = None
         # One-shot guard for _log_prefill_gate_state_once (loud resolved-state
         # log so a mis-propagated margin can't ship silently inert again).
         self._prefill_gate_state_logged: bool = False
@@ -1859,6 +1867,67 @@ class Scheduler:
                 f"cache layers to {bits}-bit{skip_msg}"
             )
 
+    def _shed_hot_caches_for_prefill(self, shortfall: int) -> int:
+        """Shed hot cache so a prefill chunk fits; returns bytes freed now.
+
+        Uses the enforcer's cross-model shed when it is wired up: the room
+        may be held by another resident model's hot cache, not this one's.
+
+        Unlike the HTTP admission gate and the load path, this drops blocks
+        that are not on SSD yet without waiting: it runs on the scheduler
+        thread mid-prefill, where a wait would stall every decode, and the
+        alternative is failing a prefill already under way. Callers reach it
+        only after the MLX free pool has been returned.
+        """
+        if shortfall <= 0:
+            return 0
+        bytes_needed = shortfall + _HOT_CACHE_GATE_PAD_BYTES
+        shed_all = getattr(self, "_shed_all_hot_caches", None)
+        if shed_all is not None:
+            try:
+                freed, _ = shed_all(
+                    bytes_needed, drop_dirty=True, reason="prefill gate"
+                )
+                return freed
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[memgate] cross-model hot cache shed failed: %s", e)
+        ssd = getattr(self, "paged_ssd_cache_manager", None)
+        if ssd is None:
+            return 0
+        freed, _ = ssd.shed_hot_cache(bytes_needed, drop_dirty=True)
+        return freed
+
+    def _still_over_ceiling_after_reclaim(
+        self, current: int, *, request_id: str, loop_label: str
+    ) -> bool:
+        """Check a post-chunk reading over the ceiling against real usage.
+
+        The reading counts MLX's free buffer pool, which is reclaimable
+        (production: 43.7GB of a 107.8GB reading). Return the pool, then
+        shed hot cache if needed; only usage left after that fails the
+        prefill.
+        """
+        hard = self._memory_hard_limit_bytes
+        _sync_and_clear_cache(self._stream)
+        resident, _, _, cache = resident_usage_bytes()
+        if resident > hard:
+            if self._shed_hot_caches_for_prefill(resident - hard):
+                resident, _, _, cache = resident_usage_bytes()
+        if resident > hard:
+            return True
+        logger.info(
+            "[memcheck:%s] rid=%s reading %.3fGB was over the ceiling; after "
+            "reclaim resident %.3fGB (mlx free pool %.3fGB) fits %.3fGB, "
+            "continuing",
+            loop_label,
+            request_id,
+            current / 1024**3,
+            resident / 1024**3,
+            cache / 1024**3,
+            hard / 1024**3,
+        )
+        return False
+
     def _prefill_forward_gate(
         self,
         chunk_tokens: int,
@@ -1965,33 +2034,30 @@ class Scheduler:
                     self._memory_hard_limit_bytes / 1024**3,
                 )
                 return
-            # Last resort before refusing: this model's hot cache blocks,
-            # including ones not yet on SSD. Losing a cached prefix costs a
-            # recompute later; a refusal fails the request now.
-            ssd = getattr(self, "paged_ssd_cache_manager", None)
-            if ssd is not None:
-                freed, _ = ssd.shed_hot_cache(
-                    resident + predicted_transient - self._memory_hard_limit_bytes,
-                    drop_dirty=True,
-                )
-                if freed:
-                    resident, active, phys, cache = resident_usage_bytes()
-                    if (
-                        resident + predicted_transient
-                        <= self._memory_hard_limit_bytes
-                    ):
-                        logger.info(
-                            "[memgate:%s] rid=%s shed %.3fGB of hot cache; "
-                            "resident %.3fGB + transient %.3fGB now fits "
-                            "cap %.3fGB, proceeding",
-                            loop_label,
-                            request_id,
-                            freed / 1024**3,
-                            resident / 1024**3,
-                            predicted_transient / 1024**3,
-                            self._memory_hard_limit_bytes / 1024**3,
-                        )
-                        return
+            # Last resort before refusing: hot cache blocks, including ones
+            # not yet on SSD. Losing a cached prefix costs a recompute later;
+            # a refusal fails the request now.
+            freed = self._shed_hot_caches_for_prefill(
+                resident + predicted_transient - self._memory_hard_limit_bytes
+            )
+            if freed:
+                resident, active, phys, cache = resident_usage_bytes()
+                if (
+                    resident + predicted_transient
+                    <= self._memory_hard_limit_bytes
+                ):
+                    logger.info(
+                        "[memgate:%s] rid=%s shed %.3fGB of hot cache; "
+                        "resident %.3fGB + transient %.3fGB now fits "
+                        "cap %.3fGB, proceeding",
+                        loop_label,
+                        request_id,
+                        freed / 1024**3,
+                        resident / 1024**3,
+                        predicted_transient / 1024**3,
+                        self._memory_hard_limit_bytes / 1024**3,
+                    )
+                    return
             current = resident
             predicted_peak = current + predicted_transient
             logger.warning(
@@ -2287,6 +2353,11 @@ class Scheduler:
                 if (
                     self._memory_hard_limit_bytes > 0
                     and current > self._memory_hard_limit_bytes
+                    and self._still_over_ceiling_after_reclaim(
+                        current,
+                        request_id=request.request_id,
+                        loop_label="external",
+                    )
                 ):
                     logger.warning(
                         f"Prefill force-stopped at {processed_tokens} "
@@ -2641,6 +2712,11 @@ class Scheduler:
             if (
                 self._memory_hard_limit_bytes > 0
                 and current > self._memory_hard_limit_bytes
+                and self._still_over_ceiling_after_reclaim(
+                    current,
+                    request_id=state.request.request_id,
+                    loop_label="chunked_step",
+                )
             ):
                 raise RuntimeError(
                     f"Memory limit exceeded during chunked prefill at "
@@ -4927,8 +5003,28 @@ class Scheduler:
         so that the engine loop keeps calling step() until the clear fires.
         Without this, an idle server would never reach the target step and
         stale buffers would accumulate indefinitely.
+
+        Also True once the oldest deferred removal's cache store is done:
+        a finished request keeps its KV in the batch generator until
+        _drain_pending_async_removes runs in a step. When it was the last
+        request, nothing else would trigger that step, so the KV stayed
+        resident while idle, and the admission gate then refused every new
+        request (production 2026-10-23: 21GB held, 25 minutes of 503s).
         """
-        return bool(self.waiting or self.prefilling or self.running or self._deferred_clear_at is not None)
+        return bool(
+            self.waiting
+            or self.prefilling
+            or self.running
+            or self._deferred_clear_at is not None
+            or self._pending_async_remove_ready()
+        )
+
+    def _pending_async_remove_ready(self) -> bool:
+        """A deferred removal whose store worker has finished."""
+        if not self._pending_async_removes:
+            return False
+        future = self._pending_async_removes[0][2]
+        return future is None or future.done()
 
     def fail_all_requests(self) -> list[str]:
         """Remove all running and waiting requests after unrecoverable error.

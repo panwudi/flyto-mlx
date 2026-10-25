@@ -1814,6 +1814,33 @@ class TestCacheCorruptionRecovery:
         scheduler.batch_generator.remove.assert_called_once_with([3])
         assert 3 not in scheduler.uid_to_request_id
         assert "req-done" not in scheduler.request_id_to_uid
+
+    def test_idle_engine_still_steps_to_release_the_last_request(
+        self, mock_model, mock_tokenizer
+    ):
+        """The last request's KV stays in the batch generator until a step
+        drains its deferred removal. With nothing else queued the engine
+        loop must still step, or the KV stays resident while idle and the
+        admission gate refuses every new request."""
+        import concurrent.futures
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        future = concurrent.futures.Future()
+        scheduler.request_id_to_uid["req-last"] = 5
+        scheduler.uid_to_request_id[5] = "req-last"
+        scheduler._pending_async_removes.append((5, "req-last", future))
+        scheduler.batch_generator = MagicMock()
+
+        # Store worker still writing: no busy stepping yet.
+        assert scheduler.has_requests() is False
+        future.set_result(None)
+        assert scheduler.has_requests() is True
+
+        with patch("omlx.scheduler._safe_sync_stream"):
+            scheduler._drain_pending_async_removes()
+
+        scheduler.batch_generator.remove.assert_called_once_with([5])
+        assert scheduler.has_requests() is False
     def _make_scheduler(self, mock_model, mock_tokenizer):
         """Create a Scheduler with requests in running state."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)

@@ -948,7 +948,17 @@ def _suggest_endpoint_for_engine(engine: object) -> str:
     return "Use the model's dedicated endpoint (see /v1/models)."
 
 
-def _memory_admission_gate() -> None:
+# How long the admission gate waits for memory to come back on its own before
+# it drops hot cache blocks that are not on SSD yet. The usual case is the
+# previous turn of the same session: its KV is released on the scheduler's next
+# step, about a second after it finished. Dropping instead lost a 190K
+# session's unsaved blocks on m5max (2026-10-24 02:01, 19/92 blocks left, a
+# 22-minute re-prefill).
+_ADMISSION_SETTLE_S = 3.0
+_ADMISSION_POLL_S = 0.25
+
+
+async def _memory_admission_gate() -> None:
     """Pre-stream memory admission gate for generation requests.
 
     Runs AFTER the engine is resolved (even on a pool cache hit) and BEFORE the
@@ -968,7 +978,15 @@ def _memory_admission_gate() -> None:
     enforcer = getattr(pool, "_process_memory_enforcer", None)
     if enforcer is None:
         return
-    ok, current, ceiling = enforcer.prefill_admission_ok()
+    ok, current, ceiling = enforcer.prefill_admission_ok(drop_dirty=False)
+    if not ok:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _ADMISSION_SETTLE_S
+        while not ok and loop.time() < deadline:
+            await asyncio.sleep(_ADMISSION_POLL_S)
+            ok, current, ceiling = enforcer.prefill_admission_ok(shed=False)
+    if not ok:
+        ok, current, ceiling = enforcer.prefill_admission_ok(drop_dirty=True)
     if ok:
         return
     logger.warning(
@@ -1006,7 +1024,7 @@ async def get_engine_for_model(model: str | None = None) -> BaseEngine:
     # Pre-stream memory admission: reject over-budget requests with 503 BEFORE
     # any StreamingResponse opens (all LLM chat/completions/responses endpoints
     # funnel through here). Runs even on a pool cache hit.
-    _memory_admission_gate()
+    await _memory_admission_gate()
     return engine
 
 

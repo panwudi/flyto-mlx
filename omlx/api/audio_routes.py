@@ -1116,6 +1116,16 @@ async def create_transcription(
     tripass_R_path: Optional[str] = None
     stereo_audio_for_diarize = None
     stereo_sr_for_diarize = None
+    # Engines this request uses stay held until it ends, so the pool does
+    # not evict one between two of its calls.
+    held_engines: list = []
+
+    def _hold(e) -> None:
+        if not any(h is e for h in held_engines):
+            e.hold()
+            held_engines.append(e)
+
+    _hold(engine)
     try:
         content = await _read_upload(file)
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
@@ -1402,6 +1412,7 @@ async def create_transcription(
                 aligner_engine = await pool.get_engine(aligner_resolved)
                 if not isinstance(aligner_engine, STTEngine):
                     return
+                _hold(aligner_engine)
                 _should_chunk = _align_should_chunk
                 _window_s = _align_window_s
                 if long_audio_managed:
@@ -1796,6 +1807,8 @@ async def create_transcription(
                     os.unlink(_extra)
                 except OSError:
                     pass
+        for _held in held_engines:
+            _held.release()
 
     # Energy-based diarization: annotate each word with a speaker label
     # based on which stereo channel dominates its time window. We do this
