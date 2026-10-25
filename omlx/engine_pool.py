@@ -47,6 +47,15 @@ from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
 
+# Shed this much hot cache beyond the shortfall when a load needs room, so
+# the re-measure is not tripped by phys noise of a few hundred MB.
+_HOT_CACHE_LOAD_PAD_BYTES = 1 * 1024**3
+
+# How long a load waits for hot cache blocks queued for SSD to be written (and
+# their memory freed) before it drops blocks that are not on SSD yet.
+_HOT_CACHE_LOAD_SETTLE_S = 3.0
+_HOT_CACHE_LOAD_POLL_S = 0.25
+
 
 @dataclass
 class EngineEntry:
@@ -345,6 +354,41 @@ class EnginePool:
         except Exception:  # noqa: BLE001
             return 0
 
+    def _shed_hot_caches_for_load(
+        self, bytes_needed: int, model_id: str, *, drop_dirty: bool
+    ) -> tuple[int, int]:
+        """Free hot cache memory so a model load can fit.
+
+        The hot caches of resident models are process memory and count in
+        ``current``, but nothing else gives them back while their model is
+        busy. With ``drop_dirty`` False, blocks not yet on SSD are queued for
+        writing and free their memory once written; with True they are
+        dropped, which costs the session holding them a re-prefill.
+        Returns ``(freed_now, queued_for_ssd)`` in bytes.
+        """
+        shed = getattr(self._process_memory_enforcer, "shed_hot_caches", None)
+        if shed is None or bytes_needed <= 0:
+            return 0, 0
+        try:
+            return shed(
+                bytes_needed + _HOT_CACHE_LOAD_PAD_BYTES,
+                drop_dirty=drop_dirty,
+                reason=f"load {model_id}",
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Hot cache shed for loading {model_id} failed: {e}")
+            return 0, 0
+
+    async def _wait_for_room(self, needed: int, ceiling: int) -> None:
+        """Wait a bounded time for ``current + needed`` to fit the ceiling."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _HOT_CACHE_LOAD_SETTLE_S
+        while loop.time() < deadline:
+            current = max(mx.get_active_memory(), get_phys_footprint())
+            if current + needed <= ceiling:
+                return
+            await asyncio.sleep(_HOT_CACHE_LOAD_POLL_S)
+
     async def get_engine(
         self, model_id: str, force_lm: bool = False,
     ) -> BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | STSEngine | TTSEngine:
@@ -413,6 +457,7 @@ class EnginePool:
                 # HTTP 200"). headroom is 0 for non-generation engines and when
                 # the enforcer callback is not wired.
                 headroom = self._working_headroom_for(entry)
+                shed_stage = 0
                 while True:
                     current = max(mx.get_active_memory(), get_phys_footprint())
                     projected = current + entry.estimated_size + headroom
@@ -437,6 +482,24 @@ class EnginePool:
                         raise ModelTooLargeError(
                             model_id, entry.estimated_size, ceiling
                         )
+
+                    # Nothing evictable, but the hot caches of the resident
+                    # (busy) models may hold enough to make room. First
+                    # without losing a cached prefix (queued blocks free their
+                    # memory once written), then, if that is not enough in
+                    # time, by dropping blocks that are not on SSD yet.
+                    if shed_stage < 2:
+                        drop_dirty = shed_stage == 1
+                        shed_stage += 1
+                        freed, queued = self._shed_hot_caches_for_load(
+                            projected - ceiling, model_id, drop_dirty=drop_dirty
+                        )
+                        if queued:
+                            await self._wait_for_room(
+                                entry.estimated_size + headroom, ceiling
+                            )
+                        if freed or queued or not drop_dirty:
+                            continue
 
                     # Decide by scanning entries whether this model would be the
                     # ONLY resident model -- NOT by guessing from phys (which

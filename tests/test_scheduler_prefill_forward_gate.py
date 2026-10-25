@@ -459,3 +459,48 @@ class TestGateStateLog:
             if "prefill forward gate ACTIVE" in r.getMessage()
         ][0]
         assert "DISABLED" in rec.getMessage()
+
+
+class TestPostChunkCheckReclaimsFirst:
+    """The post-chunk check reads max(active, phys), which counts MLX's free
+    buffer pool. Production failed two Claude Code prefills on a 107.8GB
+    reading that held 43.7GB of pool; the pool must be returned (and hot
+    cache shed) before the reading fails the request."""
+
+    def _step(self, resident_gb, freed=0):
+        s, model = _integration_scheduler(
+            hard_gb=107.5, estimate_bytes=1 * GB, margin_gb=2.0
+        )
+        s._memory_limit_bytes = int(91 * GB)
+        state = _prefill_state(n_tokens=8)
+        high = int(107.8 * GB)
+        resident = int(resident_gb * GB)
+        shed = MagicMock(return_value=freed)
+        s._shed_hot_caches_for_prefill = shed
+        with patch.object(s, "_prefill_forward_gate"), patch(
+            "omlx.scheduler.mx.get_active_memory", return_value=high
+        ), patch("omlx.scheduler.get_phys_footprint", return_value=high), patch(
+            "omlx.scheduler.resident_usage_bytes",
+            side_effect=[
+                (resident, resident, high, high - resident),
+                (resident - freed, resident - freed, high, 0),
+            ],
+        ), patch("omlx.scheduler.mx.eval"), patch(
+            "omlx.scheduler._sync_and_clear_cache"
+        ), patch("omlx.scheduler.get_prefill_tracker"):
+            done = s._step_prefill_chunk(state)
+        return done, shed
+
+    def test_reading_inflated_by_the_free_pool_does_not_fail(self):
+        done, shed = self._step(resident_gb=64.1)
+        assert done is True
+        shed.assert_not_called()
+
+    def test_hot_cache_shed_rescues_a_real_overage(self):
+        done, shed = self._step(resident_gb=108.5, freed=int(3 * GB))
+        assert done is True
+        shed.assert_called_once()
+
+    def test_still_fails_when_nothing_can_be_reclaimed(self):
+        with pytest.raises(RuntimeError, match="Memory limit exceeded"):
+            self._step(resident_gb=108.5)

@@ -275,11 +275,30 @@ class BaseNonStreamingEngine(ABC):
         self._active_count = 0
         self._active_lock = threading.Lock()
         self._activities: Dict[str, Dict[str, Any]] = {}
+        self._hold_count = 0
 
     def has_active_requests(self) -> bool:
         """Check if the engine has active in-flight requests."""
         with self._active_lock:
-            return self._active_count > 0
+            return self._active_count > 0 or self._hold_count > 0
+
+    def hold(self) -> None:
+        """Keep the engine counted as busy until ``release()``.
+
+        A request that makes several engine calls in a row (long audio
+        windows, repeat-guard re-runs, alignment) is idle between calls;
+        without a hold the pool may evict the engine there and the next
+        call fails with "Engine not started".
+        """
+        with self._active_lock:
+            self._hold_count += 1
+
+    def release(self) -> None:
+        """Undo one ``hold()``."""
+        with self._active_lock:
+            if self._hold_count <= 0:
+                raise RuntimeError("release() without a matching hold()")
+            self._hold_count -= 1
 
     _ACTIVITY_RESERVED_KEYS = {
         "request_id",

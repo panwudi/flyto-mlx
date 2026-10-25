@@ -488,6 +488,53 @@ class TestSTTEndpointErrors:
         assert response.status_code >= 500
 
 
+class TestEngineHeldForRequest:
+    """The engine stays busy for the whole request, not only inside each
+    transcribe call, so the pool cannot evict it between two calls."""
+
+    @staticmethod
+    def _engine(fail: bool = False):
+        from omlx.engine.stt import STTEngine
+
+        engine = STTEngine("whisper-tiny")
+        busy_during_call = []
+
+        async def transcribe(path, **kwargs):
+            busy_during_call.append(engine.has_active_requests())
+            if fail:
+                raise RuntimeError("model failed")
+            return {"text": "hi", "language": "en", "duration": 0.1, "segments": []}
+
+        engine.transcribe = transcribe
+        return engine, busy_during_call
+
+    def test_held_during_request_and_released_after(self, server_audio_client):
+        client, mock_pool = server_audio_client
+        engine, busy = self._engine()
+        mock_pool.get_engine.return_value = engine
+        response = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+            data={"model": "whisper-tiny"},
+        )
+        assert response.status_code == 200
+        assert busy == [True]
+        assert not engine.has_active_requests()
+
+    def test_released_when_the_request_fails(self, server_audio_client):
+        client, mock_pool = server_audio_client
+        engine, busy = self._engine(fail=True)
+        mock_pool.get_engine.return_value = engine
+        response = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+            data={"model": "whisper-tiny"},
+        )
+        assert response.status_code >= 500
+        assert busy == [True]
+        assert not engine.has_active_requests()
+
+
 # ---------------------------------------------------------------------------
 # TestVideoContainerRemap
 # ---------------------------------------------------------------------------

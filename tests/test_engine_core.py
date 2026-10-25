@@ -1237,3 +1237,45 @@ class TestGenerateTornDown:
         resp = await server.request_aborted_handler(req, exc.value)
         assert resp.status_code == 503
         assert resp.headers.get("Retry-After") == "1"
+
+
+class TestAcloseKeepsLoopServing:
+    """Unloading a model must not stall every other model's streams.
+
+    Scheduler shutdown waits for the SSD writer to flush the hot cache; on
+    m5max an eviction took 11s and the health check timed out meanwhile.
+    """
+
+    @pytest.mark.asyncio
+    async def test_event_loop_runs_while_the_scheduler_shuts_down(
+        self, mock_model, mock_tokenizer
+    ):
+        import threading
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+        release = threading.Event()
+        real_shutdown = engine.scheduler.shutdown
+
+        def slow_shutdown():
+            release.wait(5)
+            real_shutdown()
+
+        engine.scheduler.shutdown = slow_shutdown
+        closing = asyncio.create_task(engine.aclose())
+
+        # The loop keeps serving while shutdown is blocked.
+        for _ in range(5):
+            await asyncio.sleep(0.01)
+        assert not closing.done()
+
+        # A handler still holding the engine is refused, not queued forever.
+        with pytest.raises(RuntimeError, match="unloading"):
+            await engine.add_request(prompt=[1, 2, 3])
+
+        release.set()
+        await asyncio.wait_for(closing, timeout=5)
+        assert engine.scheduler is None
+        assert engine._output_collectors == {}

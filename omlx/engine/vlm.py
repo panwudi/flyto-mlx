@@ -1001,7 +1001,7 @@ class VLMBatchedEngine(BaseEngine):
             await self._engine.stop()
             if hasattr(self._engine, "engine") and self._engine.engine is not None:
                 try:
-                    self._engine.engine.close()
+                    await self._engine.engine.aclose()
                 except Exception as e:
                     logger.warning(f"Error closing engine: {e}")
         if self._vision_cache is not None:

@@ -723,7 +723,9 @@ class ProcessMemoryEnforcer:
             int(ceiling * _ADMISSION_HEADROOM_CEILING_FRACTION),
         )
 
-    def prefill_admission_ok(self) -> tuple[bool, int, int]:
+    def prefill_admission_ok(
+        self, *, drop_dirty: bool = True, shed: bool = True
+    ) -> tuple[bool, int, int]:
         """Pre-stream request admission check, mirroring the scheduler's
         phys-based forward gate (_prefill_forward_gate) but hoisted BEFORE the
         SSE stream opens.
@@ -740,6 +742,13 @@ class ProcessMemoryEnforcer:
         already gone (e.g. a finishing request's cache store) used to keep
         rejecting every new request for the whole 5-tick window.
         Returns ``(True, 0, 0)`` when the guard is disabled.
+
+        Over the ceiling, hot cache is shed first. ``drop_dirty=False`` drops
+        only blocks already on SSD and queues the rest for writing, so no
+        cached prefix is lost; the server gate calls it that way first and
+        waits for memory to come back before the dropping call. ``shed=False``
+        only measures. The [memadmit] warning is logged by the dropping call,
+        the last word before a 503.
         """
         if not self._prefill_memory_guard:
             return True, 0, 0
@@ -748,17 +757,17 @@ class ProcessMemoryEnforcer:
             return True, 0, ceiling
         current, active, phys, cache = resident_usage_bytes()
         ok = (current + self._prefill_transient_margin_bytes) <= ceiling
-        if not ok:
+        if not ok and shed:
             # Hot cache blocks are a cache, a refused request is a failure:
-            # give them up first, including ones not yet written to SSD.
+            # give them up first; with drop_dirty, also ones not yet on SSD.
             need = current + self._prefill_transient_margin_bytes - ceiling
             freed, _ = self.shed_hot_caches(
-                need, drop_dirty=True, reason="admission"
+                need, drop_dirty=drop_dirty, reason="admission"
             )
             if freed:
                 current, active, phys, cache = resident_usage_bytes()
                 ok = (current + self._prefill_transient_margin_bytes) <= ceiling
-        if not ok:
+        if not ok and shed and drop_dirty:
             logger.warning(
                 "[memadmit] resident %s (active %s, phys %s, mlx free pool %s, "
                 "recent peak %s) + margin %s > ceiling %s",
@@ -926,6 +935,7 @@ class ProcessMemoryEnforcer:
                     self._prefill_transient_margin_bytes
                 )
                 scheduler._memory_recent_peak_bytes = self._recent_peak_bytes
+                scheduler._shed_all_hot_caches = self.shed_hot_caches
                 bg = getattr(scheduler, "batch_generator", None)
                 if bg is not None and hasattr(bg, "_memory_limit_bytes"):
                     bg._memory_limit_bytes = soft_limit
@@ -951,7 +961,9 @@ class ProcessMemoryEnforcer:
     def _hot_cache_managers(self) -> list[PagedSSDCacheManager]:
         """SSD cache managers with a hot tier, one per loaded model."""
         managers = []
-        for entry in self._engine_pool._entries.values():
+        # Snapshot: prefill gates call this from inference threads while the
+        # event loop may add or drop entries.
+        for entry in list(self._engine_pool._entries.values()):
             scheduler = self._resolve_scheduler(entry)
             mgr = getattr(scheduler, "paged_ssd_cache_manager", None)
             if isinstance(mgr, PagedSSDCacheManager) and mgr._hot_cache_enabled:
