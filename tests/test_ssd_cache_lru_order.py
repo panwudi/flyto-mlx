@@ -68,8 +68,10 @@ def test_rescan_evicts_least_recently_used_first(tmp_path):
 
     mgr = _manager(cache_dir)
     try:
-        one = mgr._index.get(_key("a")).file_size
-        evicted = mgr._index.evict_until_size(mgr._index.total_size - 2 * one)
+        # Block files differ by a few header bytes, so free exactly the two
+        # oldest blocks' sizes rather than twice one of them.
+        two = sum(mgr._index.get(_key(n)).file_size for n in ("x", "a"))
+        evicted = mgr._index.evict_until_size(mgr._index.total_size - two)
         assert [m.block_hash for m in evicted] == [_key("x"), _key("a")]
     finally:
         mgr.close()

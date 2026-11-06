@@ -241,8 +241,12 @@ async def _guarded_window_text(asr_engine, path: str, seg, sr: int,
     repeats its last sentence through it (a 344 s call came back with one
     3,732-character line from this path). Decode is capped by the window
     duration; a degenerate result is redone over the window's voiced spans
-    only; leftover back-to-back repeats are folded. The aligner then places
-    the text on the window's own audio, so timing is unaffected.
+    only; a span that still loops is bisected at silence, the same as the
+    full-pass guard; leftover back-to-back repeats are folded. The aligner
+    then places the text on the window's own audio, so timing is unaffected.
+    Without the span check a one- to three-minute span looped up to its own
+    decode cap and the aligner packed 1-3K repeated characters into a few
+    seconds of the stored transcript.
     """
     import os
     import tempfile
@@ -251,6 +255,7 @@ async def _guarded_window_text(asr_engine, path: str, seg, sr: int,
 
     from omlx.engine.audio_chunk import (
         DEFAULT_DECODE_TOKENS,
+        bisect_at_silence,
         collapse_repeats,
         looks_degenerate,
         output_token_cap,
@@ -269,21 +274,37 @@ async def _guarded_window_text(asr_engine, path: str, seg, sr: int,
     text = (res.get("text") or "").strip()
     if not looks_degenerate(text, dur, _LONG_AUDIO_GUARD_UNIQUENESS):
         return collapse_repeats(text)
-    parts: list = []
-    for (si, ei) in voiced_spans(seg, sr):
+
+    async def _span_text(span, depth: int) -> str:
+        span_dur = len(span) / sr
         tf = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
         tf.close()
         try:
-            sf.write(tf.name, seg[si:ei], sr, subtype="FLOAT")
-            r = await asr_engine.transcribe(tf.name, **_capped((ei - si) / sr))
-            t = collapse_repeats((r.get("text") or "").strip())
-            if t:
-                parts.append(t)
+            sf.write(tf.name, span, sr, subtype="FLOAT")
+            r = await asr_engine.transcribe(tf.name, **_capped(span_dur))
         finally:
             try:
                 os.unlink(tf.name)
             except OSError:
                 pass
+        t = (r.get("text") or "").strip()
+        if (
+            looks_degenerate(t, span_dur, _LONG_AUDIO_GUARD_UNIQUENESS)
+            and span_dur > 4.0
+            and depth < _LONG_AUDIO_MAX_RESPLIT_DEPTH
+        ):
+            cut = bisect_at_silence(span, sr)
+            if cut and 0.0 < cut < span_dur:
+                ci = int(cut * sr)
+                return (await _span_text(span[:ci], depth + 1)
+                        + await _span_text(span[ci:], depth + 1))
+        return collapse_repeats(t)
+
+    parts: list = []
+    for (si, ei) in voiced_spans(seg, sr):
+        t = await _span_text(seg[si:ei], 0)
+        if t:
+            parts.append(t)
     logger.info("repeat guard: aligner window (%.1fs) degenerated (%d chars); "
                 "re-transcribed by voiced span", dur, len(text))
     return "".join(parts)

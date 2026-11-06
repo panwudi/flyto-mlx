@@ -1039,6 +1039,45 @@ class TestChunkAlign:
         assert [w["start"] for w in words] == [0.5, 470.5]
 
 
+class TestGuardedWindowText:
+    """The aligner-window repeat guard must re-check each voiced span, not
+    just the whole window (2026-11 production: a 19-min tripass call stored
+    2716 and 1151 repeated characters packed into a few seconds)."""
+
+    def test_span_that_still_loops_is_bisected(self, tmp_path):
+        import asyncio
+
+        import numpy as np
+        import soundfile as sf
+
+        sr = 8000
+        # 200 s of continuous speech-like noise: one voiced span, no pauses.
+        seg = np.random.default_rng(0).uniform(-0.3, 0.3, 200 * sr).astype("float32")
+        path = tmp_path / "win.wav"
+        sf.write(str(path), seg, sr, subtype="FLOAT")
+        # A 40-char unit: longer than collapse_repeats' 30-char limit, so
+        # only a re-split, not the fold, can remove it.
+        unit = "".join(chr(0x4E00 + i) for i in range(40))
+
+        async def fake_transcribe(p, **kwargs):
+            dur = float(sf.info(p).duration)
+            # Loops on anything over 30 s, clean below.
+            return {"text": unit * 50 if dur > 30.0 else "好"}
+
+        asr = MagicMock()
+        asr.transcribe = AsyncMock(side_effect=fake_transcribe)
+
+        from omlx.api.audio_routes import _guarded_window_text
+        text = asyncio.run(_guarded_window_text(
+            asr, str(path), seg, sr, {"language": "zh"},
+        ))
+
+        assert unit not in text
+        # Window pass + one span + 2 + 4 + 8 leaves of the bisection.
+        assert set(text) == {"好"}
+        assert asr.transcribe.await_count == 1 + 1 + 2 + 4 + 8
+
+
 class TestLongAudioChunking:
     """Integration: long_audio=chunk splits at silence, transcribes each
     window independently, offsets timestamps, and concatenates. Uses a short
