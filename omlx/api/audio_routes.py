@@ -1639,6 +1639,63 @@ async def create_transcription(
             )
             return concat_chunk_results(leaves, total_s, language)
 
+        async def _windowed_pass(audio_path: str, dur: float):
+            """A tripass pass over audio longer than the aligner limit.
+
+            The words for such a pass come from _chunk_align, which
+            re-transcribes every aligner window under its own repeat guard;
+            tripass_merge reads only words, language and duration. A
+            whole-file pass first was pure waste: 1.7B degenerates on a 23
+            minute file, and the guard then redid it span by span (a 1408 s
+            call spent about 210 of its 279 s that way). Go to the windows
+            directly. Returns None when the aligner is unavailable, so the
+            caller falls back to the whole-file pass."""
+            aligner_name = None
+            sm = _get_settings_manager()
+            if sm is not None:
+                try:
+                    ms = sm.get_settings(resolved_model)
+                    if ms is not None:
+                        aligner_name = getattr(ms, "aligner_model", None)
+                except Exception:
+                    pass
+            if not aligner_name:
+                return None
+            try:
+                aligner_engine = await pool.get_engine(_resolve_model(aligner_name))
+                if not isinstance(aligner_engine, STTEngine):
+                    return None
+                _hold(aligner_engine)
+                words = await _chunk_align(
+                    engine, aligner_engine, audio_path,
+                    language=language, max_tokens=effective_max_tokens,
+                    window_s=_align_window_s,
+                )
+            except HTTPException:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "tripass: windowed pass failed for %s (%s); "
+                    "falling back to a whole-file pass",
+                    os.path.basename(audio_path), exc,
+                )
+                return None
+            text = "".join(w["word"] for w in words)
+            logger.info(
+                "tripass: %s (%.1fs) transcribed in aligner windows, %d words",
+                os.path.basename(audio_path), dur, len(words),
+            )
+            segments = []
+            if words:
+                segments = [{
+                    "text": text, "language": language,
+                    "start": float(words[0]["start"]),
+                    "end": float(words[-1]["end"]),
+                    "words": words,
+                }]
+            return {"text": text, "language": language, "duration": dur,
+                    "segments": segments}
+
         async def _guarded_pass(audio_path: str) -> dict:
             """One ASR pass with the short-audio repeat guard: decode capped by
             the audio duration; a degenerate result (repeat loop, or more text
@@ -1650,6 +1707,10 @@ async def create_transcription(
                 output_token_cap,
             )
             dur = _audio_duration_seconds(audio_path) or 0.0
+            if _align_should_chunk:
+                windowed = await _windowed_pass(audio_path, dur)
+                if windowed is not None:
+                    return windowed
             kw = dict(transcribe_kwargs)
             if dur > 0:
                 cap = output_token_cap(dur)
