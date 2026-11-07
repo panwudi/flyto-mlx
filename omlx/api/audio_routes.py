@@ -1768,6 +1768,65 @@ async def create_transcription(
             await _maybe_align_inplace(res, audio_path)
             return res
 
+        async def _batched_short_passes(paths: list):
+            """L, R and mix of a call within the aligner limit, in one batch.
+
+            The three passes are independent decodes of the same length, so
+            they batch with no padding: decode is memory-bandwidth bound and
+            one step of three costs far less than three steps of one. Each
+            pass then gets exactly what _guarded_pass gives it: a degenerate
+            first pass is redone by voiced span, a clean one is aligned.
+            Returns None (the caller runs the serial passes) for long calls,
+            which batch inside _chunk_align instead, for engines without
+            batch support, for sampled requests, or if the batch fails."""
+            if _align_should_chunk or len(paths) < 2:
+                return None
+            if not (getattr(engine, "supports_batch_transcribe",
+                            lambda: False)() is True):
+                return None
+            if set(transcribe_kwargs) - {"language", "max_tokens",
+                                         "word_timestamps"}:
+                return None
+            from omlx.engine.audio_chunk import (
+                DEFAULT_DECODE_TOKENS,
+                looks_degenerate,
+                output_token_cap,
+            )
+            durs = [_audio_duration_seconds(p) or 0.0 for p in paths]
+            if not all(d > 0 for d in durs):
+                return None
+            base = transcribe_kwargs.get("max_tokens") or DEFAULT_DECODE_TOKENS
+            caps = [min(base, output_token_cap(d)) for d in durs]
+
+            def _looping(i: int, text: str) -> bool:
+                return looks_degenerate(text, durs[i],
+                                        _LONG_AUDIO_GUARD_UNIQUENESS)
+
+            try:
+                texts = list(await engine.transcribe_batch(
+                    paths, language=language, max_tokens=caps,
+                    stop_if=_looping,
+                ))
+            except Exception as exc:
+                logger.warning("tripass: batched passes failed (%s); "
+                               "running them one by one", exc)
+                return None
+            results = []
+            for p, d, t in zip(paths, durs, texts):
+                if looks_degenerate(t or "", d, _LONG_AUDIO_GUARD_UNIQUENESS):
+                    logger.info(
+                        "repeat guard: %s (%.1fs) degenerated (%d chars); "
+                        "re-transcribing by voiced span",
+                        os.path.basename(p), d, len(t or ""),
+                    )
+                    results.append(await _transcribe_voiced_spans(p))
+                    continue
+                res = {"text": t or "", "language": language,
+                       "duration": d, "segments": []}
+                await _maybe_align_inplace(res, p)
+                results.append(res)
+            return results
+
         if energy_tripass_requested:
             # 3-pass: L only, R only, mix (mix = tmp_path). Serial — the
             # underlying MLX engine is single-threaded so asyncio.gather
@@ -1778,9 +1837,15 @@ async def create_transcription(
             # Each pass runs under the short-audio repeat guard: a per-channel
             # file is mostly silence (the other leg is talking), which is
             # exactly what sends qwen3-asr into a repeat loop.
-            result_L = await _guarded_pass(tripass_L_path)
-            result_R = await _guarded_pass(tripass_R_path)
-            result_mix = await _guarded_pass(tmp_path)
+            batched = await _batched_short_passes(
+                [tripass_L_path, tripass_R_path, tmp_path]
+            )
+            if batched is not None:
+                result_L, result_R, result_mix = batched
+            else:
+                result_L = await _guarded_pass(tripass_L_path)
+                result_R = await _guarded_pass(tripass_R_path)
+                result_mix = await _guarded_pass(tmp_path)
             from omlx.engine.diarize import tripass_merge
             result = tripass_merge(
                 stereo_audio_for_diarize, stereo_sr_for_diarize,
