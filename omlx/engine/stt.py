@@ -11,7 +11,7 @@ when mlx-audio is not installed.
 import asyncio
 import gc
 import logging
-from typing import Any
+from typing import Any, Callable, Optional
 
 import mlx.core as mx
 
@@ -259,6 +259,10 @@ def _validate_stt_processor(model_name: str, model: Any) -> None:
     if model._processor is not None:
         return
     raise RuntimeError(_missing_processor_hint(model_name))
+
+
+# transcribe_batch checks stop_if on a clip every this many tokens.
+_STOP_CHECK_EVERY = 128
 
 
 class STTEngine(BaseNonStreamingEngine):
@@ -664,6 +668,137 @@ class STTEngine(BaseNonStreamingEngine):
                 self._model_name, elapsed, text_len,
             )
             return result
+        finally:
+            await self._finish_activity(activity_id)
+
+    _BATCH_ATTRS = (
+        "_preprocess_audio", "get_audio_features", "_build_prompt",
+        "_build_inputs_embeds", "_forward_with_embeds", "_eos_token_ids",
+        "_tokenizer", "extract_language", "sample_rate",
+    )
+
+    def supports_batch_transcribe(self) -> bool:
+        """True when the loaded model exposes the Qwen3-ASR internals that
+        transcribe_batch drives (mlx-audio >= 0.4.6 Qwen3-ASR)."""
+        m = self._model
+        return m is not None and all(hasattr(m, a) for a in self._BATCH_ATTRS)
+
+    async def transcribe_batch(
+        self,
+        audio_paths: list[str],
+        *,
+        language: str | None = None,
+        max_tokens: list[int],
+        batch_size: int = 6,
+        stop_if: Optional[Callable[[int, str], bool]] = None,
+    ) -> list[str]:
+        """Greedy-transcribe several independent clips in one decode batch.
+
+        Decode is memory-bandwidth bound: one sequence reads every weight to
+        emit one token, so stepping B clips together costs about the same per
+        step as one. Measured on m5max with qwen3-asr-1.7b, four 270 s
+        windows: 35 s serial, 9-11 s batched, same text where the serial run
+        did not loop. Clips in a group are zero-padded to one length so the
+        prompts share a length and the causal mask stays valid. Unlike
+        mlx-audio's own batched path, each clip stops at its own token cap,
+        so one looping clip cannot hold the group for the whole budget, and
+        a finished clip leaves the batch. ``stop_if(index, text_so_far)``
+        is checked every few hundred tokens; returning True ends that clip
+        early (the caller's repeat guard redoes a looping clip anyway, so
+        decoding the loop to its cap is wasted).
+        Callers pass only greedy (temperature 0) requests here."""
+        if self._model is None:
+            raise RuntimeError("Engine not started. Call start() first.")
+        if len(max_tokens) != len(audio_paths):
+            raise ValueError("max_tokens needs one cap per clip")
+        import time
+
+        import numpy as np
+
+        model = self._model
+        t0 = time.monotonic()
+        gen_lang = _normalize_stt_generate_language(language)
+
+        def _sync() -> list[str]:
+            import mlx.core as mx
+            from mlx_audio.stt.utils import load_audio
+            from mlx_lm.models.cache import KVCache
+
+            eos = model._eos_token_ids()
+            clips = [np.array(load_audio(p, sr=model.sample_rate)) for p in audio_paths]
+            texts = [""] * len(clips)
+            n_layers = model.config.text_config.num_hidden_layers
+            for b0 in range(0, len(clips), max(1, batch_size)):
+                group = clips[b0:b0 + batch_size]
+                caps = max_tokens[b0:b0 + batch_size]
+                pad_to = max(len(c) for c in group)
+                embeds = []
+                for c in group:
+                    if len(c) < pad_to:
+                        c = np.pad(c, (0, pad_to - len(c)))
+                    feats, fmask, n_audio = model._preprocess_audio(c)
+                    af = model.get_audio_features(feats, fmask)
+                    ids = model._build_prompt(n_audio, gen_lang, None)
+                    embeds.append(model._build_inputs_embeds(ids, af)[0])
+                x = mx.stack(embeds, axis=0)
+                cache = [KVCache() for _ in range(n_layers)]
+                logits = model._forward_with_embeds(x, cache)[:, -1, :]
+                y = mx.argmax(logits, axis=-1)
+                bsz = len(group)
+                out = [[] for _ in range(bsz)]
+                active = list(range(bsz))  # batch row -> clip in group
+                while active:
+                    keep = []
+                    for r, t in enumerate(y.tolist()):
+                        i = active[r]
+                        if t in eos:
+                            continue
+                        out[i].append(t)
+                        n = len(out[i])
+                        if n >= caps[i]:
+                            continue
+                        if (stop_if is not None and n % _STOP_CHECK_EVERY == 0
+                                and stop_if(b0 + i, model._tokenizer.decode(
+                                    out[i], skip_special_tokens=True))):
+                            continue
+                        keep.append(r)
+                    if not keep:
+                        break
+                    if len(keep) < len(active):
+                        # Drop finished rows so the rest decode at the
+                        # smaller batch's cost.
+                        idx = mx.array(keep)
+                        y = y[idx]
+                        for c in cache:
+                            c.keys = c.keys[idx]
+                            c.values = c.values[idx]
+                        active = [active[r] for r in keep]
+                    nxt = model._forward_with_embeds(
+                        model.model.embed_tokens(y[:, None]), cache
+                    )
+                    y = mx.argmax(nxt[:, -1, :], axis=-1)
+                for i in range(bsz):
+                    t = model._tokenizer.decode(out[i], skip_special_tokens=True)
+                    if gen_lang is None:
+                        _, t = model.extract_language(t)
+                    texts[b0 + i] = t
+                del cache
+                mx.clear_cache()
+            return texts
+
+        activity_id = self._begin_activity(
+            "transcribing", detail="Transcribing (batched)",
+            metadata={"clips": len(audio_paths)},
+        )
+        try:
+            loop = asyncio.get_running_loop()
+            texts = await loop.run_in_executor(get_mlx_executor(), _sync)
+            logger.info(
+                "STT transcribe_batch done: model=%s, %d clips, %.2fs, %d chars",
+                self._model_name, len(texts), time.monotonic() - t0,
+                sum(len(t) for t in texts),
+            )
+            return texts
         finally:
             await self._finish_activity(activity_id)
 

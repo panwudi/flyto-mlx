@@ -219,7 +219,7 @@ override-dependencies = [
     "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
     "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@78b96eb5462141447b9a6b4943ef553891da56dd",
     "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@20d68db3b3c0ae3dd6d3a2f0d3c10b2344ee514e",
-    "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@51753266e0a4f766fd5e6fbc46652224efc23981",
+    "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@d28d68c6ac4e28f7d2d66007f640b06cf3fd8ceb",
 ]
 
 [tool.black]

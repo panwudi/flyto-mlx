@@ -1364,3 +1364,165 @@ class TestTripassLongAudioWindowed:
         assert speakers <= {"agent", "customer"} and speakers
         starts = [w["start"] for s in body["segments"] for w in s["words"]]
         assert starts == sorted(starts) and starts[-1] > 14.0
+
+
+class TestChunkAlignBatched:
+    """_chunk_align takes the first pass over all windows in one batch when
+    the engine supports it; the per-window repeat guard still applies."""
+
+    def _run(self, asr, aligner):
+        import asyncio
+        import sys
+
+        import numpy as np
+
+        fake_sf = MagicMock()
+        fake_sf.read.return_value = (np.zeros(480_000, dtype="float32"), 1000)
+        with patch.dict(sys.modules, {"soundfile": fake_sf}):
+            from omlx.api.audio_routes import _chunk_align
+            return asyncio.run(_chunk_align(
+                asr, aligner, "/tmp/long.wav",
+                language="zh", max_tokens=None, window_s=240.0,
+            ))
+
+    def _aligner(self):
+        aligner = MagicMock()
+        aligner.transcribe = AsyncMock(return_value={
+            "words": [{"word": "w", "start": 1.0, "end": 1.4}],
+        })
+        return aligner
+
+    def test_clean_batch_skips_serial_asr(self):
+        asr = MagicMock()
+        asr.supports_batch_transcribe = MagicMock(return_value=True)
+        asr.transcribe_batch = AsyncMock(return_value=["甲", "乙", "丙"])
+        asr.transcribe = AsyncMock()
+        aligner = self._aligner()
+        words = self._run(asr, aligner)
+        assert len(words) == 3
+        assert asr.transcribe.await_count == 0
+        kw = asr.transcribe_batch.await_args.kwargs
+        assert len(kw["max_tokens"]) == 3 and all(c > 0 for c in kw["max_tokens"])
+        assert [c.kwargs["text"] for c in aligner.transcribe.await_args_list] == [
+            "甲", "乙", "丙"]
+
+    def test_degenerate_batched_window_is_redone(self):
+        asr = MagicMock()
+        asr.supports_batch_transcribe = MagicMock(return_value=True)
+        loop = "我们今天先说到这里吧谢谢" * 80
+        asr.transcribe_batch = AsyncMock(return_value=["甲", loop, "丙"])
+        # Zero audio has no voiced spans, so the redo yields nothing and the
+        # looping window is dropped instead of reaching the aligner.
+        asr.transcribe = AsyncMock(return_value={"text": "乙"})
+        aligner = self._aligner()
+        self._run(asr, aligner)
+        texts = [c.kwargs["text"] for c in aligner.transcribe.await_args_list]
+        assert loop not in texts and texts == ["甲", "丙"]
+
+    def test_batch_failure_falls_back_to_serial(self):
+        asr = MagicMock()
+        asr.supports_batch_transcribe = MagicMock(return_value=True)
+        asr.transcribe_batch = AsyncMock(side_effect=RuntimeError("boom"))
+        asr.transcribe = AsyncMock(return_value={"text": "hello"})
+        aligner = self._aligner()
+        assert len(self._run(asr, aligner)) == 3
+        assert asr.transcribe.await_count == 3
+
+
+class TestSTTEngineTranscribeBatch:
+    """transcribe_batch stops each clip at its own cap or EOS."""
+
+    def test_per_clip_caps_and_eos(self, tmp_path):
+        import asyncio
+
+        import mlx.core as mx
+        import numpy as np
+
+        from omlx.engine.stt import STTEngine
+
+        EOS, TOK, V = 2, 7, 10
+        stop_after = [2, None, 4]   # clip 1 never emits EOS
+
+        class FakeModel:
+            sample_rate = 16000
+            _tokenizer = MagicMock()
+
+            def __init__(self):
+                self.step = 0
+                self.rows_seen = []
+                self.config = MagicMock()
+                self.config.text_config.num_hidden_layers = 1
+                self.model = MagicMock()
+                self.model.embed_tokens = lambda y: mx.zeros((y.shape[0], 1, 4))
+                self._tokenizer.decode = lambda ids, **k: "字" * len(ids)
+
+            def _eos_token_ids(self):
+                return {EOS}
+
+            def _preprocess_audio(self, a):
+                return None, None, 3
+
+            def get_audio_features(self, f, m):
+                return None
+
+            def _build_prompt(self, n, lang, sp):
+                return mx.zeros((1, 5), dtype=mx.int32)
+
+            def _build_inputs_embeds(self, ids, af):
+                return mx.zeros((1, 5, 4))
+
+            def _forward_with_embeds(self, x, cache):
+                # The fake cache's keys hold each row's clip index, so rows
+                # stay attributable after finished clips are dropped.
+                if cache[0].keys is None:
+                    cache[0].keys = mx.arange(x.shape[0])
+                    cache[0].values = mx.arange(x.shape[0])
+                self.rows_seen.append(x.shape[0])
+                rows = []
+                for ci in cache[0].keys.tolist():
+                    s = stop_after[ci]
+                    t = EOS if (s is not None and self.step >= s) else TOK
+                    rows.append(np.eye(V, dtype="float32")[t])
+                self.step += 1
+                return mx.array(np.stack(rows))[:, None, :]
+
+            def extract_language(self, t):
+                return None, t
+
+        class FakeCache:
+            def __init__(self):
+                self.keys = None
+                self.values = None
+
+        eng = STTEngine("fake")
+        eng._model = FakeModel()
+        paths = []
+        for i in range(3):
+            p = tmp_path / f"c{i}.wav"
+            p.write_bytes(_make_wav_bytes(0.1))
+            paths.append(str(p))
+        # numpy, not mx: an mx array built on this thread and evaluated on
+        # the MLX executor thread aborts the process.
+        with patch("mlx_audio.stt.utils.load_audio",
+                   side_effect=lambda *a, **k: np.zeros(1600, dtype="float32")), \
+             patch("mlx_lm.models.cache.KVCache", FakeCache):
+            texts = asyncio.run(eng.transcribe_batch(
+                paths, language="zh", max_tokens=[50, 6, 50],
+            ))
+        assert [len(t) for t in texts] == [2, 6, 4]
+        # Finished clips leave the batch: 3 rows, then 2, then 1.
+        rows = eng._model.rows_seen
+        assert rows[0] == 3 and rows[-1] == 1 and rows == sorted(rows, reverse=True)
+
+        # stop_if ends a clip early (checked every _STOP_CHECK_EVERY tokens).
+        stop_after[:] = [None, None, None]
+        eng._model = FakeModel()
+        with patch("mlx_audio.stt.utils.load_audio",
+                   side_effect=lambda *a, **k: np.zeros(1600, dtype="float32")), \
+             patch("mlx_lm.models.cache.KVCache", FakeCache), \
+             patch("omlx.engine.stt._STOP_CHECK_EVERY", 4):
+            texts = asyncio.run(eng.transcribe_batch(
+                paths, language="zh", max_tokens=[50, 50, 50],
+                stop_if=lambda i, t: i == 1 and len(t) >= 8,
+            ))
+        assert [len(t) for t in texts] == [50, 8, 50]

@@ -234,7 +234,8 @@ def _stitch_aligner_windows(windows: list) -> list:
 
 
 async def _guarded_window_text(asr_engine, path: str, seg, sr: int,
-                               asr_kwargs: dict) -> str:
+                               asr_kwargs: dict,
+                               first_text: Optional[str] = None) -> str:
     """Reference transcript for one aligner window, under the repeat guard.
 
     A window of a per-channel file is often mostly silence, and qwen3-asr
@@ -270,8 +271,10 @@ async def _guarded_window_text(asr_engine, path: str, seg, sr: int,
         return kw
 
     dur = len(seg) / sr if sr else 0.0
-    res = await asr_engine.transcribe(path, **_capped(dur))
-    text = (res.get("text") or "").strip()
+    if first_text is None:
+        res = await asr_engine.transcribe(path, **_capped(dur))
+        first_text = res.get("text") or ""
+    text = first_text.strip()
     if not looks_degenerate(text, dur, _LONG_AUDIO_GUARD_UNIQUENESS):
         return collapse_repeats(text)
 
@@ -342,31 +345,69 @@ async def _chunk_align(asr_engine, aligner_engine, audio_path: str, *,
         starts.append(t)
         t += step_s
 
-    windows: list = []
+    asr_kwargs: dict = {"language": language}
+    if max_tokens is not None:
+        asr_kwargs["max_tokens"] = max_tokens
+    plan: list = []
     for start_s in starts:
         end_s = min(start_s + window_s, total_s)
         seg = audio[int(start_s * sr):int(end_s * sr)]
         if len(seg) < int(0.1 * sr):  # skip sub-100ms slivers
             continue
-        tf = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-        tf.close()
-        try:
+        plan.append((start_s, seg))
+
+    windows: list = []
+    paths: list = []
+    try:
+        for _, seg in plan:
+            tf = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+            tf.close()
+            paths.append(tf.name)
             sf.write(tf.name, seg, sr, subtype="FLOAT")
-            asr_kwargs: dict = {"language": language}
-            if max_tokens is not None:
-                asr_kwargs["max_tokens"] = max_tokens
+        # First pass over all windows in one decode batch when the engine
+        # supports it; each window then goes through the same guard as the
+        # serial path, using the batched text as its first pass.
+        first: list = [None] * len(plan)
+        if len(plan) > 1 and getattr(asr_engine, "supports_batch_transcribe",
+                                     lambda: False)() is True:
+            from omlx.engine.audio_chunk import (
+                DEFAULT_DECODE_TOKENS,
+                looks_degenerate,
+                output_token_cap,
+            )
+            durs = [len(seg) / sr for _, seg in plan]
+            caps = [min(max_tokens or DEFAULT_DECODE_TOKENS,
+                        output_token_cap(d)) for d in durs]
+
+            def _looping(i: int, text: str) -> bool:
+                # Same detector the guard applies afterwards, so a clip cut
+                # here is still judged degenerate and redone by voiced span.
+                return looks_degenerate(text, durs[i],
+                                        _LONG_AUDIO_GUARD_UNIQUENESS)
+
+            try:
+                first = list(await asr_engine.transcribe_batch(
+                    paths, language=language, max_tokens=caps,
+                    stop_if=_looping,
+                ))
+            except Exception as exc:
+                logger.warning("aligner windows: batched ASR failed (%s); "
+                               "transcribing windows one by one", exc)
+                first = [None] * len(plan)
+        for (start_s, seg), path, ft in zip(plan, paths, first):
             win_text = await _guarded_window_text(
-                asr_engine, tf.name, seg, sr, asr_kwargs
+                asr_engine, path, seg, sr, asr_kwargs, first_text=ft,
             )
             if not win_text:
                 continue
             align_res = await aligner_engine.transcribe(
-                tf.name, text=win_text, **asr_kwargs
+                path, text=win_text, **asr_kwargs
             )
             windows.append((start_s, align_res.get("words") or []))
-        finally:
+    finally:
+        for p in paths:
             try:
-                os.unlink(tf.name)
+                os.unlink(p)
             except OSError:
                 pass
 
