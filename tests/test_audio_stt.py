@@ -1526,3 +1526,72 @@ class TestSTTEngineTranscribeBatch:
                 stop_if=lambda i, t: i == 1 and len(t) >= 8,
             ))
         assert [len(t) for t in texts] == [50, 8, 50]
+
+
+class TestTripassShortBatched:
+    """energy_tripass within the aligner limit: L, R and mix take their
+    first pass in one batch, then the same guard and aligner as before."""
+
+    def _post(self, client, wav):
+        return client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("call.wav", wav.read_bytes(), "audio/wav")},
+            data={
+                "model": "qwen3-asr", "response_format": "verbose_json",
+                "language": "zh", "on_aligner_overflow": "chunk",
+                "diarize_backend": "energy_tripass",
+                "left_speaker": "agent", "right_speaker": "customer",
+            },
+        )
+
+    def _setup(self, pool, batch_texts):
+        from types import SimpleNamespace
+
+        from omlx.engine.stt import STTEngine
+
+        asr = MagicMock(spec=STTEngine)
+        asr.supports_batch_transcribe = MagicMock(return_value=True)
+        asr.transcribe_batch = AsyncMock(return_value=batch_texts)
+        asr.transcribe = AsyncMock(return_value={"text": "段", "language": "zh",
+                                                 "duration": 1.0})
+
+        async def align(path, **kwargs):
+            return {"words": [{"word": kwargs["text"], "start": 0.5, "end": 0.8}]}
+
+        aligner = MagicMock(spec=STTEngine)
+        aligner.transcribe = AsyncMock(side_effect=align)
+        pool.get_engine = AsyncMock(
+            side_effect=lambda m, *a, **k: aligner if "aligner" in m else asr
+        )
+        sm = MagicMock()
+        sm.get_settings.return_value = SimpleNamespace(
+            aligner_model="test-aligner", max_tokens=None,
+        )
+        return asr, aligner, sm
+
+    def test_three_passes_in_one_batch(self, audio_client, tmp_path):
+        client, pool = audio_client
+        wav = tmp_path / "call.wav"
+        TestTripassLongAudioWindowed()._stereo_wav(wav, dur=6.0)
+        asr, aligner, sm = self._setup(pool, ["左", "右", "混"])
+        with patch("omlx.api.audio_routes._get_settings_manager", return_value=sm):
+            resp = self._post(client, wav)
+        assert resp.status_code == 200, resp.text
+        assert asr.transcribe_batch.await_count == 1
+        assert len(asr.transcribe_batch.await_args.args[0]) == 3
+        assert asr.transcribe.await_count == 0
+        assert sorted(c.kwargs["text"] for c in aligner.transcribe.await_args_list) \
+            == ["右", "左", "混"]
+
+    def test_looping_pass_is_redone_by_span(self, audio_client, tmp_path):
+        client, pool = audio_client
+        wav = tmp_path / "call.wav"
+        TestTripassLongAudioWindowed()._stereo_wav(wav, dur=6.0)
+        loop = "我们今天先说到这里吧谢谢" * 40
+        asr, aligner, sm = self._setup(pool, ["左", loop, "混"])
+        with patch("omlx.api.audio_routes._get_settings_manager", return_value=sm):
+            resp = self._post(client, wav)
+        assert resp.status_code == 200, resp.text
+        assert asr.transcribe.await_count >= 1          # span redo ran
+        texts = [c.kwargs["text"] for c in aligner.transcribe.await_args_list]
+        assert loop not in texts and "左" in texts and "混" in texts
