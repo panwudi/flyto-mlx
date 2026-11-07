@@ -1287,3 +1287,80 @@ class TestLongAudioChunking:
             data={"model": "qwen3-asr", "long_audio": "chunk", "chunk_minutes": "-1"},
         )
         assert resp.status_code == 400
+
+
+class TestTripassLongAudioWindowed:
+    """energy_tripass on audio past the aligner limit, with
+    on_aligner_overflow=chunk (what flytoCall sends). Each pass must go
+    straight to the aligner windows. 2026-11 production: a 1408 s call ran
+    a whole-file pass on L, R and mix first; two of them degenerated and
+    were redone span by span, about 210 of 279 s spent on text the merge
+    never reads."""
+
+    def _stereo_wav(self, path, dur=20.0, sr=8000):
+        import numpy as np
+        import soundfile as sf
+        rng = np.random.default_rng(0)
+        n = int(dur * sr)
+        st = np.stack([rng.uniform(-0.3, 0.3, n), rng.uniform(-0.3, 0.3, n)],
+                      axis=1).astype("float32")
+        sf.write(str(path), st, sr, subtype="FLOAT")
+
+    def test_each_pass_transcribes_only_aligner_windows(self, audio_client, tmp_path):
+        from types import SimpleNamespace
+
+        from omlx.engine.stt import STTEngine
+
+        client, pool = audio_client
+        wav = tmp_path / "call.wav"
+        self._stereo_wav(wav)
+
+        asr_durs: list = []
+
+        async def asr_transcribe(path, **kwargs):
+            import soundfile as sf
+            d = float(sf.info(path).duration)
+            asr_durs.append(d)
+            return {"text": "好", "language": "zh", "duration": d}
+
+        async def align_transcribe(path, **kwargs):
+            return {"words": [{"word": kwargs["text"], "start": 0.5, "end": 0.8}]}
+
+        asr = MagicMock(spec=STTEngine)
+        asr.transcribe = AsyncMock(side_effect=asr_transcribe)
+        aligner = MagicMock(spec=STTEngine)
+        aligner.transcribe = AsyncMock(side_effect=align_transcribe)
+        pool.get_engine = AsyncMock(
+            side_effect=lambda m, *a, **k: aligner if "aligner" in m else asr
+        )
+        sm = MagicMock()
+        sm.get_settings.return_value = SimpleNamespace(
+            aligner_model="test-aligner", max_tokens=None,
+        )
+        with (
+            patch("omlx.api.audio_routes._get_settings_manager", return_value=sm),
+            patch("omlx.api.audio_routes._resolve_aligner_limit", return_value=8.0),
+            patch("omlx.api.audio_routes._ALIGNER_CHUNK_OVERLAP_S", 1.0),
+        ):
+            resp = client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("call.wav", wav.read_bytes(), "audio/wav")},
+                data={
+                    "model": "qwen3-asr", "response_format": "verbose_json",
+                    "language": "zh", "long_audio": "auto",
+                    "on_aligner_overflow": "chunk",
+                    "diarize_backend": "energy_tripass",
+                    "left_speaker": "agent", "right_speaker": "customer",
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        # No pass sends the whole 20 s file to ASR; every call is a window.
+        assert asr_durs and max(asr_durs) <= 8.0 + 0.01
+        # 20 s, window 8 s, step 7 s -> 3 windows per pass, 3 passes.
+        assert asr.transcribe.await_count == 9
+        assert aligner.transcribe.await_count == 9
+        body = resp.json()
+        speakers = {s["speaker"] for s in body["segments"]}
+        assert speakers <= {"agent", "customer"} and speakers
+        starts = [w["start"] for s in body["segments"] for w in s["words"]]
+        assert starts == sorted(starts) and starts[-1] > 14.0
