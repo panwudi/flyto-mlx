@@ -85,20 +85,24 @@ destructive / shared-state operation" rule for this repo only.
 
 ## Machines
 
-- The Flyto MLX server runs only on **m5max** at `~/Code/omlx`, launched by
-  `/Applications/Flyto MLX.app` -- a Rust menubar app whose source lives in this
-  repo at `apps/fmlx-menubar` (it replaced the Swift shell in `apps/omlx-mac`,
-  which stays in the tree for rollback until it is removed). The app embeds no
-  Python; it runs the host venv `~/Code/omlx/.venv/bin/python -m omlx.cli serve`,
-  so editing a `.py` in the worktree + restarting the server applies instantly.
-  It adopts a healthy server already on the port, and judges liveness by PID:
-  never start a second server while the old one for `~/.fmlx` is still exiting.
-  The local clone dir is named `omlx`; it is this `flyto-mlx` repo.
-- **m2max is a dev machine only.** Its server, app, cluster router and models
-  were removed on 2026-10-10 (it had been down since late September with no
-  traffic). Keep `~/Code/omlx` + `.venv` there for development and tests; do
-  not deploy to it. The m5max cluster router (`:9000`) now has m5max as its
-  only backend.
+- **m5max is the development and test machine** (owner, 2026-11-09). It is no
+  longer production. Develop and run tests in `~/Code/omlx` with its `.venv`.
+  Heavy tests are allowed, but m5max also runs the owner's ds4 server
+  (`~/ds4`, DeepSeek V4.1) on `127.0.0.1:8000`: check that ds4 is not busy
+  before a heavy run, and do not take port 8000 or start Flyto MLX on it
+  without asking the owner.
+- Flyto MLX on m5max is launched by `/Applications/Flyto MLX.app` -- a Rust
+  menubar app whose source lives in this repo at `apps/fmlx-menubar` (it
+  replaced the Swift shell in `apps/omlx-mac`, which stays in the tree for
+  rollback until it is removed). The app embeds no Python; it runs the host
+  venv `~/Code/omlx/.venv/bin/python -m omlx.cli serve`, so editing a `.py` in
+  the worktree + restarting the server applies instantly. It adopts a healthy
+  server already on the port, and judges liveness by PID: never start a second
+  server while the old one for `~/.fmlx` is still exiting. The local clone dir
+  is named `omlx`; it is this `flyto-mlx` repo.
+- **m2max keeps only the git clone.** Its server, app and models were removed
+  on 2026-10-10; its `.venv` and model cache were removed on 2026-11-09, so it
+  cannot run tests. Use it for git and code reading only; do not deploy to it.
 - Rebuilding the menubar app: `apps/fmlx-menubar/scripts/build.sh` (needs only
   the Rust toolchain; emits a ~2 MB `build/Flyto MLX.app`, version from
   `omlx/_version.py`). Install steps are in `apps/fmlx-menubar/README.md`;
